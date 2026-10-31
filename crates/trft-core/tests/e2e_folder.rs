@@ -135,7 +135,7 @@ async fn oversize_text_gets_reject_byte_not_eof() {
 /// （模拟传输中断），其后连接全量转发到真实接收器。
 #[tokio::test]
 async fn folder_send_falls_back_to_resume_after_failure() {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt as _;
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("proj");
     make_file(&src.join("a.bin"), 8192);
@@ -160,7 +160,7 @@ async fn folder_send_falls_back_to_resume_after_failure() {
                 drop(c);
                 continue;
             }
-            let mut up = match tokio::net::TcpStream::connect(b_addr).await {
+            let up = match tokio::net::TcpStream::connect(b_addr).await {
                 Ok(u) => u,
                 Err(_) => return,
             };

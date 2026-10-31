@@ -166,6 +166,11 @@
    - **监控槽位写入竞态**（run_monitor 立即失败的清理与 start 的写入交错 → 死句柄槽）：MonitorTask 代际令牌（占位先行 + ptr_eq 判代覆盖/清理）；
    - **校验可并发重入**（双击 → 双扫描互踩）：tasks 表在跑即拒绝；**主题/语言切换即时持久化**（与 qr-address 一致，重启不丢）；**GUI UDP 约束守卫**（folder/text + udp → L10N 提示，此前晦涩 IO 错）；**CLI 参数组合显式报错**（--passes/--fec-parity/--nofec 非 UDP、--srcport UDP、--chunks 非 --file）；CLI update 死代码删除；队列逐项校验（NaN port 不再让整批反序列化失败）+ persistQueue 失败可见；主动取消的 toast 文案与失败区分（取消仅 warn 日志）；
    - **登记接受（不修）**：接收确认弹窗并发（单 overlay——并发确认时前序靠后端 31s 看门狗 fail-closed 拒绝，无用户可感知错误，仅 UI 上后到覆盖先到；排队/徽标属打磨项）。
+18. **第二轮全量审查·轮 8（判别力抽查 + 全量回扫）收尾口径**（2026-11-01）：
+   - **判别力 12/12 强**（6 项实测「去修复必红」+ 6 项静态确认，无恒真/恒假/被兜底）；回扫 180 绿、构建 0 告警（含全部测试目标）、无调试残留；
+   - 收尾修复：测试面 2 条编译警告（r6 引入，全 workspace 唯二告警破口）；`is_upload_part_name` 收紧为自产名严格同形（`.up`+8hex+单段 ext+`.part`，附判别单测——宽松 contains(".up") 理论误伤用户文件）；EMSGSIZE 注释平台值更正（FreeBSD/Solaris）；
+   - 轮 1/轮 3 的完整发现清单与判别记录补入 REVIEW-LOG（此前仅在 commit message，文档欠账）；
+   - **队列重试不区分错误类**（AuthRejected 等不可重试错误也重试至 QueueRetries 次——规格未限定错误类，仅浪费尝试，登记接受）。
 
 ## 8. 记录在案的否决项
 

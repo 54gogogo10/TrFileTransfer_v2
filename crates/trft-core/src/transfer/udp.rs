@@ -952,7 +952,7 @@ pub async fn serve_udp_on(socket: UdpSocket, opts: UdpRecvOptions, events: Optio
             // （轮 4 P1：LAN kill switch，已实测复现）。合法帧上限 1525B，
             // 超长包必为垃圾 → 丢弃续收。跨平台错误码（轮 4 F6：此前仅匹配
             // Windows 10040，Linux EMSGSIZE=90 仍会杀死接收器）：
-            // 10040=WSAEMSGSIZE(Windows) / 90=EMSGSIZE(Linux) / 40(macOS) / 97(FreeBSD)。
+            // 10040=WSAEMSGSIZE(Windows) / 90=EMSGSIZE(Linux) / 40=EMSGSIZE(macOS·FreeBSD) / 97=EMSGSIZE(Solaris)。
             Err(e)
                 if matches!(e.raw_os_error(), Some(10040) | Some(90) | Some(40) | Some(97)) =>
             {

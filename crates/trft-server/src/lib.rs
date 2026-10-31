@@ -957,6 +957,20 @@ fn url_escape(s: &str) -> String {
 /// 续传半成品均有 7 天孤儿清扫兜底（「与进程被杀同口径」），Web 上传半成品
 /// 此前不在任何清扫器覆盖内，落在用户共享目录永久残留。启动时按 7 天清扫
 ///（与 core `cleanup_part_orphans` 同口径；深度封顶防符号链接环）。
+/// 上传半成品文件名判定（轮 8 P3-2）：`{stem}.up{8hex}{ext}.part`——
+/// 与 upload_impl 的自产名严格同形。
+fn is_upload_part_name(name: &str) -> bool {
+    let Some(dot) = name.rfind(".up") else { return false };
+    let after = &name[dot + 3..];
+    // 自产形：".up" + 8 位 hex + ext（空或 ".xxx" 单段）+ ".part" 结尾。
+    if after.len() < 8 || !after[..8].chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Some(stripped) = after[8..].strip_suffix(".part") else { return false };
+    stripped.is_empty()
+        || (stripped.starts_with('.') && !stripped[1..].contains('.'))
+}
+
 pub fn cleanup_upload_orphans(dir: &std::path::Path) {
     fn walk(dir: &std::path::Path, depth: u32) {
         if depth > 6 {
@@ -971,8 +985,10 @@ pub fn cleanup_upload_orphans(dir: &std::path::Path) {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
-            // 上传半成品形态："{stem}.up{8 位 hex}{ext}.part"。
-            if !(name.contains(".up") && name.ends_with(".part")) {
+            // 上传半成品形态："{stem}.up{8 位 hex}{ext}.part"——按自产格式收紧
+            // （轮 8 P3-2：宽松的 contains(".up") 理论上可误删形如
+            // my.uploader.part 的用户文件）。
+            if !is_upload_part_name(&name) {
                 continue;
             }
             if let Ok(md) = e.metadata() {
@@ -1027,5 +1043,26 @@ pub async fn serve_with_header_timeout(
                 .header_read_timeout(std::time::Duration::from_secs(15));
             let _ = builder.serve_connection(TokioIo::new(socket), service).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 轮 8 P3-2 判别：上传半成品判定与自产名严格同形——宽松匹配
+    /// （contains(".up")）会误删形如 my.uploader.part 的用户文件。
+    #[test]
+    fn upload_part_name_matches_produced_shape_only() {
+        // 自产名全命中。
+        assert!(is_upload_part_name("a.up1a2b3c4d.txt.part"));
+        assert!(is_upload_part_name("报表.updeadbeef.pdf.part"));
+        assert!(is_upload_part_name("noext.up00000000.part"));
+        // 用户文件不误伤。
+        assert!(!is_upload_part_name("my.uploader.part"));
+        assert!(!is_upload_part_name("up.part"));
+        assert!(!is_upload_part_name("a.up123.txt.part"), "hex 段长度/边界不符");
+        assert!(!is_upload_part_name("a.upzzzzzzzz.txt.part"), "非 hex");
+        assert!(!is_upload_part_name("a.up1a2b3c4d.t.x.part"), "扩展名含点非自产形");
     }
 }
