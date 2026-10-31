@@ -65,6 +65,40 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 }
 
 pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> Result<()> {
+    send_folder_inner(addr, root, opts, None).await
+}
+
+/// 0x01 整夹 + 失败转 0x04 差量续传（规格 §3.2 AutoRetry「文件夹失败后转 0x04」；
+/// 轮 6 P2-5 补齐——此前文件夹失败永远从零重发）。差量基础 = 0x01 发送路径
+/// 逐文件回填的**本地**摘要缓存（本地计算的摘要恒为真值；已完整发出的文件
+/// 在 0x04 重试轮由服务端逐项核对跳过，半途中断的那个不匹配、必发）。
+/// 用法/配置/认证/不支持类错误重试无意义，直接上抛。
+pub async fn send_folder_auto(addr: SocketAddr, root: &Path, opts: &SendOptions) -> Result<()> {
+    // 纯内存缓存（不可写路径 → degraded；TTL 0 = 永不过期——只活本次调用）。
+    let ephemeral = std::env::temp_dir().join("trft-no-such-ephemeral-dir").join("c.txt");
+    let cache = std::sync::Arc::new(tokio::sync::Mutex::new(crate::hashcache::HashCache::load(
+        &ephemeral,
+        0,
+    )));
+    match send_folder_inner(addr, root, opts, Some(&cache)).await {
+        Ok(()) => Ok(()),
+        Err(e) => match &e {
+            Error::Config(_) | Error::AuthRejected(_) | Error::Unsupported(_) => Err(e),
+            _ => {
+                eprintln!("[重试] 文件夹 0x01 失败（{e}），转 0x04 差量续传");
+                let sid = resume::stable_session_id(root, &addr.to_string());
+                resume::send_folder_resume(addr, root, opts, sid, Some(&cache)).await
+            }
+        },
+    }
+}
+
+async fn send_folder_inner(
+    addr: SocketAddr,
+    root: &Path,
+    opts: &SendOptions,
+    cache: Option<&std::sync::Arc<tokio::sync::Mutex<crate::hashcache::HashCache>>>,
+) -> Result<()> {
     if !root.is_dir() {
         return Err(config_err("路径不是目录"));
     }
@@ -93,12 +127,12 @@ pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> R
         // 0x01 为基础帧：无需能力探询、不协商压缩（保持既有线上行为）。
         Transport::Tcp => {
             let (mut s, _) = connect_stack(addr, opts, StackPlan::default()).await?;
-            send_folder_over(&mut s, &root_name, &files, opts).await
+            send_folder_over(&mut s, &root_name, &files, opts, cache).await
         }
         Transport::Quic => {
             // 配对已在 connect_quic_auth 内完成（0x0D 通道绑定 / 旧端回退）。
             let mut s = connect_quic_auth(addr, opts).await?;
-            send_folder_over(&mut s, &root_name, &files, opts).await
+            send_folder_over(&mut s, &root_name, &files, opts, cache).await
         }
     };
     match &res {
@@ -113,11 +147,14 @@ pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> R
 }
 
 /// 返回 (发送字节, 发送文件数)（发送侧统计口径）。
+/// `cache`：逐文件回填**本地**摘要（轮 6 P2-5——0x01 失败转 0x04 的差量基础；
+/// 与 send_folder_resume 的免费回填同键口径 (rel, size, mtime)）。
 async fn send_folder_over<S>(
     s: &mut S,
     root_name: &str,
     files: &[(String, PathBuf)],
     opts: &SendOptions,
+    cache: Option<&std::sync::Arc<tokio::sync::Mutex<crate::hashcache::HashCache>>>,
 ) -> Result<(u64, u32)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -153,7 +190,17 @@ where
                 r.add(n as u64);
             }
         }
-        s.write_all(&dig.finalize()).await?;
+        let hash = dig.finalize();
+        s.write_all(&hash).await?;
+        if let Some(c) = cache {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            c.lock().await.insert(rel, size, mtime, hash);
+        }
     }
 
     // 整夹完成确认：接收端权威。

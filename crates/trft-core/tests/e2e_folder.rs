@@ -128,3 +128,58 @@ async fn oversize_text_gets_reject_byte_not_eof() {
     assert_eq!(b[0], 0x00, "超限文本应答拒绝字节 0x00");
     let _ = server.abort();
 }
+
+/// 轮 6 P2-5 判别：文件夹 0x01 失败后必须自动转 0x04 差量续传收敛
+/// （规格 §3.2 AutoRetry「文件夹失败后转 0x04」——此前失败永远从零重发，
+/// 即直接报错）。测试编排：前置代理对第 1 条连接读 100 字节即掐断
+/// （模拟传输中断），其后连接全量转发到真实接收器。
+#[tokio::test]
+async fn folder_send_falls_back_to_resume_after_failure() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("proj");
+    make_file(&src.join("a.bin"), 8192);
+    make_file(&src.join("b.bin"), 4096);
+    let out = dir.path().join("out");
+
+    // 真实接收器（常驻）。
+    let (backend, b_addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(backend, common::opts_resident(out.clone(), None)));
+
+    // 前置代理：第 1 条连接掐断，其后双向转发。
+    let (front, f_addr) = ephemeral_listener().await;
+    let proxy = tokio::spawn(async move {
+        let mut conn_no = 0u32;
+        loop {
+            let Ok((mut c, _)) = front.accept().await else { return };
+            conn_no += 1;
+            if conn_no == 1 {
+                // 模拟传输中断：读一小段后丢弃连接。
+                let mut b = [0u8; 100];
+                let _ = c.read(&mut b).await;
+                drop(c);
+                continue;
+            }
+            let mut up = match tokio::net::TcpStream::connect(b_addr).await {
+                Ok(u) => u,
+                Err(_) => return,
+            };
+            let (mut cr, mut cw) = c.into_split();
+            let (mut ur, mut uw) = up.into_split();
+            let t1 = tokio::spawn(async move { let _ = tokio::io::copy(&mut cr, &mut uw).await; });
+            let t2 = tokio::spawn(async move { let _ = tokio::io::copy(&mut ur, &mut cw).await; });
+            let _ = t1.await;
+            let _ = t2.await;
+        }
+    });
+
+    let opts = SendOptions::default();
+    trft_core::transfer::folder::send_folder_auto(f_addr, &src, &opts)
+        .await
+        .expect("0x01 中断后必须经 0x04 差量续传收敛（规格 §3.2 AutoRetry）");
+    assert!(out.join("proj").join("a.bin").exists(), "文件 a 必须落盘");
+    assert!(out.join("proj").join("b.bin").exists(), "文件 b 必须落盘");
+    common::assert_no_leftovers(&out);
+    server.abort();
+    proxy.abort();
+}

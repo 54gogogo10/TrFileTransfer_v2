@@ -14,7 +14,7 @@ use trft_core::error::config_err;
 use trft_core::config::Config;
 use trft_core::hashcache::{cache_file_for, HashCache, DEFAULT_TTL_DAYS};
 use trft_core::transfer::chunked::{send_file_chunked, ChunkTracker};
-use trft_core::transfer::folder::send_folder;
+use trft_core::transfer::folder::send_folder_auto;
 use trft_core::transfer::receiver::{serve_on, RecvOptions};
 use trft_core::transfer::resume::{send_file_auto, send_folder_resume, stable_session_id};
 use trft_core::transfer::sender::SendOptions;
@@ -160,7 +160,7 @@ pub fn list_addresses() -> Vec<String> {
 
 // ============ 发送 ============
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SendRequest {
     /// "file" | "folder" | "text" | "udpfile"
@@ -358,8 +358,9 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
                 let path = PathBuf::from(req.path.clone().unwrap_or_default());
                 let opts = req.stream_opts(Some(reporter), compress_default, Some(send_stats.clone()));
                 match opts {
-                    // 拖放多选把目录按 file 入队（前端拿不到 is_dir）——自动路由整夹发送。
-                    Ok(o) if path.is_dir() => send_folder(addr, &path, &o).await,
+                    // 拖放多选把目录按 file 入队（前端拿不到 is_dir）——自动路由整夹发送
+                    // （0x01 失败转 0x04 差量续传，规格 §3.2，轮 6 P2-5）。
+                    Ok(o) if path.is_dir() => send_folder_auto(addr, &path, &o).await,
                     Ok(o) => send_file_auto(addr, &path, &o).await,
                     Err(e) => Err(config_err(e)),
                 }
@@ -368,7 +369,8 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
                 let path = PathBuf::from(req.path.clone().unwrap_or_default());
                 let opts = req.stream_opts(Some(reporter), compress_default, Some(send_stats.clone()));
                 match opts {
-                    Ok(o) => send_folder(addr, &path, &o).await,
+                    // 0x01 失败转 0x04 差量续传（规格 §3.2，轮 6 P2-5）。
+                    Ok(o) => send_folder_auto(addr, &path, &o).await,
                     Err(e) => Err(config_err(e)),
                 }
             }
@@ -414,7 +416,8 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
 /// 0x02 并行分块（Unsupported 自动回退 0x03 续传——规格 §3.6）。
 #[tauri::command]
 pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, String> {
-    let connections = req.chunks.unwrap_or(2).clamp(1, 8);
+    // 规格 §3.1：分块默认 4 路（轮 6 P2-7 对齐——此前 GUI 默认 2）。
+    let connections = req.chunks.unwrap_or(4).clamp(1, 8);
     let name = req.display_name();
     let (ptx, prx) = mpsc::unbounded_channel();
     forward_progress(app.clone(), prx);
@@ -502,11 +505,22 @@ pub async fn send_queue(
     let app2 = app.clone();
     let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled2 = settled.clone();
+    // 失败自动重试（规格 §3.2 队列行：QueueRetries 0–5，默认 1；轮 6 P2-3）。
+    let retries = app.state::<AppState>().config().queue_retries.min(5);
     let handle = tauri::async_runtime::spawn(async move {
         let mut ok_n = 0u32;
         for (i, item) in items.into_iter().enumerate() {
             let label = format!("队列 {}/{}", i + 1, item.display_name());
-            let sub = run_single_send(app2.clone(), item).await;
+            let mut sub = run_single_send(app2.clone(), item.clone()).await;
+            let mut attempt = 0u32;
+            while sub.is_err() && attempt < retries {
+                attempt += 1;
+                let _ = app2.emit(
+                    "trft://log",
+                    serde_json::json!({ "level": "warn", "message": format!("{label} 失败，重试 {attempt}/{retries}") }),
+                );
+                sub = run_single_send(app2.clone(), item.clone()).await;
+            }
             if sub.is_ok() {
                 ok_n += 1;
             }
@@ -989,13 +1003,21 @@ pub async fn recv_start(
     update_discovery_answer(&app);
     let st = app.state::<AppState>();
     // 规格 §3.7：首次成功启动服务器展示一次 netsh 放行命令。
+    // 按所启协议生成（轮 6 P3-11：此前恒 protocol=TCP——首个启动的是 UDP/UDT
+    // 接收器时放行错协议，命令无效）。
     if !cfg.firewall_hinted {
         let hint_port = bound.first().and_then(|b| b.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()));
+        let (fw_proto, default_port) = match proto {
+            Proto::Tcp => ("TCP", cfg.server_port_tcp),
+            // QUIC 与单向 UDP 均承载于 UDP。
+            Proto::Udt | Proto::Udp => ("UDP", cfg.server_port_udp),
+        };
+        let p = hint_port.unwrap_or(default_port);
         let _ = app.emit(
             "trft://firewall-hint",
             serde_json::json!({
-                "command": format!("netsh advfirewall firewall add rule name=\"TrFileTransfer\" dir=in action=allow protocol=TCP localport={}", hint_port.unwrap_or(cfg.server_port_tcp)),
-                "port": hint_port.unwrap_or(cfg.server_port_tcp),
+                "command": format!("netsh advfirewall firewall add rule name=\"TrFileTransfer\" dir=in action=allow protocol={fw_proto} localport={p}"),
+                "port": p,
             }),
         );
         st.cfg.lock().expect("配置锁").firewall_hinted = true;
@@ -1739,11 +1761,22 @@ pub fn text_history_clear() -> Result<(), String> {
 }
 
 // ============ 发送队列持久化（规格 §3.2：queue.txt，`|` 分隔，上限 500 项） ============
+// 轮 6 P2-4：逐项快照面板参数（规格「串行批量执行；逐项快照面板参数」）——
+// 行格式 `kind|path|ip|port|proto|code|limit|nocompress|noencrypt`；旧版
+// 2 字段行按无快照恢复（运行时回落当前面板值，行为与旧版一致）。
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 pub struct QueueItem {
     pub kind: String,
     pub path: String,
+    // 入队时的面板参数快照（None = 旧条目，运行时回落当前面板）。
+    pub ip: Option<String>,
+    pub port: Option<u16>,
+    pub proto: Option<String>,
+    pub code: Option<String>,
+    pub limit: Option<u64>,
+    pub nocompress: Option<bool>,
+    pub noencrypt: Option<bool>,
 }
 
 fn queue_path() -> PathBuf {
@@ -1759,8 +1792,25 @@ pub fn queue_load() -> Vec<serde_json::Value> {
         .filter(|l| !l.trim().is_empty())
         // 与 queue_save 同分隔符 `|`（轮 7 P1：此前按 tab 分割——保存的行
         // 不含 tab，恢复恒为空，持久化形同虚设）。
-        .filter_map(|l| l.split_once('|'))
-        .map(|(kind, path)| serde_json::json!({ "kind": kind, "path": path }))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('|').collect();
+            if f.len() < 2 {
+                return None;
+            }
+            let mut v = serde_json::json!({ "kind": f[0], "path": f[1] });
+            // ≥3 字段：带快照的新格式（ip|port|proto|code|limit|nocompress|noencrypt）。
+            if f.len() >= 9 {
+                let num = |s: &str| s.parse::<u64>().ok();
+                v["ip"] = serde_json::json!(if f[2].is_empty() { None } else { Some(f[2]) });
+                v["port"] = serde_json::json!(f[3].parse::<u16>().ok());
+                v["proto"] = serde_json::json!(if f[4].is_empty() { None } else { Some(f[4]) });
+                v["code"] = serde_json::json!(if f[5].is_empty() { None } else { Some(f[5]) });
+                v["limit"] = serde_json::json!(num(f[6]));
+                v["nocompress"] = serde_json::json!(match f[7] { "1" => Some(true), "0" => Some(false), _ => None });
+                v["noencrypt"] = serde_json::json!(match f[8] { "1" => Some(true), "0" => Some(false), _ => None });
+            }
+            Some(v)
+        })
         .take(500)
         .collect()
 }
@@ -1775,8 +1825,24 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
         if it.path.contains('|') {
             continue; // `|` 为分隔符（Windows 文件名本身不含 |，防御性跳过）
         }
-        out.push_str(&format!("{}|{}
-", it.kind, it.path));
+        let ip = it.ip.unwrap_or_default();
+        let code = it.code.unwrap_or_default();
+        if ip.contains('|') || code.contains('|') {
+            continue; // 快照字段同样不得含分隔符
+        }
+        out.push_str(&format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}
+",
+            it.kind,
+            it.path,
+            ip,
+            it.port.map(|p| p.to_string()).unwrap_or_default(),
+            it.proto.unwrap_or_default(),
+            code,
+            it.limit.map(|l| l.to_string()).unwrap_or_default(),
+            it.nocompress.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.noencrypt.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+        ));
     }
     trft_core::config::atomic_write(&queue_path(), out.as_bytes()).map_err(err)
 }

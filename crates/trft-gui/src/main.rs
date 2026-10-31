@@ -79,16 +79,21 @@ fn main() {
         })
         .on_window_event(|window, event| {
             // 规格 §3.7：关闭窗口 = 隐藏 + 保存配置；最小化 = 隐藏到托盘（托盘常驻）。
+            // 规格 §3.4：HTTP 共享「随主窗口关闭停止」——窗口隐藏（关闭/最小化）
+            // 即停共享（轮 6 P2-2：此前共享与窗口生命周期解绑，隐藏后共享目录
+            // 持续对外可访问，用户以为已关）。接收器/监控不受影响（托盘常驻语义）。
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     if let Some(state) = window.app_handle().try_state::<AppState>() {
                         let _ = state.save_config();
                     }
+                    stop_http_share(window);
                     let _ = window.hide();
                 }
                 tauri::WindowEvent::Resized(_) => {
                     if let Ok(true) = window.is_minimized() {
+                        stop_http_share(window);
                         let _ = window.hide();
                     }
                 }
@@ -97,6 +102,25 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("TrFileTransfer GUI 启动失败");
+}
+
+/// 停止 HTTP 共享（窗口隐藏时；规格 §3.4「随主窗口关闭停止」，轮 6 P2-2）。
+/// 与 `http_stop` 同逻辑但不依赖前端调用；未运行时为空操作。
+fn stop_http_share<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    use tauri::Emitter as _;
+    let app = window.app_handle();
+    if let Some(state) = app.try_state::<AppState>() {
+        let stopped = state
+            .http
+            .lock()
+            .expect("http 锁")
+            .take()
+            .map(|h| h.shutdown.send(()).is_ok())
+            .unwrap_or(false);
+        if stopped {
+            let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": "窗口已隐藏，HTTP 共享已停止" }));
+        }
+    }
 }
 
 /// WebView2 运行时检测：注册表三处（HKLM/HKCU/WOW6432Node）任一有效 `pv` 即已安装。

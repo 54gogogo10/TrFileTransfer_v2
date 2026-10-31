@@ -328,7 +328,7 @@ async function doSend(chunked) {
   if (errs.length) { toast(errs.join(", "), "err"); return; }
   try {
     if (chunked) {
-      req.chunks = Math.min(8, Math.max(1, parseInt($("#send-chunks").value, 10) || 2));
+      req.chunks = Math.min(8, Math.max(1, parseInt($("#send-chunks").value, 10) || 4));
       await startTask({ kind: "chunked", req });
     } else if (sendKind === "folder" && $("#folder-mode").value === "sync" && req.proto !== "udp") {
       // 0x04 差量同步：稳定会话 ID，二次只传差异（规格 §3.1/§3.2）。
@@ -377,30 +377,50 @@ function renderQueue() {
   });
 }
 function persistQueue() {
-  invoke("queue_save", { items: queueItems.map((q) => ({ kind: q.kind, path: q.path })) }).catch(() => {});
+  const items = queueItems.map((q) => q.snap
+    ? { kind: q.kind, path: q.path, ip: q.snap.ip, port: q.snap.port, proto: q.snap.proto,
+        code: q.snap.code, limit: q.snap.limit, nocompress: q.snap.nocompress, noencrypt: q.snap.noencrypt }
+    : { kind: q.kind, path: q.path });
+  invoke("queue_save", { items }).catch(() => {});
+}
+function queueSnapshot() {
+  return {
+    ip: $("#send-ip").value.trim(),
+    port: parseInt($("#send-port").value, 10),
+    proto: $("#send-proto").value,
+    code: $("#send-code").value.trim() || null,
+    limit: parseInt($("#send-limit").value, 10) || null,
+    nocompress: !$("#send-compress").checked,
+    noencrypt: !$("#send-encrypt").checked,
+  };
 }
 $("#btn-queue-add").addEventListener("click", () => {
   const p = $("#send-path").value.trim();
   if (!p) return;
   if (queueItems.length >= 500) { toast(t("queue_full"), "err"); return; }
-  queueItems.push({ kind: sendKind, path: p });
+  // 轮 6 P2-4：入队即快照面板参数（规格 §3.2「逐项快照面板参数」——
+  // 入队后改面板不得 retroactively 改变已入队项的行为）。
+  queueItems.push({ kind: sendKind, path: p, snap: queueSnapshot() });
   renderQueue();
   persistQueue();
 });
 $("#btn-queue-clear").addEventListener("click", () => { queueItems.length = 0; renderQueue(); persistQueue(); });
 $("#btn-queue-run").addEventListener("click", async () => {
   if (!queueItems.length) return;
-  const reqs = queueItems.map((item) => ({
-    kind: item.kind === "folder" ? "folder" : "file",
-    path: item.path, text: null,
-    ip: $("#send-ip").value.trim(),
-    port: parseInt($("#send-port").value, 10),
-    proto: $("#send-proto").value === "udp" ? "udp" : $("#send-proto").value,
-    code: $("#send-code").value.trim() || null,
-    limit: parseInt($("#send-limit").value, 10) || null,
-    chunks: null, nocompress: !$("#send-compress").checked, noencrypt: !$("#send-encrypt").checked,
-    passes: null, fecParity: null, nofec: false, pin: null,
-  }));
+  // 轮 6 P2-4：逐项按入队快照构造（旧条目无快照时回落当前面板值）。
+  const cur = queueSnapshot();
+  const reqs = queueItems.map((item) => {
+    const sp = item.snap || cur;
+    return {
+      kind: item.kind === "folder" ? "folder" : "file",
+      path: item.path, text: null,
+      ip: sp.ip, port: sp.port,
+      proto: sp.proto === "udp" ? "udp" : sp.proto,
+      code: sp.code, limit: sp.limit,
+      chunks: null, nocompress: sp.nocompress, noencrypt: sp.noencrypt,
+      passes: null, fecParity: null, nofec: false, pin: null,
+    };
+  });
   // 完成后动作执行前确认（规格 §3.2：执行前弹确认）。
   const ad = $("#after-done").value;
   if (ad !== "none") {
@@ -1094,9 +1114,10 @@ function setupDragDrop() {
           updateKindRows();
         }
       } else if (paths.length > 1) {
+        const snap = queueSnapshot();
         for (const f of paths) {
           if (queueItems.length >= 500) { toast(t("queue_full"), "err"); break; }
-          queueItems.push({ kind: "file", path: f });
+          queueItems.push({ kind: "file", path: f, snap });
         }
         renderQueue();
       }
@@ -1404,7 +1425,15 @@ $("#btn-log-clear").addEventListener("click", () => {
     } catch (e) { toast(String(e), "err"); }
   });
   invoke("queue_load").then((items) => {
-    items.forEach((it) => queueItems.push({ kind: it.kind, path: it.path }));
+    items.forEach((it) => {
+      const hasSnap = it.ip !== undefined || it.port !== undefined || it.proto !== undefined;
+      queueItems.push(hasSnap
+        ? { kind: it.kind, path: it.path, snap: {
+            ip: it.ip || "", port: it.port || 0, proto: it.proto || "tcp",
+            code: it.code || null, limit: it.limit || null,
+            nocompress: !!it.nocompress, noencrypt: !!it.noencrypt } }
+        : { kind: it.kind, path: it.path });
+    });
     renderQueue();
   }).catch(() => {});
   refreshStats();

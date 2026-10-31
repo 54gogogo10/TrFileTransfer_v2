@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use trft_core::config::DuplicatePolicy;
 use trft_core::hashcache::{HashCache, cache_file_for};
 use trft_core::transfer::Transport;
-use trft_core::transfer::folder::send_folder;
+use trft_core::transfer::folder::send_folder_auto;
 use trft_core::transfer::quic::serve_quic;
 use trft_core::transfer::receiver::{self, RecvOptions};
 use trft_core::transfer::resume::{send_file_auto, send_folder_resume, stable_session_id};
@@ -297,7 +297,8 @@ async fn run() -> i32 {
             }
             let opts = stream_opts(code, limit, srcport, proto, !noencrypt, !nocompress, pin, allow_legacy_pair);
             let r = match (folder, file, text) {
-                (Some(f), _, _) => send_folder(addr, &f, &opts).await,
+                // 规格 §3.2 AutoRetry：文件夹 0x01 失败转 0x04 差量续传（轮 6 P2-5）。
+                (Some(f), _, _) => send_folder_auto(addr, &f, &opts).await,
                 // 规格 §3.2 AutoRetry：单文件首选 0x03（含降级 0x00）；--chunks 走 0x02。
                 (_, Some(f), _) if chunks.is_some() => {
                     let n = chunks.unwrap();

@@ -1,7 +1,7 @@
 //! 0x08/0x18 分段 deflate 压缩装饰器（规格 §4.1：装饰器顺序 encrypt(compress(plain))，
 //! 压缩在内层、加密在外层；仅认证后协商）。
 //!
-//! 段格式（docs/WIRE-PROTOCOL.md §4）：`u32 rawLen + u8 mode + payload`。
+//! 段格式（docs/WIRE-PROTOCOL.md §4）：`u32 rawLen + u32 wireLen + u8 mode + payload`。
 //! - mode 0：原样零膨胀直传；mode 1：deflate（解压必须恰好产出 rawLen 字节）。
 //! - 写前采样 ≤64KB，压后 ≤30% 才压整段（规格 §6.2）；段长 <64B 一律直传（最小压缩段）。
 //! - 读侧防线：rawLen > 64MiB 拒绝；解压输出以 rawLen 为硬上限（炸弹守卫）。

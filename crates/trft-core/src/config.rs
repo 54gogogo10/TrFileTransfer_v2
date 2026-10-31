@@ -87,6 +87,9 @@ pub struct Config {
     pub skip_version: Option<String>,
     /// `?t=` 令牌派生密钥（64 hex，M6' 轮 6 P2-4；缺省首启生成）。
     pub token_secret: Option<String>,
+    /// 发送队列失败自动重试次数（规格 §3.2/§12.1 QueueRetries：0–5，默认 1；
+    /// 轮 6 P2-3 补齐——此前队列失败仅记日志继续，无重试）。
+    pub queue_retries: u32,
 }
 
 impl Default for Config {
@@ -124,28 +127,43 @@ impl Default for Config {
             firewall_hinted: false,
             skip_version: None,
             token_secret: None,
+            queue_retries: 1,
         }
     }
 }
 
 impl Config {
-    /// 加载配置：文件缺失 → 默认值（视为用户重置）；解析失败 → 回退 .bak（规格 §3.8）。
+    /// 加载配置（规格 §3.8 备份自愈）：
+    /// - 文件**缺失** → 默认值（视为用户重置，不回退）；
+    /// - 主文件存在但**不可读**/**解析为空**/解析失败 → 回退 `.bak`（轮 6 P2-1：
+    ///   此前仅 toml 语法错误路径回退——恰好是 .bak 存在目的的损坏场景
+    ///   （截断成空文件、占用不可读）静默丢配置）。
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(path)?;
-        match toml::from_str::<Config>(&text) {
-            Ok(c) => c.validate(),
-            Err(e) => {
+        let main: Result<Self> = match std::fs::read_to_string(path) {
+            // 解析为空（规格 §3.8）：保存中途截断的典型形态，视为损坏。
+            Ok(text) if text.trim().is_empty() => {
+                Err(config_err("主文件为空（疑似保存中途截断）"))
+            }
+            Ok(text) => toml::from_str::<Config>(&text)
+                .map_err(|e| config_err(format!("config 解析失败: {e}")))
+                .and_then(|c| c.validate()),
+            Err(e) => Err(config_err(format!("主文件不可读: {e}"))),
+        };
+        match main {
+            Ok(c) => Ok(c),
+            Err(main_err) => {
                 let bak = path.with_extension("bak");
                 if bak.exists() {
                     let bak_text = std::fs::read_to_string(&bak)?;
-                    let c: Config = toml::from_str(&bak_text)
-                        .map_err(|e2| config_err(format!("主文件与 .bak 均无法解析: {e} / {e2}")))?;
+                    let c: Config = toml::from_str(&bak_text).map_err(|e2| {
+                        config_err(format!("主文件损坏（{main_err}）且 .bak 无法解析: {e2}"))
+                    })?;
                     c.validate()
                 } else {
-                    Err(config_err(format!("config 解析失败且无 .bak: {e}")))
+                    Err(main_err)
                 }
             }
         }
@@ -264,5 +282,26 @@ mod tests {
         assert!(c.validate().is_err());
         c.pairing_code = Some("123".into());
         assert!(c.validate().is_err());
+    }
+
+    /// 轮 6 P2-1 判别：主文件**解析为空**（保存中途截断的典型形态）必须回退
+    /// .bak（规格 §3.8）——修复前空文件被 serde(default) 解析为默认配置，
+    /// 静默丢用户配置。
+    #[test]
+    fn empty_main_falls_back_to_bak() {
+        let (_d, p) = tmp_config();
+        let mut c = Config::default();
+        c.server_port_tcp = 9100;
+        c.save(&p).unwrap();
+        c.server_port_tcp = 9200;
+        c.save(&p).unwrap(); // .bak = 9100
+        std::fs::write(&p, "").unwrap(); // 截断为空
+        let c2 = Config::load(&p).unwrap();
+        assert_eq!(c2.server_port_tcp, 9100, "空主文件必须回退 .bak（不得静默重置为默认）");
+
+        // 纯空白同理。
+        std::fs::write(&p, "   \n\t\n").unwrap();
+        let c3 = Config::load(&p).unwrap();
+        assert_eq!(c3.server_port_tcp, 9100, "纯空白主文件同样按损坏处理");
     }
 }
