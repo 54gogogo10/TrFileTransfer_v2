@@ -1,0 +1,17 @@
+[package]
+name = "trft-cli"
+version.workspace = true
+edition.workspace = true
+description = "TrFileTransfer v2 命令行界面"
+
+[[bin]]
+name = "trft"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+trft-core = { path = "../trft-core" }
+
+[dev-dependencies]
+tempfile = "3"

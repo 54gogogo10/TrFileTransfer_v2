@@ -1,0 +1,307 @@
+/* TrFileTransfer GUI——色板 token 集中管理（规格 §3.7：主题三态、色板 token 集中）。
+   明暗两套只换 token 值，组件样式只引用 token。 */
+
+:root {
+  --bg: #f3f5f7;
+  --panel: #ffffff;
+  --panel-2: #eef1f4;
+  --text: #1a2430;
+  --text-dim: #64748b;
+  --accent: #0e9bb8;
+  --accent-strong: #0c7f99;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --err: #dc2626;
+  --border: #d7dde3;
+  --shadow: 0 1px 3px rgba(15, 30, 45, 0.08);
+  --dot-off: #b6c0ca;
+  --radius: 10px;
+}
+
+html[data-theme="dark"] {
+  --bg: #12171d;
+  --panel: #1a212a;
+  --panel-2: #212b36;
+  --text: #e6ecf2;
+  --text-dim: #8fa1b3;
+  --accent: #22b8d4;
+  --accent-strong: #35c6e0;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --err: #f87171;
+  --border: #2c3844;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --dot-off: #3a4754;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  user-select: none;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+.mono { font-family: Consolas, "Cascadia Mono", monospace; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.hidden { display: none !important; }
+.w60 { width: 64px; }
+.w80 { width: 84px; }
+.w120 { width: 128px; }
+.w160 { width: 180px; }
+.empty { color: var(--text-dim); font-style: italic; }
+
+/* ============ 头部 ============ */
+#titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px 6px;
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+.head-actions { display: flex; gap: 10px; }
+
+/* 分段选择器 */
+.seg { display: inline-flex; background: var(--panel-2); border-radius: 8px; padding: 2px; gap: 2px; }
+.seg-btn {
+  border: 0; background: transparent; color: var(--text-dim);
+  padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit;
+}
+.seg-btn.active { background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+
+/* ============ 页签 ============ */
+#tabs { display: flex; gap: 4px; padding: 4px 14px 0; }
+.tab {
+  border: 0; background: transparent; color: var(--text-dim);
+  font: inherit; padding: 8px 16px; cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* ============ 主体 ============ */
+#main { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px; }
+.pane { display: none; flex-direction: column; gap: 12px; }
+.pane.active { display: flex; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.card-title { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 2px; }
+
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lbl { min-width: 70px; color: var(--text-dim); }
+.lbl-s { color: var(--text-dim); font-size: 12px; }
+.colon { color: var(--text-dim); }
+.hint { color: var(--text-dim); font-size: 12px; }
+.hint-col { display: flex; flex-direction: column; gap: 6px; }
+
+input[type="text"], textarea, select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  outline: none;
+}
+input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
+textarea { resize: vertical; }
+
+input[type="text"].invalid { border-color: var(--err); }
+
+.btn {
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 7px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.btn.primary:hover { background: var(--accent-strong); }
+.btn.small { padding: 3px 10px; font-size: 12px; }
+.btn:disabled { opacity: 0.5; cursor: default; }
+
+.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim); cursor: pointer; }
+.chk input { accent-color: var(--accent); }
+
+/* ============ 列表 ============ */
+.list {
+  list-style: none;
+  max-height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.list li {
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  word-break: break-all;
+}
+.list li .x { margin-left: auto; cursor: pointer; color: var(--text-dim); border: 0; background: none; font-size: 14px; }
+.list li .x:hover { color: var(--err); }
+
+/* ============ 进度卡片 ============ */
+.pcard {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  margin-bottom: 6px;
+}
+.pcard .phead { display: flex; align-items: center; gap: 8px; }
+.pcard .pname { font-weight: 600; word-break: break-all; }
+.pcard .pmeta { margin-left: auto; color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+.pcard .pstate { font-size: 12px; padding: 1px 8px; border-radius: 99px; }
+.pstate.running { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.pstate.done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.pstate.failed { color: var(--err); background: color-mix(in srgb, var(--err) 14%, transparent); }
+.pcard progress { width: 100%; height: 8px; accent-color: var(--accent); }
+.pcard .perr { color: var(--err); font-size: 12px; word-break: break-all; }
+
+/* ============ 接收三卡 ============ */
+.recv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.recv-card { min-width: 0; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dot-off); display: inline-block; }
+.dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+
+/* 绑定地址下拉多选（规格 §3.3：族通配 + 具体网卡，每勾选地址一个监听器） */
+.dd { position: relative; min-width: 0; }
+.dd-toggle { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; font-weight: 400; }
+.dd-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-caret { color: var(--text-dim); font-size: 11px; }
+.dd-panel {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 60;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow); max-height: 220px; overflow-y: auto;
+  padding: 6px; display: flex; flex-direction: column; gap: 2px;
+}
+.dd-panel .chk { padding: 5px 8px; border-radius: 6px; cursor: pointer; }
+.dd-panel .chk:hover { background: var(--panel-2); }
+.bound-hint { font-size: 11px; color: var(--ok); font-weight: 400; margin-left: auto; word-break: break-all; }
+
+/* 设备卡 */
+.tag { font-size: 11px; padding: 1px 8px; border-radius: 99px; background: var(--panel); border: 1px solid var(--border); color: var(--text-dim); }
+.tag.online { color: var(--ok); border-color: var(--ok); }
+.tag.pair { color: var(--warn); border-color: var(--warn); }
+
+/* ============ 二维码 ============ */
+.qr-row { align-items: flex-start; }
+.qr-box {
+  width: 232px; height: 232px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+}
+.qr-box svg { display: block; }
+.qr-empty { color: var(--text-dim); font-size: 12px; padding: 12px; text-align: center; }
+
+/* ============ 校验 ============ */
+.verify-results { display: flex; gap: 12px; }
+.vstat { flex: 1; text-align: center; background: var(--panel-2); border-radius: 8px; padding: 8px; }
+.vstat b { display: block; font-size: 20px; }
+.vstat span { color: var(--text-dim); font-size: 12px; }
+#verify-mismatch { max-height: 160px; }
+#verify-mismatch li { color: var(--err); }
+
+progress { accent-color: var(--accent); }
+
+/* ============ 日志栏 ============ */
+#logbar {
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  padding: 6px 14px 8px;
+  height: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+#log-list { max-height: 100px; font-size: 12px; }
+#log-list li { background: transparent; padding: 1px 6px; }
+#log-list li.ok { color: var(--ok); }
+#log-list li.err { color: var(--err); }
+#log-list li.warn { color: var(--warn); }
+
+/* ============ Toast ============ */
+#toast-layer {
+  position: fixed;
+  right: 16px; bottom: 160px;
+  display: flex; flex-direction: column; gap: 8px;
+  z-index: 99;
+}
+.toast {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 10px 14px;
+  max-width: 380px;
+  display: flex; align-items: center; gap: 10px;
+}
+.toast.err { border-left-color: var(--err); }
+.toast.ok { border-left-color: var(--ok); }
+.toast .tmsg { word-break: break-all; font-size: 13px; }
+.toast .tbtn { border: 1px solid var(--border); background: var(--panel-2); color: var(--text); border-radius: 6px; padding: 3px 10px; cursor: pointer; font: inherit; }
+
+/* 拖放高亮 */
+body.dragging::after {
+  content: "";
+  position: fixed; inset: 0;
+  border: 3px dashed var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  pointer-events: none;
+  z-index: 98;
+}
+
+/* ============ M5'：接收前确认弹窗 ============ */
+#confirm-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 200;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 18px 20px;
+  width: min(420px, 90vw);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.modal-title { font-weight: 600; }
+.modal-msg { font-size: 13px; word-break: break-all; }
+.modal-count { font-size: 12px; opacity: 0.7; }
+.modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* 监控卡状态点与卡片标题对齐 */
+#monitor-card .card-title { gap: 8px; }

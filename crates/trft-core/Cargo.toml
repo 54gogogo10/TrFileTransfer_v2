@@ -1,0 +1,42 @@
+[package]
+name = "trft-core"
+version.workspace = true
+edition.workspace = true
+description = "TrFileTransfer v2 核心库：线协议、加密、传输逻辑（零 UI 依赖）"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json = "1"
+toml.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+aes = "0.8"
+ctr = "0.9"
+cipher = "0.4"
+generic-array = "0.14"
+subtle = "2"
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reed-solomon-erasure = "6"
+fs4 = "0.13"
+socket2 = "0.6"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+flate2 = "1.1.10"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize", "alloc"] }
+webpki-roots = "1.0.11"
+time = { version = "0.3", default-features = false, features = ["std", "local-offset"] }
+# 监控模式事件加速器（TECH-STACK §7.10：事件只提前触发扫描，不承载判定；
+# 初始化失败自动退化为纯轮询，功能零损失）。
+notify = "7"
+
+[dev-dependencies]
+# 判别测试用暂停时钟（start_paused）：节流逻辑须确定性验证。
+tokio = { workspace = true, features = ["test-util"] }

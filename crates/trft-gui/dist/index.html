@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TrFileTransfer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header id="titlebar">
+    <div class="brand">
+      <img src="icon.png" alt="" width="22" height="22" />
+      <span>TrFileTransfer</span>
+    </div>
+    <div class="head-actions">
+      <div class="seg" id="lang-seg">
+        <button id="lang-zh" class="seg-btn">中文</button>
+        <button id="lang-en" class="seg-btn">EN</button>
+      </div>
+      <div class="seg" id="theme-seg">
+        <button id="theme-light" class="seg-btn" title="Light">☀</button>
+        <button id="theme-system" class="seg-btn" title="System">◐</button>
+        <button id="theme-dark" class="seg-btn" title="Dark">☾</button>
+      </div>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button class="tab active" data-tab="send" data-i18n="tab_send">发送</button>
+    <button class="tab" data-tab="recv" data-i18n="tab_recv">接收</button>
+    <button class="tab" data-tab="share" data-i18n="tab_share">共享</button>
+    <button class="tab" data-tab="verify" data-i18n="tab_verify">校验</button>
+    <button class="tab" data-tab="stats" data-i18n="tab_stats">历史</button>
+    <button class="tab" data-tab="settings" data-i18n="tab_settings">设置</button>
+  </nav>
+
+  <main id="main">
+    <!-- ============ 发送 ============ -->
+    <section class="pane active" id="pane-send">
+      <div class="card">
+        <div class="row">
+          <label class="lbl" data-i18n="kind">类型</label>
+          <div class="seg" id="kind-seg">
+            <button class="seg-btn active" data-kind="file" data-i18n="kind_file">文件</button>
+            <button class="seg-btn" data-kind="folder" data-i18n="kind_folder">文件夹</button>
+            <button class="seg-btn" data-kind="text" data-i18n="kind_text">文本</button>
+          </div>
+        </div>
+        <div class="row" id="path-row">
+          <label class="lbl" data-i18n="path">路径</label>
+          <input type="text" id="send-path" class="grow mono" placeholder="C:\path\to\file" />
+          <button id="btn-browse" class="btn" data-i18n="browse">浏览…</button>
+        </div>
+        <div class="row hidden" id="text-row">
+          <label class="lbl" data-i18n="text">文本</label>
+          <textarea id="send-text" class="grow mono" rows="3" maxlength="1048576"></textarea>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="target">目标</label>
+          <input type="text" id="send-ip" class="mono" placeholder="192.168.1.20" />
+          <span class="colon">:</span>
+          <input type="text" id="send-port" class="mono w80" value="8080" />
+          <select id="send-proto">
+            <option value="tcp">TCP</option>
+            <option value="udt">UDT (QUIC)</option>
+            <option value="udp">UDP (单向)</option>
+          </select>
+          <input type="text" id="send-chunks" class="mono w80" placeholder="1-8" />
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="pairing">配对码</label>
+          <input type="text" id="send-code" class="mono w120" placeholder="——" />
+          <label class="lbl-s" data-i18n="limit">KB/s</label>
+          <input type="text" id="send-limit" class="mono w80" placeholder="0" />
+          <label class="chk"><input type="checkbox" id="send-compress" checked /><span data-i18n="compress">压缩</span></label>
+          <label class="chk"><input type="checkbox" id="send-encrypt" checked /><span data-i18n="encrypt">加密</span></label>
+        </div>
+        <div class="row hidden" id="folder-opts">
+          <label class="lbl" data-i18n="folder_mode">发送方式</label>
+          <select id="folder-mode">
+            <option value="sync" data-i18n="mode_sync">差量同步 0x04（二次只传差异）</option>
+            <option value="plain" data-i18n="mode_plain">整夹发送 0x01（全量）</option>
+          </select>
+          <span class="hint" data-i18n="sync_hint">按 (源路径, 目标地址) 派生稳定会话 ID，与 CLI sync 互相接力</span>
+        </div>
+        <div class="row hidden" id="udp-opts">
+          <label class="lbl-s" data-i18n="passes">重发轮数 1-5</label>
+          <input type="text" id="send-passes" class="mono w60" placeholder="2" />
+          <label class="lbl-s" data-i18n="fec_parity">FEC 校验片 1-8</label>
+          <input type="text" id="send-parity" class="mono w60" placeholder="2" />
+          <label class="chk"><input type="checkbox" id="send-nofec" /><span data-i18n="nofec">关闭 FEC</span></label>
+        </div>
+        <div class="row">
+          <button id="btn-send" class="btn primary" data-i18n="send">发送</button>
+          <button id="btn-send-chunked" class="btn hidden" data-i18n="send_chunked">并行分块发送</button>
+          <button id="btn-queue-add" class="btn" data-i18n="queue_add">加入队列</button>
+          <label class="chk"><input type="checkbox" id="send-gen-code-on" /><span data-i18n="gen_code">生成配对码</span></label>
+          <span class="hint" data-i18n="drop_hint">可直接拖入文件/文件夹</span>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="group_targets">群发目标（每行 ip:port）</label>
+          <textarea id="group-targets" class="grow mono" rows="2" placeholder="192.168.1.20:8080"></textarea>
+          <button id="btn-group-send" class="btn" data-i18n="group_send">并行群发</button>
+        </div>
+      </div>
+
+      <div class="card" id="monitor-card">
+        <div class="card-title">
+          <span data-i18n="monitor">监控模式</span>
+          <span class="dot" id="dot-monitor"></span>
+          <span class="grow"></span>
+          <button id="btn-monitor-start" class="btn small primary" data-i18n="monitor_start">启动监控</button>
+          <button id="btn-monitor-stop" class="btn small" data-i18n="monitor_stop">停止监控</button>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="monitor_dir">监控目录</label>
+          <input type="text" id="monitor-dir" class="grow mono" placeholder="C:\drop" />
+          <button id="btn-monitor-browse" class="btn" data-i18n="browse">浏览…</button>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="target">目标</label>
+          <input type="text" id="monitor-ip" class="mono" placeholder="192.168.1.20" />
+          <span class="colon">:</span>
+          <input type="text" id="monitor-port" class="mono w80" value="8080" />
+          <select id="monitor-proto">
+            <option value="tcp">TCP</option>
+            <option value="udt">UDT (QUIC)</option>
+            <option value="udp">UDP (单向)</option>
+          </select>
+          <input type="text" id="monitor-code" class="mono w120" placeholder="——" />
+        </div>
+        <div class="row"><span class="hint" data-i18n="monitor_hint">目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。</span></div>
+        <ul id="monitor-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
+      </div>
+
+      <div class="card" id="queue-card">
+        <div class="card-title">
+          <span data-i18n="queue">发送队列</span>
+          <span class="grow"></span>
+          <label class="lbl-s" data-i18n="after_done">完成后</label>
+          <select id="after-done">
+            <option value="none" data-i18n="ad_none">无动作</option>
+            <option value="shutdown" data-i18n="ad_shutdown">关机（60s 可取消）</option>
+            <option value="sleep" data-i18n="ad_sleep">休眠</option>
+            <option value="command" data-i18n="ad_command">执行命令</option>
+          </select>
+          <input type="text" id="after-command" class="mono w160 hidden" placeholder="cmd /C 命令" />
+          <button id="btn-queue-run" class="btn small" data-i18n="queue_run">串行发送</button>
+          <button id="btn-queue-clear" class="btn small" data-i18n="queue_clear">清空</button>
+        </div>
+        <ul id="queue-list" class="list"><li class="empty" data-i18n="queue_empty">队列为空</li></ul>
+      </div>
+
+      <div class="card" id="progress-card">
+        <div class="card-title" data-i18n="progress">传输进度</div>
+        <div id="progress-list"></div>
+      </div>
+
+      <div class="card" id="devices-card">
+        <div class="card-title">
+          <span data-i18n="devices">设备</span>
+          <span class="grow"></span>
+          <button id="btn-discover" class="btn small" data-i18n="discover">发现设备</button>
+          <button id="btn-devices-clear" class="btn small" data-i18n="devices_clear">清空记忆</button>
+        </div>
+        <ul id="devices-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
+      </div>
+    </section>
+
+    <!-- ============ 接收 ============ -->
+    <section class="pane" id="pane-recv">
+      <div class="recv-grid">
+        <div class="card recv-card" data-proto="tcp">
+          <div class="card-title"><span class="dot" id="dot-tcp"></span><span>TCP</span></div>
+          <div class="row"><label class="lbl" data-i18n="port">端口</label><input type="text" class="mono w80 recv-port" value="8080" /></div>
+          <div class="row"><label class="lbl" data-i18n="save_dir">保存目录</label><input type="text" class="grow mono recv-dir" /><button class="btn recv-browse" data-i18n="browse">浏览…</button></div>
+          <div class="row">
+            <label class="lbl" data-i18n="bind_addr">绑定地址</label>
+            <div class="dd grow" data-addr-proto="tcp">
+              <button type="button" class="dd-toggle btn grow"><span class="dd-label"></span><span class="dd-caret">▾</span></button>
+              <div class="dd-panel hidden"></div>
+            </div>
+          </div>
+          <div class="row">
+            <button class="btn primary recv-start" data-i18n="start">启动</button>
+            <button class="btn recv-stop" data-i18n="stop">停止</button>
+            <button class="btn recv-open" data-i18n="open_dir">打开目录</button>
+          </div>
+        </div>
+        <div class="card recv-card" data-proto="udt">
+          <div class="card-title"><span class="dot" id="dot-udt"></span><span>UDT (QUIC)</span></div>
+          <div class="row"><label class="lbl" data-i18n="port">端口</label><input type="text" class="mono w80 recv-port" value="8080" /></div>
+          <div class="row"><label class="lbl" data-i18n="save_dir">保存目录</label><input type="text" class="grow mono recv-dir" /><button class="btn recv-browse" data-i18n="browse">浏览…</button></div>
+                    <div class="row">
+            <label class="lbl" data-i18n="bind_addr">绑定地址</label>
+            <div class="dd grow" data-addr-proto="udt">
+              <button type="button" class="dd-toggle btn grow"><span class="dd-label"></span><span class="dd-caret">▾</span></button>
+              <div class="dd-panel hidden"></div>
+            </div>
+          </div>
+<div class="row">
+            <button class="btn primary recv-start" data-i18n="start">启动</button>
+            <button class="btn recv-stop" data-i18n="stop">停止</button>
+            <button class="btn recv-open" data-i18n="open_dir">打开目录</button>
+          </div>
+        </div>
+        <div class="card recv-card" data-proto="udp">
+          <div class="card-title"><span class="dot" id="dot-udp"></span><span>UDP (单向 + FEC)</span></div>
+          <div class="row"><label class="lbl" data-i18n="port">端口</label><input type="text" class="mono w80 recv-port" value="8080" /></div>
+          <div class="row"><label class="lbl" data-i18n="save_dir">保存目录</label><input type="text" class="grow mono recv-dir" /><button class="btn recv-browse" data-i18n="browse">浏览…</button></div>
+                    <div class="row">
+            <label class="lbl" data-i18n="bind_addr">绑定地址</label>
+            <div class="dd grow" data-addr-proto="udp">
+              <button type="button" class="dd-toggle btn grow"><span class="dd-label"></span><span class="dd-caret">▾</span></button>
+              <div class="dd-panel hidden"></div>
+            </div>
+          </div>
+<div class="row">
+            <button class="btn primary recv-start" data-i18n="start">启动</button>
+            <button class="btn recv-stop" data-i18n="stop">停止</button>
+            <button class="btn recv-open" data-i18n="open_dir">打开目录</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title" data-i18n="recent">最近接收</div>
+        <ul id="recent-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
+      </div>
+      <div class="card">
+        <div class="card-title">
+          <span data-i18n="text_history">文本历史（200 条）</span>
+          <span class="grow"></span>
+          <button id="btn-th-clear" class="btn small" data-i18n="clear">清空</button>
+        </div>
+        <ul id="text-history" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
+      </div>
+    </section>
+
+    <!-- ============ 共享 ============ -->
+    <section class="pane" id="pane-share">
+      <div class="card">
+        <div class="row">
+          <label class="lbl" data-i18n="port">端口</label>
+          <input type="text" id="http-port" class="mono w80" value="8090" />
+          <label class="lbl" data-i18n="share_dir">共享目录</label>
+          <select id="share-dir-sel">
+            <option value="save_dir_tcp">TCP</option>
+            <option value="save_dir_quic">UDT</option>
+            <option value="save_dir_udp">UDP</option>
+          </select>
+          <button id="btn-http-start" class="btn primary" data-i18n="share_start">开启共享</button>
+          <button id="btn-http-stop" class="btn" data-i18n="share_stop">停止共享</button>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="address">网卡地址</label>
+          <select id="qr-address" class="grow"></select>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="share_url">链接</label>
+          <input type="text" id="share-url" class="grow mono" readonly />
+          <button id="btn-copy-url" class="btn" data-i18n="copy">复制</button>
+        </div>
+        <div class="row qr-row">
+          <div id="qr-box" class="qr-box"></div>
+          <div class="hint-col">
+            <span class="hint" data-i18n="qr_hint">手机浏览器扫码即可浏览 / 上传 / 下载共享目录。</span>
+            <span class="hint mono" id="share-dir-line"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 校验 ============ -->
+    <section class="pane" id="pane-verify">
+      <div class="card">
+        <div class="row">
+          <span class="hint grow" data-i18n="verify_desc">聚合扫描全部已配置保存目录，重算 SHA-256 与摘要缓存比对（规格 §3.5）。</span>
+          <button id="btn-verify-start" class="btn primary" data-i18n="verify_start">开始校验</button>
+          <button id="btn-verify-stop" class="btn" data-i18n="verify_stop">停止</button>
+        </div>
+        <div class="row">
+          <progress id="verify-bar" class="grow" value="0" max="1"></progress>
+          <span id="verify-text" class="mono w120">0 / 0</span>
+        </div>
+        <div class="verify-results">
+          <div class="vstat"><b id="v-scanned">0</b><span data-i18n="v_scanned">已扫描</span></div>
+          <div class="vstat"><b id="v-hit">0</b><span data-i18n="v_hit">一致</span></div>
+          <div class="vstat"><b id="v-fresh">0</b><span data-i18n="v_fresh">无记录</span></div>
+          <div class="vstat"><b id="v-bad">0</b><span data-i18n="v_bad">不一致</span></div>
+          <div class="vstat"><b id="v-unread">0</b><span data-i18n="v_unread">无法读取</span></div>
+        </div>
+        <ul id="verify-mismatch" class="list mono"></ul>
+      </div>
+    </section>
+
+    <!-- ============ 历史（统计与历史，规格 §3.3） ============ -->
+    <section class="pane" id="pane-stats">
+      <div class="card">
+        <div class="card-title">
+          <span data-i18n="stats_summary">统计概览</span>
+          <span class="grow"></span>
+          <button id="btn-stats-refresh" class="btn small" data-i18n="refresh">刷新</button>
+          <button id="btn-stats-export" class="btn small" data-i18n="export_csv">导出 CSV</button>
+          <button id="btn-stats-clear" class="btn small" data-i18n="stats_clear">全部清除</button>
+        </div>
+        <div class="verify-results">
+          <div class="vstat"><b id="st-today-count">0</b><span data-i18n="st_today">今日次数</span></div>
+          <div class="vstat"><b id="st-today-bytes">0</b><span data-i18n="st_today_bytes">今日流量</span></div>
+          <div class="vstat"><b id="st-week-bytes">0</b><span data-i18n="st_week_bytes">7 天流量</span></div>
+          <div class="vstat"><b id="st-total-count">0</b><span data-i18n="st_total">累计次数</span></div>
+          <div class="vstat"><b id="st-total-bytes">0</b><span data-i18n="st_total_bytes">累计流量</span></div>
+        </div>
+        <div class="card-title" style="margin-top:8px" data-i18n="by_device">按设备明细</div>
+        <ul id="stats-devices" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
+      </div>
+      <div class="card">
+        <div class="card-title">
+          <span data-i18n="stats_history">传输历史</span>
+          <span class="grow"></span>
+          <select id="stats-direction">
+            <option value="all" data-i18n="dir_all">全部</option>
+            <option value="S" data-i18n="dir_s">发送</option>
+            <option value="R" data-i18n="dir_r">接收</option>
+          </select>
+        </div>
+        <ul id="stats-list" class="list mono"></ul>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="pane" id="pane-settings">
+      <div class="card">
+        <div class="card-title" data-i18n="settings_general">通用</div>
+        <div class="row">
+          <label class="lbl" data-i18n="pairing">配对码</label>
+          <input type="text" id="cfg-code" class="mono w120" placeholder="4-12 位数字" />
+          <label class="chk"><input type="checkbox" id="cfg-notify" /><span data-i18n="notify">完成通知</span></label>
+          <label class="chk"><input type="checkbox" id="cfg-autostart" /><span data-i18n="autostart">开机自启</span></label>
+          <label class="chk"><input type="checkbox" id="cfg-notify-sound" /><span data-i18n="notify_sound">提示音</span></label>
+        </div>
+        <div class="row">
+          <label class="chk"><input type="checkbox" id="cfg-sync-strict" /><span data-i18n="sync_strict">同步逐字节核对（绕过摘要缓存，双侧生效）</span></label>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="confirm_receive">接收前确认</label>
+          <select id="cfg-confirm">
+            <option value="off" data-i18n="cf_off">关闭（不确认）</option>
+            <option value="unknown" data-i18n="cf_unknown">仅未知设备（已知放行）</option>
+            <option value="all" data-i18n="cf_all">一律确认（30 秒无应答视为拒绝）</option>
+          </select>
+          <label class="chk"><input type="checkbox" id="cfg-per-device" /><span data-i18n="per_device">按设备分目录</span></label>
+          <label class="chk"><input type="checkbox" id="cfg-archive" /><span data-i18n="auto_archive">按日期归档</span></label>
+        </div>
+        <div class="row"><span class="hint" data-i18n="recv_dir_hint">分目录/归档作用于新接收会话；叠加顺序 = 保存目录/设备/日期。</span></div>
+        <div class="row">
+          <label class="lbl" data-i18n="ip_filter">IP 过滤</label>
+          <select id="cfg-filter-mode">
+            <option value="off" data-i18n="if_off">关闭</option>
+            <option value="allow" data-i18n="if_allow">白名单（allow）</option>
+            <option value="deny" data-i18n="if_deny">黑名单（deny）</option>
+          </select>
+          <textarea id="cfg-filter-list" class="grow mono" rows="2" placeholder="192.168.1.* / 10.0.0.0/8 / fe80::/16"></textarea>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="duplicate">重复文件</label>
+          <select id="cfg-duplicate">
+            <option value="rename" data-i18n="dup_rename">改名保留（file_1）</option>
+            <option value="skip" data-i18n="dup_skip">跳过相同内容</option>
+          </select>
+          <label class="lbl" data-i18n="cache_days">摘要缓存有效期（天）</label>
+          <input type="text" id="cfg-cache-days" class="mono w80" placeholder="7" />
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="save_dir">保存目录</label>
+          <span class="lbl-s mono">TCP</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_tcp" />
+          <button class="btn cfg-dir-browse" data-key="save_dir_tcp" data-i18n="browse">浏览…</button>
+        </div>
+        <div class="row">
+          <span class="lbl"></span>
+          <span class="lbl-s mono">UDT</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_quic" />
+          <button class="btn cfg-dir-browse" data-key="save_dir_quic" data-i18n="browse">浏览…</button>
+        </div>
+        <div class="row">
+          <span class="lbl"></span>
+          <span class="lbl-s mono">UDP</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_udp" />
+          <button class="btn cfg-dir-browse" data-key="save_dir_udp" data-i18n="browse">浏览…</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title" data-i18n="settings_limits">限速与 UDP</div>
+        <div class="row">
+          <label class="lbl" data-i18n="send_limit_lbl">发送限速 KB/s</label>
+          <input type="text" id="cfg-limit" class="mono w80" />
+          <label class="lbl" data-i18n="recv_limit_lbl">接收限速 KB/s</label>
+          <input type="text" id="cfg-recv-limit" class="mono w80" />
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="udp_passes_lbl">UDP 重发轮数</label>
+          <input type="text" id="cfg-passes" class="mono w60" />
+          <label class="chk"><input type="checkbox" id="cfg-fec" /><span data-i18n="fec">FEC 前向纠错</span></label>
+          <label class="lbl" data-i18n="udp_parity_lbl">校验片</label>
+          <input type="text" id="cfg-parity" class="mono w60" />
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title" data-i18n="settings_update">更新</div>
+        <div class="row">
+          <label class="lbl" data-i18n="update_url">清单 URL</label>
+          <input type="text" id="cfg-update-url" class="grow mono" placeholder="https://…" />
+          <button id="btn-check-update" class="btn" data-i18n="check_update">检查更新</button>
+        </div>
+        <div class="row"><span class="hint" id="version-line"></span></div>
+        <div class="row">
+          <span class="grow"></span>
+          <button id="btn-save-cfg" class="btn primary" data-i18n="save">保存设置</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="logbar">
+    <div class="card-title" id="log-title"><span data-i18n="logs">日志</span><span class="grow"></span><button id="btn-log-clear" class="btn small" data-i18n="clear">清空</button></div>
+    <ul id="log-list" class="list mono"></ul>
+  </footer>
+
+  <div id="toast-layer"></div>
+
+  <!-- 接收前确认弹窗（规格 §3.3：30 秒无应答视为拒绝；fail-closed） -->
+  <div id="confirm-overlay" class="hidden">
+    <div class="modal">
+      <div class="modal-title" data-i18n="confirm_title">接收确认</div>
+      <div id="confirm-msg" class="modal-msg"></div>
+      <div class="modal-count mono" id="confirm-count"></div>
+      <div class="modal-btns">
+        <button id="btn-confirm-allow" class="btn primary" data-i18n="confirm_allow">允许接收</button>
+        <button id="btn-confirm-deny" class="btn" data-i18n="confirm_deny">拒绝</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
