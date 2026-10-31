@@ -85,7 +85,15 @@ pub struct AppState {
     pub confirm_seen: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, std::time::Instant>>>,
     /// 监控模式（M5'：单实例；stop 信号 + 任务句柄）。
     pub monitor_stop: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
-    pub monitor_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// `gen` 代际令牌（轮 7 F7）：run_monitor 立即失败的清理任务与
+    /// monitor_start 的槽位写入竞态——凭 ptr_eq 判定「还是本代」才清/写。
+    pub monitor_handle: Mutex<Option<MonitorTask>>,
+}
+
+/// 监控任务句柄（代际令牌见上）。
+pub struct MonitorTask {
+    pub gen: Arc<()>,
+    pub handle: tauri::async_runtime::JoinHandle<()>,
 }
 
 impl AppState {

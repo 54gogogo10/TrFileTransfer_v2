@@ -158,6 +158,14 @@
    - **文件夹 0x01 失败自动转 0x04 差量续传**（规格 §3.2 AutoRetry 句末——`send_folder_auto`：0x01 逐文件回填本地摘要缓存 → 失败（非用法/认证/不支持类）以稳定会话 ID 转 0x04，已完整发出的文件被服务端核对跳过；判别 e2e `folder_send_falls_back_to_resume_after_failure`——前置代理掐断第 1 条连接模拟中断）；
    - **分块默认 4 路对齐规格 §3.1**（GUI 此前默认 2）；**防火墙提示按所启协议生成**（QUIC/单向 UDP → protocol=UDP；此前恒 TCP，首个启动为 UDT/UDP 接收器时命令无效）；**WIRE-PROTOCOL §3.4 修正**（已组装会话的 0x0B 应答为 `0x01`+满覆盖——与 PRODUCT-SPEC §4.1/§7.8 一致，文档漂移）；compress.rs 模块头注释同步 9B 段头；
    - **登记接受（不修）**：CLI `update --restart` 判用法错误（CLI 进程重启后无动词，语义不成立）；「同步会话」对话框（枚举+两步确认重置）未实现（磁盘即状态模型下语义弱化，WIRE §3.7 已注明 sessionId 为保留字段）；数据文件布局与 §8.1 C# 清单的差异（每目录 `.trft-hash-cache.txt` vs 全局 `hash-cache-*.txt`、`text-history.txt` vs `.log`、`config.toml` vs `.ini` 且不做旧 C# 配置迁移——与「不互通承诺」一致，stats.log 保留旧行兼容）；GUI 发送面板缺 SrcPort 输入（CLI `--srcport` 可用，GUI 面板后续按需补）；TCP 收发缓冲 4MB（§6.2）未显式设置——OS 默认在环回/LAN 表现充分，性能旋钮待实测有据再调。
+17. **第二轮全量审查·轮 7（GUI/CLI 命令层 + 前端 JS）新增口径**（2026-11-01）：
+   - **P1 暂停/继续链路自毁回归**（轮 7 历史「取消补发终态事件」与暂停清理互相打架——终态事件先于 invoke 返回到达，前端无条件清 reqByTask/pausedTasks/taskByProgress：继续按钮失忆抛 TypeError、onProgress 暂停守卫恒死代码）：`send_cancel` 增 `paused` 标记，前端暂停**先置位再 invoke** + 事件处理器对 paused 任务保留映射（继续/暂停守卫恢复可用）；
+   - **队列 UDP 项被静默改走 TCP**（kind 映射与直发路径不一致 + UDP 三参数不入快照）：队列构造对齐 `proto=udp → "udpfile"`，passes/fecParity/nofec 入快照与 queue.txt（12 字段行，旧格式兼容）；
+   - **0x02 回退 0x03 的进度卡无按钮**（第二 progressId 不在 task-start 事件里）：回退分支补发 `trft://task-start`；
+   - **窗口隐藏停共享后前端假「运行中」**（死二维码）：新增 `trft://sync-state` 事件（停共享/接收器自摘/监控自摘统一发），前端重拉 `get_app_state` 复位共享页/圆点/按钮；
+   - **监控槽位写入竞态**（run_monitor 立即失败的清理与 start 的写入交错 → 死句柄槽）：MonitorTask 代际令牌（占位先行 + ptr_eq 判代覆盖/清理）；
+   - **校验可并发重入**（双击 → 双扫描互踩）：tasks 表在跑即拒绝；**主题/语言切换即时持久化**（与 qr-address 一致，重启不丢）；**GUI UDP 约束守卫**（folder/text + udp → L10N 提示，此前晦涩 IO 错）；**CLI 参数组合显式报错**（--passes/--fec-parity/--nofec 非 UDP、--srcport UDP、--chunks 非 --file）；CLI update 死代码删除；队列逐项校验（NaN port 不再让整批反序列化失败）+ persistQueue 失败可见；主动取消的 toast 文案与失败区分（取消仅 warn 日志）；
+   - **登记接受（不修）**：接收确认弹窗并发（单 overlay——并发确认时前序靠后端 31s 看门狗 fail-closed 拒绝，无用户可感知错误，仅 UI 上后到覆盖先到；排队/徽标属打磨项）。
 
 ## 8. 记录在案的否决项
 

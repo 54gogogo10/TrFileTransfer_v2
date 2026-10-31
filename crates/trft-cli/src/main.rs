@@ -263,11 +263,26 @@ async fn run() -> i32 {
                 if !(1..=5).contains(&p) {
                     return usage_fail("--passes 取值 1–5");
                 }
+                if proto != Proto::Udp {
+                    return usage_fail("--passes 仅用于 --proto udp");
+                }
             }
             if let Some(fp) = fec_parity {
                 if !(1..=8).contains(&fp) {
                     return usage_fail("--fec-parity 取值 1–8");
                 }
+                if proto != Proto::Udp {
+                    return usage_fail("--fec-parity 仅用于 --proto udp");
+                }
+            }
+            if nofec && proto != Proto::Udp {
+                return usage_fail("--nofec 仅用于 --proto udp");
+            }
+            if proto == Proto::Udp && srcport.is_some() {
+                return usage_fail("--srcport 不适用于 --proto udp");
+            }
+            if chunks.is_some() && (folder.is_some() || text.is_some()) {
+                return usage_fail("--chunks 仅适用于单文件（--file）");
             }
             let addr = match addr_of(&ip, port) {
                 Ok(a) => a,
@@ -509,11 +524,6 @@ async fn run() -> i32 {
                 Ok(Some(bak)) => {
                     let _ = std::fs::remove_file(&bak); // 成功换入后清理备份
                     println!("已更新并换入（旧文件备份 {}）", bak.display());
-                    if restart {
-                        if let Err(e) = trft_core::update::spawn_restarted() {
-                            return fail(&format!("已更新但重启失败（请手动启动）: {e}"));
-                        }
-                    }
                     0
                 }
                 Ok(None) => {

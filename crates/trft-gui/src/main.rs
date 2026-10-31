@@ -106,6 +106,8 @@ fn main() {
 
 /// 停止 HTTP 共享（窗口隐藏时；规格 §3.4「随主窗口关闭停止」，轮 6 P2-2）。
 /// 与 `http_stop` 同逻辑但不依赖前端调用；未运行时为空操作。
+/// 轮 7 F4：补发 `trft://sync-state`——前端复位共享页（死二维码/假「运行中」
+/// 假象）并在窗口重显时同步。
 fn stop_http_share<R: tauri::Runtime>(window: &tauri::Window<R>) {
     use tauri::Emitter as _;
     let app = window.app_handle();
@@ -119,6 +121,7 @@ fn stop_http_share<R: tauri::Runtime>(window: &tauri::Window<R>) {
             .unwrap_or(false);
         if stopped {
             let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": "窗口已隐藏，HTTP 共享已停止" }));
+            let _ = app.emit("trft://sync-state", ());
         }
     }
 }

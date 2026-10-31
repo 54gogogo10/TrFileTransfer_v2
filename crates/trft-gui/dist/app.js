@@ -52,6 +52,7 @@ const L10N = {
     started: "已启动", stopped: "已停止", http_on: "共享已开启", http_off: "共享未运行",
     verify_done: "校验完成", send_fail: "发送失败", lang_locked: "传输进行中，语言切换已锁定",
     queue_sent: "队列已全部执行", queue_full: "队列已达 500 项上限",
+    udp_file_only: "单向 UDP 仅支持单文件（无握手通道）",
     tab_stats: "历史",
     stats_summary: "统计概览", refresh: "刷新", export_csv: "导出 CSV", stats_clear: "全部清除",
     st_today: "今日次数", st_today_bytes: "今日流量", st_week_bytes: "7 天流量", st_total: "累计次数", st_total_bytes: "累计流量",
@@ -114,6 +115,7 @@ const L10N = {
     started: "started", stopped: "stopped", http_on: "Sharing started", http_off: "Sharing not running",
     verify_done: "Verify finished", send_fail: "Send failed", lang_locked: "Language locked during transfers",
     queue_sent: "Queue finished", queue_full: "Queue reached the 500-item limit",
+    udp_file_only: "One-way UDP supports single files only (no handshake channel)",
     tab_stats: "History",
     stats_summary: "Overview", refresh: "Refresh", export_csv: "Export CSV", stats_clear: "Clear all",
     st_today: "Today", st_today_bytes: "Today bytes", st_week_bytes: "7-day bytes", st_total: "Total count", st_total_bytes: "Total bytes",
@@ -320,6 +322,8 @@ function sendRequest(kindOverride) {
   if (code && !(/^[0-9]{4,12}$/.test(code))) errs.push(t("pairing"));
   if (kind !== "text" && !req.path) errs.push(t("path"));
   if (kind === "text" && !req.text) errs.push(t("text"));
+  // 轮 7 F8：GUI 补 CLI 同款 UDP 约束（此前给的是晦涩 IO 错误）。
+  if (req.proto === "udp" && (kind === "folder" || kind === "text")) errs.push(t("udp_file_only"));
   return { req, errs };
 }
 
@@ -379,9 +383,10 @@ function renderQueue() {
 function persistQueue() {
   const items = queueItems.map((q) => q.snap
     ? { kind: q.kind, path: q.path, ip: q.snap.ip, port: q.snap.port, proto: q.snap.proto,
-        code: q.snap.code, limit: q.snap.limit, nocompress: q.snap.nocompress, noencrypt: q.snap.noencrypt }
+        code: q.snap.code, limit: q.snap.limit, nocompress: q.snap.nocompress, noencrypt: q.snap.noencrypt,
+        passes: q.snap.passes, fecParity: q.snap.fecParity, nofec: q.snap.nofec }
     : { kind: q.kind, path: q.path });
-  invoke("queue_save", { items }).catch(() => {});
+  invoke("queue_save", { items }).catch((e) => toast(t("send_fail") + ": " + e, "err"));
 }
 function queueSnapshot() {
   return {
@@ -392,6 +397,9 @@ function queueSnapshot() {
     limit: parseInt($("#send-limit").value, 10) || null,
     nocompress: !$("#send-compress").checked,
     noencrypt: !$("#send-encrypt").checked,
+    passes: parseInt($("#send-passes").value, 10) || null,
+    fecParity: parseInt($("#send-parity").value, 10) || null,
+    nofec: $("#send-nofec").checked,
   };
 }
 $("#btn-queue-add").addEventListener("click", () => {
@@ -408,17 +416,32 @@ $("#btn-queue-clear").addEventListener("click", () => { queueItems.length = 0; r
 $("#btn-queue-run").addEventListener("click", async () => {
   if (!queueItems.length) return;
   // 轮 6 P2-4：逐项按入队快照构造（旧条目无快照时回落当前面板值）。
+  // 轮 7 F2：kind 映射与直发路径一致（proto=udp → "udpfile"）——此前队列
+  // 里的 UDP 项被静默改走 TCP/0x03；UDP 专属参数（passes/fecParity/nofec）
+  // 一并入快照（此前恒丢）。
   const cur = queueSnapshot();
-  const reqs = queueItems.map((item) => {
+  // 轮 7 F13：逐项校验（NaN port 快照此前让整个 invoke 反序列化失败、整批不执行）。
+  const bad = queueItems.filter((item) => {
     const sp = item.snap || cur;
+    return !sp.ip || !(sp.port >= 1 && sp.port <= 65535);
+  });
+  if (bad.length) {
+    toast(t("group_bad_target") + " ×" + bad.length, "err");
+  }
+  const reqs = queueItems.filter((item) => {
+    const sp = item.snap || cur;
+    return !!sp.ip && sp.port >= 1 && sp.port <= 65535;
+  }).map((item) => {
+    const sp = item.snap || cur;
+    const kind0 = item.kind === "folder" ? "folder" : "file";
     return {
-      kind: item.kind === "folder" ? "folder" : "file",
+      kind: sp.proto === "udp" ? "udpfile" : kind0,
       path: item.path, text: null,
       ip: sp.ip, port: sp.port,
       proto: sp.proto === "udp" ? "udp" : sp.proto,
       code: sp.code, limit: sp.limit,
       chunks: null, nocompress: sp.nocompress, noencrypt: sp.noencrypt,
-      passes: null, fecParity: null, nofec: false, pin: null,
+      passes: sp.passes, fecParity: sp.fecParity, nofec: !!sp.nofec, pin: null,
     };
   });
   // 完成后动作执行前确认（规格 §3.2：执行前弹确认）。
@@ -650,11 +673,13 @@ function attachCardButtons(progressId, card) {
   };
   const pauseBtn = mk(pausedTasks.has(taskId) ? t("resume") : t("pause"), async () => {
     if (!pausedTasks.has(taskId)) {
-      await invoke("send_cancel", { id: taskId });
+      // 轮 7 F1：先置位再 invoke——send_cancel 的终态事件可能先于 invoke
+      // 返回到达，置位晚了会被事件处理器当取消清理干净（暂停自毁回归）。
       pausedTasks.add(taskId);
       card.state.textContent = t("paused");
       card.state.className = "pstate failed";
       pauseBtn.textContent = t("resume");
+      await invoke("send_cancel", { id: taskId, paused: true });
     } else {
       const entry = reqByTask.get(taskId);
       pausedTasks.delete(taskId);
@@ -1290,6 +1315,22 @@ async function closeConfirm(id, allow) {
 /* ============ 事件接线 ============ */
 async function wireEvents() {
   await listen("trft://progress", (ev) => onProgress(ev.payload));
+  // 轮 7 F4/F7：后端异步状态变化（窗口隐藏停共享/接收器自摘/监控自摘）——
+  // 前端重拉状态复位按钮/圆点/共享页（死二维码假「运行中」）。
+  await listen("trft://sync-state", async () => {
+    try {
+      appState = await invoke("get_app_state");
+      httpInfo = null;
+      $("#share-dir-line").textContent = "";
+      refreshQr();
+      renderReceivers();
+      invoke("monitor_status").then((on) => {
+        $("#dot-monitor").classList.toggle("on", !!on);
+        $("#btn-monitor-start").disabled = !!on;
+        $("#btn-monitor-stop").disabled = !on;
+      }).catch(() => {});
+    } catch (e) { /* 状态重拉失败保旧值 */ }
+  });
   await listen("trft://task-start", (ev) => {
     const p = ev.payload;
     taskByProgress.set(p.progressId, p.id);
@@ -1298,6 +1339,21 @@ async function wireEvents() {
   });
   await listen("trft://task", (ev) => {
     const p = ev.payload;
+    // 轮 7 F1：暂停的终态事件（paused 标记）不清 reqByTask/pausedTasks/
+    // taskByProgress——「继续」按钮与 onProgress 暂停守卫都依赖它们。
+    const isPaused = !!p.paused || pausedTasks.has(p.id);
+    if (isPaused) {
+      if (groupPending.delete(p.id)) {
+        // 群发槽位收敛（不计失败）——否则汇总永不出现。
+        if (groupPending.size === 0 && groupTotal > 0) {
+          const msg = t("group_summary") + " " + groupOk + " / " + groupTotal + (groupFail ? " (" + t("send_fail") + " " + groupFail + ")" : "");
+          toast(msg, groupFail ? "err" : "ok");
+          log(groupFail ? "warn" : "ok", msg);
+          groupTotal = 0; groupOk = 0; groupFail = 0;
+        }
+      }
+      return;
+    }
     reqByTask.delete(p.id);
     pausedTasks.delete(p.id);
     if (groupPending.delete(p.id)) {
@@ -1310,9 +1366,13 @@ async function wireEvents() {
       }
     }
     if (p.ok) { log("ok", "#" + p.id + " " + (p.summary || "OK")); if (p.summary) beep(); }
+    else if (p.error === "已取消") {
+      // 轮 7 F5：主动取消不是失败——warn 日志即可，不弹失败 toast。
+      log("warn", "#" + p.id + " " + (p.error || ""));
+    }
     else {
       log("err", "#" + p.id + " " + t("send_fail") + ": " + (p.error || ""));
-      toast(t("send_fail") + ": " + p.error, "err");
+      toast(t("send_fail") + ": " + (p.error || ""), "err");
     }
     for (const [k, v] of taskByProgress) { if (v === p.id) taskByProgress.delete(k); }
     scheduleStatsRefresh();
@@ -1391,11 +1451,21 @@ function setLang(v) {
   applyLang();
   renderQueue();
   renderAddrDropdowns();
+  // 轮 7 F11：即时持久化（与 qr-address 一致）——否则关窗保存的 cfg 不含
+  // 本次改动，重启丢语言。
+  if (appState) {
+    appState.config.language = v;
+    invoke("save_config", { config: appState.config }).catch(() => {});
+  }
 }
 ["light", "system", "dark"].forEach((mode) => {
   $("#theme-" + mode).addEventListener("click", () => {
     localStorage.setItem("trft-theme", mode);
-    if (appState) appState.config.theme = mode;
+    if (appState) {
+      appState.config.theme = mode;
+      // 轮 7 F11：即时持久化（同上）。
+      invoke("save_config", { config: appState.config }).catch(() => {});
+    }
     applyTheme();
   });
 });
@@ -1431,7 +1501,8 @@ $("#btn-log-clear").addEventListener("click", () => {
         ? { kind: it.kind, path: it.path, snap: {
             ip: it.ip || "", port: it.port || 0, proto: it.proto || "tcp",
             code: it.code || null, limit: it.limit || null,
-            nocompress: !!it.nocompress, noencrypt: !!it.noencrypt } }
+            nocompress: !!it.nocompress, noencrypt: !!it.noencrypt,
+            passes: it.passes || null, fecParity: it.fecParity || null, nofec: !!it.nofec } }
         : { kind: it.kind, path: it.path });
     });
     renderQueue();

@@ -22,7 +22,7 @@ use trft_core::transfer::udp::{send_file_udp, serve_udp_on, UdpRecvOptions, UdpS
 use trft_core::transfer::Transport;
 use trft_core::monitor::MonitorProto;
 
-use crate::state::{forward_progress, AppState, DiscoveryAnswer, HttpHandle, Proto, ReceiverHandle, TaskHandle};
+use crate::state::{forward_progress, AppState, DiscoveryAnswer, HttpHandle, MonitorTask, Proto, ReceiverHandle, TaskHandle};
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -442,6 +442,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
     // 首卡（0x02）Reporter 在 spawn 前注册：任务↔进度卡绑定需要它的 ID。
     let first_reporter = hub.register("send", &name, 0);
     let first_progress_id = first_reporter.id();
+    let app3 = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
         // 0x02 与回退 0x03 是两张进度卡：各注册一个 Reporter（同一事件通道）。
         let mut chunked_opts = base.clone();
@@ -450,7 +451,15 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
             Err(trft_core::error::Error::Unsupported(m)) => {
                 let _ = app2.emit("trft://log", serde_json::json!({ "level": "warn", "message": m }));
                 let mut auto_opts = base;
-                auto_opts.progress = Some(hub.register("send", name3, 0));
+                let fallback_reporter = hub.register("send", name3, 0);
+                let fallback_progress_id = fallback_reporter.id();
+                auto_opts.progress = Some(fallback_reporter);
+                // 回退卡补发 task-start（轮 7 F3）：否则 progressId 绑定链断裂——
+                // 回退 0x03 可能是长时间全量重发，卡片无暂停/取消按钮。
+                let _ = app3.emit(
+                    "trft://task-start",
+                    serde_json::json!({ "id": id, "progressId": fallback_progress_id }),
+                );
                 send_file_auto(addr, &path, &auto_opts).await
             }
             other => other,
@@ -468,7 +477,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
 }
 
 #[tauri::command]
-pub fn send_cancel(app: tauri::AppHandle, id: u64) {
+pub fn send_cancel(app: tauri::AppHandle, id: u64, paused: Option<bool>) {
     let t = {
         let st = app.state::<AppState>();
         let mut g = st.tasks.lock().expect("任务锁");
@@ -478,9 +487,18 @@ pub fn send_cancel(app: tauri::AppHandle, id: u64) {
         t.handle.abort();
         // 补发终态事件（轮 7 P2）：abort 掐断的 future 不会走 settle_send——
         // 群发汇总（groupPending）依赖 trft://task 收敛。
+        // `paused` 标记（轮 7 F1）：暂停与取消共用 abort，但前端必须区分——
+        // 暂停的终态事件不得清 reqByTask/pausedTasks/taskByProgress（否则
+        // 「继续」按钮失忆、暂停守卫恒死代码——暂停链路实机不可用）。
+        let is_pause = paused.unwrap_or(false);
         let _ = app.emit(
             "trft://task",
-            serde_json::json!({ "id": id, "ok": false, "error": "已取消" }),
+            serde_json::json!({
+                "id": id,
+                "ok": false,
+                "error": if is_pause { "已暂停" } else { "已取消" },
+                "paused": is_pause,
+            }),
         );
     }
     let st = app.state::<AppState>();
@@ -753,6 +771,8 @@ fn receiver_task_exit(
             "trft://log",
             serde_json::json!({ "level": "warn", "message": format!("{} 接收器已全部退出", proto.label()) }),
         );
+        // 轮 7 F7：前端复位接收卡/标签圆点（异步退出此前只发日志）。
+        let _ = app.emit("trft://sync-state", ());
     }
 }
 
@@ -1178,8 +1198,15 @@ pub fn qr_svg(text: String) -> Result<String, String> {
 pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
     {
         let st = app.state::<AppState>();
-        if st.verify_stop.swap(false, Ordering::Relaxed) {
-            // 清残留标志
+        // 重入守卫（轮 7 F6）：tasks 表仍有校验任务 → 拒绝（双击会并发两个
+        // 扫描、双份进度/结果事件互踩）。先清 stop 残留标志再建任务。
+        let busy = {
+            let t = st.tasks.lock().expect("任务锁");
+            !t.is_empty()
+        };
+        st.verify_stop.store(false, Ordering::Relaxed);
+        if busy {
+            return Err("校验已在进行中".into());
         }
     }
     let cfg = app.state::<AppState>().config();
@@ -1551,19 +1578,46 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
     };
     mcfg.events = Some(etx);
 
+    // 代际令牌（轮 7 F7）：占位先行——run_monitor 立即失败的清理任务凭
+    // ptr_eq 判定「还是本代」才清；spawn 后凭同代覆盖真句柄。
+    let mgen = Arc::new(());
+    {
+        let st = app.state::<AppState>();
+        *st.monitor_handle.lock().expect("监控锁") =
+            Some(MonitorTask { gen: mgen.clone(), handle: tauri::async_runtime::spawn(async {}) });
+    }
     let a3 = app.clone();
+    let g3 = mgen.clone();
     let handle = tauri::async_runtime::spawn(async move {
         // run_monitor 启动即败（目录竞删等）——上报并清理句柄槽（轮 5 P3）。
         if let Err(e) = trft_core::monitor::run_monitor(mcfg).await {
             let _ = a3.emit("trft://log", serde_json::json!({ "level": "err", "message": format!("监控退出: {e}") }));
             let st = a3.state::<AppState>();
             *st.monitor_stop.lock().expect("监控锁") = None;
-            *st.monitor_handle.lock().expect("监控锁") = None;
+            let mut g = st.monitor_handle.lock().expect("监控锁");
+            if g.as_ref().is_some_and(|t| Arc::ptr_eq(&t.gen, &g3)) {
+                *g = None;
+                drop(g);
+                let _ = a3.emit("trft://sync-state", ()); // 轮 7 F7：前端复位监控按钮
+            }
         }
     });
-    let st = app.state::<AppState>();
-    *st.monitor_stop.lock().expect("监控锁") = Some(stx);
-    *st.monitor_handle.lock().expect("监控锁") = Some(handle);
+    {
+        let st = app.state::<AppState>();
+        let mut g = st.monitor_handle.lock().expect("监控锁");
+        match g.as_ref() {
+            Some(t) if Arc::ptr_eq(&t.gen, &mgen) => {
+                *g = Some(MonitorTask { gen: mgen.clone(), handle });
+            }
+            _ => {
+                // 占位已被清理任务摘除（启动即败）或被并发 start 替换：放弃本代。
+                drop(g);
+                handle.abort();
+                return Err("监控启动失败（或已在启动期间被停止）".into());
+            }
+        }
+    }
+    *app.state::<AppState>().monitor_stop.lock().expect("监控锁") = Some(stx);
     let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": format!("监控启动 {} → {}:{}", req.watch_dir, req.ip, req.port) }));
     update_awake(&app);
     Ok(())
@@ -1585,9 +1639,9 @@ pub async fn monitor_stop(app: tauri::AppHandle) -> Result<(), String> {
         let mut g = st.monitor_handle.lock().expect("监控锁");
         g.take()
     };
-    if let Some(h) = h {
+    if let Some(t) = h {
         // 给循环最多 2s 自然退出（abort 兜底——半成品由孤儿清扫兜底口径不变）。
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), t.handle).await;
     }
     let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": "监控已停止" }));
     update_awake(&app);
@@ -1777,6 +1831,10 @@ pub struct QueueItem {
     pub limit: Option<u64>,
     pub nocompress: Option<bool>,
     pub noencrypt: Option<bool>,
+    // UDP 专属（轮 7 F2：proto=udp 的队列项此前被静默改走 TCP 且参数恒丢）。
+    pub passes: Option<u32>,
+    pub fec_parity: Option<u8>,
+    pub nofec: Option<bool>,
 }
 
 fn queue_path() -> PathBuf {
@@ -1798,7 +1856,7 @@ pub fn queue_load() -> Vec<serde_json::Value> {
                 return None;
             }
             let mut v = serde_json::json!({ "kind": f[0], "path": f[1] });
-            // ≥3 字段：带快照的新格式（ip|port|proto|code|limit|nocompress|noencrypt）。
+            // ≥9 字段：带快照的新格式（ip|port|proto|code|limit|nocompress|noencrypt）。
             if f.len() >= 9 {
                 let num = |s: &str| s.parse::<u64>().ok();
                 v["ip"] = serde_json::json!(if f[2].is_empty() { None } else { Some(f[2]) });
@@ -1808,6 +1866,12 @@ pub fn queue_load() -> Vec<serde_json::Value> {
                 v["limit"] = serde_json::json!(num(f[6]));
                 v["nocompress"] = serde_json::json!(match f[7] { "1" => Some(true), "0" => Some(false), _ => None });
                 v["noencrypt"] = serde_json::json!(match f[8] { "1" => Some(true), "0" => Some(false), _ => None });
+            }
+            // ≥12 字段：UDP 专属参数（轮 7 F2）。
+            if f.len() >= 12 {
+                v["passes"] = serde_json::json!(f[9].parse::<u32>().ok());
+                v["fecParity"] = serde_json::json!(f[10].parse::<u8>().ok());
+                v["nofec"] = serde_json::json!(match f[11] { "1" => Some(true), "0" => Some(false), _ => None });
             }
             Some(v)
         })
@@ -1831,7 +1895,7 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
             continue; // 快照字段同样不得含分隔符
         }
         out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
 ",
             it.kind,
             it.path,
@@ -1842,6 +1906,9 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
             it.limit.map(|l| l.to_string()).unwrap_or_default(),
             it.nocompress.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
             it.noencrypt.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.passes.map(|n| n.to_string()).unwrap_or_default(),
+            it.fec_parity.map(|n| n.to_string()).unwrap_or_default(),
+            it.nofec.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
         ));
     }
     trft_core::config::atomic_write(&queue_path(), out.as_bytes()).map_err(err)
