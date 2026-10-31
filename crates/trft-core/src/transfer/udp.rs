@@ -275,8 +275,11 @@ impl UdpPlan {
 }
 
 /// 单向 UDP 发送：多轮重发，每轮 START×3 → 全部 DATA/PARITY → END×3。
+/// Outcome 守卫：任何 `?` 早退（send_to 失败如 ICMP 端口不可达、读源文件失败）
+/// 都必须发进度终态（轮 3 F2——此前仅成功路径 finish，失败卡片永久 running）。
 pub async fn send_file_udp(addr: SocketAddr, path: &Path, opts: &UdpSendOptions) -> Result<()> {
     let started = std::time::Instant::now();
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
     let plan = build_plan(path, opts).await?;
     let local = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let socket = UdpSocket::bind(local).await?;
@@ -302,9 +305,7 @@ pub async fn send_file_udp(addr: SocketAddr, path: &Path, opts: &UdpSendOptions)
             tokio::time::sleep(PASS_DELAY).await;
         }
     }
-    if let Some(r) = &opts.progress {
-        r.finish();
-    }
+    outcome.finish();
     // 单向 UDP 无回传链路：发送完成 ≠ 对端落盘（规格 §4.2 落盘即状态）——
     // 统计如实记为「已发出」口径（对端侧另在自己的 stats 记账）。
     if let Some(s) = &opts.stats {

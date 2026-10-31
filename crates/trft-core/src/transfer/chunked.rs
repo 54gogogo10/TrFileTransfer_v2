@@ -145,10 +145,16 @@ impl ChunkTracker {
         let mut map = self.sessions.lock().await;
         let now = now_ms();
         // 空闲逐出：删半成品（对打开句柄可能失败——best effort，句柄关闭后孤儿清扫兜底）。
+        // 逐出即放弃会话：必须对进度 Reporter 补发终态（轮 3 F1——否则发送端
+        // 中途放弃的组被逐出后，接收侧进度卡永久 running；与 UDP 引擎惰性清扫
+        // 同纪律）。
         map.retain(|_, s| {
             let fresh = now.saturating_sub(s.last_seen_ms.load(Ordering::Relaxed)) < SESSION_TTL.as_millis() as u64;
             if !fresh {
                 let _ = std::fs::remove_file(&s.part);
+                if let Some(r) = &s.report {
+                    r.fail_if_running();
+                }
             }
             fresh
         });
@@ -168,6 +174,9 @@ impl ChunkTracker {
             if let Some(k) = oldest {
                 if let Some(s) = map.remove(&k) {
                     let _ = std::fs::remove_file(&s.part);
+                    if let Some(r) = &s.report {
+                        r.fail_if_running();
+                    }
                 }
             }
         }
@@ -518,6 +527,9 @@ pub async fn send_file_chunked(
     opts: &SendOptions,
     connections: u8,
 ) -> Result<()> {
+    // Outcome 守卫（轮 3 F2）：显式终态之外的所有 `?` 早退（后续连接建连失败、
+    // join panic、补发轮建连失败等）也必须发进度终态——否则进度卡永久 running。
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
     let raw = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -580,29 +592,19 @@ pub async fn send_file_chunked(
         }
     }
     if fatal {
-        if let Some(r) = &opts.progress {
-            r.fail();
-        }
         return Err(Error::Rejected("分块会话丢失（对端逐出/重启），需整组重发".into()));
     }
     if !saw_complete {
         for _ in 0..3 {
             if send_complement(addr, &opts2, gid, &name, size, &path2).await? {
-                if let Some(r) = &opts.progress {
-                    r.finish();
-                }
+                outcome.finish();
                 crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("0x02 分块（补发）"), &name);
                 return Ok(());
             }
         }
-        if let Some(r) = &opts.progress {
-            r.fail();
-        }
         return Err(Error::Rejected("分块补发 3 轮仍未覆盖完整文件".into()));
     }
-    if let Some(r) = &opts.progress {
-        r.finish();
-    }
+    outcome.finish();
     crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("0x02 分块×{connections}"), &name);
     Ok(())
 }
@@ -748,5 +750,57 @@ mod tests {
         std::fs::remove_file(group_part_path(&out, "bad.bin", &g2)).unwrap();
         tracker.finish(g2, &opts).await.unwrap_err();
         assert_eq!(tracker.end_status(g2).await, STATUS_REJECT, "组装失败必须判 0x00（无假成功）");
+    }
+
+    /// 轮 3 F1 判别：部分覆盖的会话被逐出（TTL/LRU）时必须对进度 Reporter
+    /// 补发 failed 终态——否则发送端中途放弃的组被逐出后，接收侧进度卡
+    /// 永久 running（PoC 实证）。已完成（done）会话被逐出不得翻转为 failed。
+    #[tokio::test]
+    async fn eviction_fails_dangling_reporter_but_not_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = crate::progress::ProgressHub::new(tx);
+        let tracker = ChunkTracker { progress: Some(hub), ..Default::default() };
+        let payload = vec![1u8; 100];
+
+        // victim：部分覆盖（未完成）。
+        let victim = [0x99u8; 16];
+        tracker.receive(victim, "victim.bin", 10_000, 0, &payload, &out).await.unwrap();
+        // 填充到 64 组挤占 LRU（victim 最旧 → 被逐出）。
+        for i in 0..MAX_CHUNK_SESSIONS {
+            let mut gid = [0u8; 16];
+            gid[0] = i as u8;
+            tracker.receive(gid, "f.bin", 10_000, 0, &payload, &out).await.unwrap();
+        }
+        // 排空事件流，找到 victim 的 Reporter 是否收到 failed。
+        let mut victim_failed = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.name == "victim.bin" && ev.state == "failed" {
+                victim_failed = true;
+            }
+        }
+        assert!(victim_failed, "被逐出的未完成会话必须补发 failed 终态");
+
+        // done 会话被逐出不得翻转：完整接收 + finish 成功后，用新组挤出。
+        let done = [0xAAu8; 16];
+        let opts = RecvOptions { save_dir: out.clone(), ..Default::default() };
+        let full = vec![2u8; 200];
+        tracker.receive(done, "done.bin", 200, 0, &full, &out).await.unwrap();
+        tracker.receive(done, "done.bin", 200, 100, &full[100..], &out).await.unwrap();
+        tracker.finish(done, &opts).await.unwrap();
+        for i in 0..MAX_CHUNK_SESSIONS {
+            let mut gid = [1u8; 16];
+            gid[0] = i as u8;
+            tracker.receive(gid, "g.bin", 10_000, 0, &payload, &out).await.unwrap();
+        }
+        let mut done_flipped = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.name == "done.bin" && ev.state == "failed" {
+                done_flipped = true;
+            }
+        }
+        assert!(!done_flipped, "已完成的会话被逐出不得翻转为 failed");
     }
 }

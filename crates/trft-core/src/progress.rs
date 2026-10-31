@@ -139,6 +139,14 @@ impl Reporter {
         self.sh.state.store(STATE_FAILED, Ordering::Relaxed);
         let _ = self.tx.send(Self::snapshot(&self.sh, "failed"));
     }
+
+    /// 条件终态：仅当仍在 running 时置失败。「会话逐出」等放弃路径用——
+    /// 已完成（done）的传输不得被翻转为 failed（轮 3 F1）。
+    pub fn fail_if_running(&self) {
+        if self.sh.state.load(Ordering::Relaxed) == STATE_RUNNING {
+            self.fail();
+        }
+    }
 }
 
 /// 进度事件出口 + ID 分配器（Clone 供多处持有）。

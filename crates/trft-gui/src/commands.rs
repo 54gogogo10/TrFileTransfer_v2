@@ -22,7 +22,7 @@ use trft_core::transfer::udp::{send_file_udp, serve_udp_on, UdpRecvOptions, UdpS
 use trft_core::transfer::Transport;
 use trft_core::monitor::MonitorProto;
 
-use crate::state::{forward_progress, AppState, HttpHandle, Proto, ReceiverHandle, TaskHandle};
+use crate::state::{forward_progress, AppState, DiscoveryAnswer, HttpHandle, Proto, ReceiverHandle, TaskHandle};
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -43,6 +43,10 @@ fn spawn_hidden(mut c: std::process::Command) {
 
 /// 防睡眠（规格 §3.7）：传输/接收器/共享运行期间 SetThreadExecutionState 引用钳制。
 /// 计数从状态**派生**而非加减配对——任务 abort（取消）路径不可能泄漏。
+/// **必须固定线程执行**（轮 3 F3）：SetThreadExecutionState 是每线程状态（MSDN），
+/// 此前从任意 tokio worker 调用——worker A 置位、worker B 清零时 B 清不掉 A 的
+/// 状态，ES_SYSTEM_REQUIRED 残留令系统永久不得休眠。统一经 Tauri 主线程执行
+/// （生命周期与进程一致，设置/清除同线程）。
 fn update_awake(app: &tauri::AppHandle) {
     let st = app.state::<AppState>();
     let active = {
@@ -52,17 +56,20 @@ fn update_awake(app: &tauri::AppHandle) {
         let monitor = st.monitor_handle.lock().expect("监控锁").is_some() as usize;
         receivers + tasks + http + monitor
     };
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::System::Power::{
-            SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
-        };
-        let mode = if active > 0 { ES_CONTINUOUS | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS };
-        SetThreadExecutionState(mode);
-    }
-    #[cfg(not(windows))]
-    let _ = active;
+    let _ = app.run_on_main_thread(move || set_awake(active > 0));
 }
+
+#[cfg(windows)]
+fn set_awake(active: bool) {
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+    };
+    unsafe {
+        SetThreadExecutionState(if active { ES_CONTINUOUS | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS });
+    }
+}
+#[cfg(not(windows))]
+fn set_awake(_active: bool) {}
 
 fn addr_of(ip: &str, port: u16) -> Result<SocketAddr, String> {
     if ip.contains(':') {
@@ -225,12 +232,42 @@ impl SendRequest {
 }
 
 /// 任务收尾（轮 3 P1）：先置 settled 再摘表——spawn/insert 时序竞态下，
-/// 父任务注册后的补偿检查（`register_task` 返回值）保证幽灵句柄必被回收。
-fn finish_task(app: &tauri::AppHandle, id: u64) {
+/// 父任务注册后的补偿检查（`register_task_checked` 返回值）保证幽灵句柄必被回收。
+/// `settled`：置位与摘表在**同一 tasks 锁临界区**内完成（轮 3 F6——与父任务
+/// 「insert+读取」临界区互斥，封死「子 remove → 父 insert → 父读 false → 子置位」
+/// 的任务表泄漏交错）。
+fn finish_task(app: &tauri::AppHandle, id: u64, settled: Option<&std::sync::atomic::AtomicBool>) {
     let st = app.state::<AppState>();
-    st.tasks.lock().expect("任务锁").remove(&id);
-    st.task_progress.lock().expect("映射锁").remove(&id);
+    {
+        let mut t = st.tasks.lock().expect("任务锁");
+        t.remove(&id);
+        st.task_progress.lock().expect("映射锁").remove(&id);
+        if let Some(s) = settled {
+            s.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     update_awake(app);
+}
+
+/// 父任务注册（轮 3 F6）：insert 与 settled 读取在同一 tasks 锁临界区——
+/// 返回 true = 子任务已先收尾（未注册，调用方补一次 finish_task 刷新防睡眠等）。
+fn register_task_checked(
+    app: &tauri::AppHandle,
+    id: u64,
+    handle: tauri::async_runtime::JoinHandle<()>,
+    progress_id: Option<u64>,
+    settled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let st = app.state::<AppState>();
+    let mut t = st.tasks.lock().expect("任务锁");
+    let done = settled.load(std::sync::atomic::Ordering::SeqCst);
+    if !done {
+        t.insert(id, TaskHandle { handle });
+        if let Some(pid) = progress_id {
+            st.task_progress.lock().expect("映射锁").insert(id, pid);
+        }
+    }
+    done
 }
 
 /// 发送任务公共收尾：终态事件 + 已知设备记忆（规格 §3.3）+ 可选系统通知。
@@ -240,11 +277,17 @@ async fn settle_send(
     name: String,
     res: Result<(), trft_core::error::Error>,
     peer: Option<(String, u16, &'static str, bool)>,
+    settled: Option<&std::sync::atomic::AtomicBool>,
 ) {
     let notify = {
         let st = app.state::<AppState>();
-        st.tasks.lock().expect("任务锁").remove(&id);
+        let mut t = st.tasks.lock().expect("任务锁");
+        t.remove(&id);
         st.task_progress.lock().expect("映射锁").remove(&id);
+        // 持任务锁置位（轮 3 F6）：与 register_task_checked 的临界区互斥。
+        if let Some(s) = settled {
+            s.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let cfg = st.cfg.lock().expect("配置锁");
         cfg.notify_enabled
     };
@@ -357,19 +400,11 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
         };
         let peer_proto = if req.proto == Proto::Udt { "udt" } else { "tcp" };
         let peer = Some((req.ip.clone(), req.port, peer_proto, req.code.is_some()));
-        settle_send(app2, id, name2, res, peer).await;
-        settled2.store(true, std::sync::atomic::Ordering::SeqCst);
+        settle_send(app2, id, name2, res, peer, Some(&settled2)).await;
     });
-    let st = app.state::<AppState>();
-    st.tasks.lock().expect("任务锁").insert(
-        id,
-        TaskHandle { handle },
-    );
-    st.task_progress.lock().expect("映射锁").insert(id, progress_id);
-    // 子任务先于注册收尾的补偿摘除（轮 3 P1-1）；task_progress 先插——
-    // 快速完成窗口中子 settle 摘的是尚不存在的映射，父再插即泄漏（轮 7 P3）。
-    if settled.load(std::sync::atomic::Ordering::SeqCst) {
-        finish_task(&app, id);
+    // 子任务先于注册收尾的补偿摘除（轮 3 P1-1）；insert+读取同临界区（轮 3 F6）。
+    if register_task_checked(&app, id, handle, Some(progress_id), &settled) {
+        finish_task(&app, id, None);
     }
     update_awake(&app);
     let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": progress_id }));
@@ -419,17 +454,10 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
         };
         let peer_proto = if req.proto == Proto::Udt { "udt" } else { "tcp" };
         let peer = Some((req.ip.clone(), req.port, peer_proto, req.code.is_some()));
-        settle_send(app2, id, name2, res, peer).await;
-        settled2.store(true, std::sync::atomic::Ordering::SeqCst);
+        settle_send(app2, id, name2, res, peer, Some(&settled2)).await;
     });
-    let st = app.state::<AppState>();
-    st.tasks.lock().expect("任务锁").insert(
-        id,
-        TaskHandle { handle },
-    );
-    st.task_progress.lock().expect("映射锁").insert(id, first_progress_id);
-    if settled.load(std::sync::atomic::Ordering::SeqCst) {
-        finish_task(&app, id);
+    if register_task_checked(&app, id, handle, Some(first_progress_id), &settled) {
+        finish_task(&app, id, None);
     }
     update_awake(&app);
     let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": first_progress_id }));
@@ -492,8 +520,7 @@ pub async fn send_queue(
             serde_json::json!({ "id": id, "ok": ok_n > 0, "summary": format!("{ok_n} 完成") }),
         );
         // 自摘除（轮 3 P1-2：queue 任务此前永驻 tasks 表——防睡眠计数泄漏）。
-        finish_task(&app2, id);
-        settled2.store(true, std::sync::atomic::Ordering::SeqCst);
+        finish_task(&app2, id, Some(&settled2));
         // 完成后动作（确认弹窗已在队列启动前完成——规格 §3.2）。
         match after_done.as_deref() {
             Some("shutdown") => {
@@ -517,13 +544,8 @@ pub async fn send_queue(
             _ => {}
         }
     });
-    let st = app.state::<AppState>();
-    st.tasks.lock().expect("任务锁").insert(
-        id,
-        TaskHandle { handle },
-    );
-    if settled.load(std::sync::atomic::Ordering::SeqCst) {
-        finish_task(&app, id);
+    if register_task_checked(&app, id, handle, None, &settled) {
+        finish_task(&app, id, None);
     }
     update_awake(&app);
     Ok(id)
@@ -616,17 +638,10 @@ pub async fn sync_start(
     let handle = tauri::async_runtime::spawn(async move {
         let res = send_folder_resume(addr, &path, &opts, session, cache.as_ref()).await;
         let peer = Some((ip.to_string(), port, if proto == Proto::Udt { "udt" } else { "tcp" }, code.is_some()));
-        settle_send(app2, id, name2, res, peer).await;
-        settled2.store(true, std::sync::atomic::Ordering::SeqCst);
+        settle_send(app2, id, name2, res, peer, Some(&settled2)).await;
     });
-    let st = app.state::<AppState>();
-    st.tasks.lock().expect("任务锁").insert(
-        id,
-        TaskHandle { handle },
-    );
-    st.task_progress.lock().expect("映射锁").insert(id, progress_id);
-    if settled.load(std::sync::atomic::Ordering::SeqCst) {
-        finish_task(&app, id);
+    if register_task_checked(&app, id, handle, Some(progress_id), &settled) {
+        finish_task(&app, id, None);
     }
     update_awake(&app);
     let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": progress_id }));
@@ -683,6 +698,50 @@ fn next_free_port(proto: Proto, ip: std::net::IpAddr, port: u16) -> Option<u16> 
     None
 }
 
+/// serve 任务收尾（轮 3 F5）：退出（异常/endpoint 关闭）时自摘注册表条目——
+/// 否则死句柄残留：显示运行中、无法重新启动、防睡眠计数恒 >0，无自愈。
+/// `exited`：本代已退出任务计数——最后一个退出的任务负责摘除
+/// （tauri JoinHandle 无 is_finished，用计数器实现「只剩自己」判定）。
+fn receiver_task_exit(
+    app: tauri::AppHandle,
+    proto: Proto,
+    gen: Arc<()>,
+    exited: Arc<std::sync::atomic::AtomicUsize>,
+    r: std::result::Result<(), trft_core::error::Error>,
+) {
+    use tauri::Emitter;
+    if let Err(e) = r {
+        let _ = app.emit(
+            "trft://log",
+            serde_json::json!({ "level": "err", "message": format!("{} 接收器退出: {e}", proto.label()) }),
+        );
+    }
+    let remove = {
+        let st = app.state::<AppState>();
+        let mut g = st.receivers.lock().expect("接收器锁");
+        match g.get(&proto) {
+            Some(cur) if Arc::ptr_eq(&cur.gen, &gen) => {
+                let n = exited.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n == cur.handles.len() {
+                    g.remove(&proto);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false, // 已被停止/替换：recv_stop 或新代任务负责清理
+        }
+    };
+    if remove {
+        update_awake(&app);
+        update_discovery_answer(&app);
+        let _ = app.emit(
+            "trft://log",
+            serde_json::json!({ "level": "warn", "message": format!("{} 接收器已全部退出", proto.label()) }),
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn recv_start(
     app: tauri::AppHandle,
@@ -691,6 +750,9 @@ pub async fn recv_start(
     save_dir: Option<String>,
     addrs: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
+    // 代际令牌（轮 3 F4）：占位、最终句柄、serve 任务三方共享同一 Arc 身份；
+    // bind 窗口内表项被 recv_stop 摘除或被并发 start 替换时，凭 ptr_eq 自判放弃。
+    let gen = Arc::new(());
     {
         let st = app.state::<AppState>();
         let mut g = st.receivers.lock().expect("接收器锁");
@@ -701,7 +763,7 @@ pub async fn recv_start(
         // 会让后者覆盖前者的句柄，前者成为无法停止的孤儿监听器。失败路径回滚。
         g.insert(
             proto,
-            ReceiverHandle { proto, port, bound: vec![], handles: vec![] },
+            ReceiverHandle { proto, port, bound: vec![], handles: vec![], gen: gen.clone() },
         );
     }
     let cfg = app.state::<AppState>().config();
@@ -738,6 +800,8 @@ pub async fn recv_start(
     let mut handles = Vec::new();
     let mut bound = Vec::new();
     let mut failed: Vec<(SocketAddr, String)> = Vec::new();
+    // 本代已退出任务计数（轮 3 F5：最后一个退出的任务自摘注册表条目）。
+    let exited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // 状态/资源只建一份：多监听器经 Clone 共享（gate/并发闸/分块会话表/缓存/事件通道）。
     // M5'：设备记忆/确认钩子/分目录/归档/统计统一注入（TECH-STACK §7.10）。
@@ -826,10 +890,11 @@ pub async fn recv_start(
                 Ok(listener) => {
                     let o = shared.as_ref().expect("TCP 选项已建").clone();
                     let a2 = app2.clone();
+                    let g2 = gen.clone();
+                    let ex = exited.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        if let Err(e) = serve_on(listener, o).await {
-                            let _ = a2.emit("trft://log", serde_json::json!({ "level": "err", "message": format!("TCP 接收器退出: {e}") }));
-                        }
+                        let r = serve_on(listener, o).await;
+                        receiver_task_exit(a2, Proto::Tcp, g2, ex, r);
                     }));
                     bound.push(addr.to_string());
                 }
@@ -839,10 +904,11 @@ pub async fn recv_start(
                 Ok((endpoint, cert_fp)) => {
                     let o = shared.as_ref().expect("QUIC 选项已建").clone();
                     let a2 = app2.clone();
+                    let g2 = gen.clone();
+                    let ex = exited.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        if let Err(e) = trft_core::transfer::quic::serve_quic_on(endpoint, cert_fp, o).await {
-                            let _ = a2.emit("trft://log", serde_json::json!({ "level": "err", "message": format!("QUIC 接收器退出: {e}") }));
-                        }
+                        let r = trft_core::transfer::quic::serve_quic_on(endpoint, cert_fp, o).await;
+                        receiver_task_exit(a2, Proto::Udt, g2, ex, r);
                     }));
                     bound.push(addr.to_string());
                 }
@@ -862,10 +928,11 @@ pub async fn recv_start(
                         stats: Some(st.stats.clone()),
                     };
                     let a2 = app2.clone();
+                    let g2 = gen.clone();
+                    let ex = exited.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        if let Err(e) = serve_udp_on(socket, o, None).await {
-                            let _ = a2.emit("trft://log", serde_json::json!({ "level": "err", "message": format!("UDP 接收器退出: {e}") }));
-                        }
+                        let r = serve_udp_on(socket, o, None).await;
+                        receiver_task_exit(a2, Proto::Udp, g2, ex, r);
                     }));
                     bound.push(addr.to_string());
                 }
@@ -896,13 +963,31 @@ pub async fn recv_start(
         return Err(format!("{} 监听器全部绑定失败 —— {}{}", proto.label(), detail, suggestion));
     }
 
-    let st = app.state::<AppState>();
-    st.receivers.lock().expect("接收器锁").insert(
-        proto,
-        ReceiverHandle { proto, port, bound: bound.clone(), handles },
-    );
+    {
+        let st = app.state::<AppState>();
+        let mut g = st.receivers.lock().expect("接收器锁");
+        match g.get(&proto) {
+            Some(cur) if Arc::ptr_eq(&cur.gen, &gen) => {
+                // 正常路径：占位仍是本代 → 覆盖为真句柄。
+                g.insert(
+                    proto,
+                    ReceiverHandle { proto, port, bound: bound.clone(), handles, gen: gen.clone() },
+                );
+            }
+            _ => {
+                // 启动窗口内被 recv_stop 摘除 / 被并发 recv_start 替换（轮 3 F4）：
+                // 放弃刚建立的监听器，不得复活已被停止的接收器。
+                drop(g);
+                for h in &handles {
+                    h.abort();
+                }
+                return Err(format!("{} 接收器在启动期间被停止，已放弃", proto.label()));
+            }
+        }
+    }
     update_awake(&app);
     update_discovery_answer(&app);
+    let st = app.state::<AppState>();
     // 规格 §3.7：首次成功启动服务器展示一次 netsh 放行命令。
     if !cfg.firewall_hinted {
         let hint_port = bound.first().and_then(|b| b.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()));
@@ -1142,16 +1227,10 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
         }
         let _ = app2.emit("trft://verify-result", &agg);
         // 自摘除（轮 3 P1-2）。
-        finish_task(&app2, id);
-        settled2.store(true, std::sync::atomic::Ordering::SeqCst);
+        finish_task(&app2, id, Some(&settled2));
     });
-    let st = app.state::<AppState>();
-    st.tasks.lock().expect("任务锁").insert(
-        id,
-        TaskHandle { handle },
-    );
-    if settled.load(std::sync::atomic::Ordering::SeqCst) {
-        finish_task(&app, id);
+    if register_task_checked(&app, id, handle, None, &settled) {
+        finish_task(&app, id, None);
     }
     update_awake(&app);
     Ok(id)
@@ -1545,6 +1624,9 @@ pub async fn discover_devices(app: tauri::AppHandle) -> Result<Vec<DeviceInfo>, 
 }
 
 /// 有 TCP/UDT 监听器时确保发现应答服务在跑；没有则停掉。flags 实时读取。
+/// 死任务（bind 失败/serve 已退出，经 `done` 标志判定——tauri JoinHandle 无
+/// is_finished）视作 None 重建（轮 3 F8——此前槽位恒 Some，端口占用期间启动
+/// 接收器后，发现应答静默失效直至全部接收器停止）。
 fn update_discovery_answer(app: &tauri::AppHandle) {
     let st = app.state::<AppState>();
     let any_stream = st
@@ -1554,6 +1636,12 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
         .keys()
         .any(|p| matches!(p, Proto::Tcp | Proto::Udt));
     let mut slot = st.discovery_answer.lock().expect("应答锁");
+    let dead = slot
+        .as_ref()
+        .is_some_and(|d| d.done.load(std::sync::atomic::Ordering::SeqCst));
+    if dead {
+        slot.take();
+    }
     if any_stream && slot.is_none() {
         let cfg = st.config();
         let app_flags = app.clone();
@@ -1568,21 +1656,27 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
                 (tcp, udt, pairing)
             });
         let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "TrFileTransfer".into());
-        *slot = Some(tauri::async_runtime::spawn(async move {
-            let app2 = app_spawn;
-            let bind = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), cfg.discovery_port);
-            match tokio::net::UdpSocket::bind(bind).await {
-                Ok(sock) => {
-                    let _ = trft_core::discovery::serve_answer(sock, name, flags).await;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        *slot = Some(DiscoveryAnswer {
+            done,
+            handle: tauri::async_runtime::spawn(async move {
+                let app2 = app_spawn;
+                let bind = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), cfg.discovery_port);
+                match tokio::net::UdpSocket::bind(bind).await {
+                    Ok(sock) => {
+                        let _ = trft_core::discovery::serve_answer(sock, name, flags).await;
+                    }
+                    Err(e) => {
+                        let _ = tauri::Emitter::emit(&app2, "trft://log", serde_json::json!({ "level": "warn", "message": format!("发现应答端口 {} 占用: {e}", cfg.discovery_port) }));
+                    }
                 }
-                Err(e) => {
-                    let _ = tauri::Emitter::emit(&app2, "trft://log", serde_json::json!({ "level": "warn", "message": format!("发现应答端口 {} 占用: {e}", cfg.discovery_port) }));
-                }
-            }
-        }));
+                done2.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        });
     } else if !any_stream && slot.is_some() {
-        if let Some(h) = slot.take() {
-            h.abort();
+        if let Some(d) = slot.take() {
+            d.handle.abort();
         }
     }
 }

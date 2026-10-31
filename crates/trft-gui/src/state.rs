@@ -29,18 +29,27 @@ impl Proto {
 
 /// 运行中的接收器（abort = 停止；半成品由孤儿清扫兜底）。
 /// 多地址绑定（规格 §3.3：每勾选地址一个监听器）→ 每地址一个任务句柄。
+/// `gen`：启动代际令牌（轮 3 F4）——占位与最终句柄同代；`recv_stop`/并发
+/// `recv_start` 在 bind 窗口内替换表项后，旧代任务凭 ptr_eq 自判放弃。
 pub struct ReceiverHandle {
     pub proto: Proto,
     pub port: u16,
     /// 实际绑定成功的地址。
     pub bound: Vec<String>,
     pub handles: Vec<tauri::async_runtime::JoinHandle<()>>,
+    pub gen: Arc<()>,
 }
 
 /// HTTP 共享句柄（graceful shutdown）。
 pub struct HttpHandle {
     pub port: u16,
     pub shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+/// 发现应答服务句柄（轮 3 F8：done 标志标记任务已退出，供死任务判定重建）。
+pub struct DiscoveryAnswer {
+    pub done: Arc<std::sync::atomic::AtomicBool>,
+    pub handle: tauri::async_runtime::JoinHandle<()>,
 }
 
 /// 发送/校验任务（cancel = abort）。
@@ -60,7 +69,9 @@ pub struct AppState {
     /// 校验中途停止标志（规格 §3.5；Arc 供任务闭包克隆）。
     pub verify_stop: Arc<AtomicBool>,
     /// 设备发现应答服务（有 TCP/UDT 监听器时运行；0xD1→0xD2）。
-    pub discovery_answer: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// `done`：任务退出标志（轮 3 F8——tauri JoinHandle 无 is_finished，
+    /// 死任务凭此被 update_discovery_answer 判定并重建）。
+    pub discovery_answer: Mutex<Option<DiscoveryAnswer>>,
     /// 设备记忆（M5'：core 共享实例——接收器确认/分目录解析与 GUI 同源）。
     pub devices: Arc<trft_core::devices::DeviceStore>,
     /// 传输统计（M5'：stats.log；GUI/CLI 同一文件）。
