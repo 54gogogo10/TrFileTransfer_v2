@@ -39,6 +39,11 @@ pub struct SendOptions {
     pub quic_pin: Option<[u8; 32]>,
     /// 客户端期望压缩（0x08；库默认关——CLI/GUI 默认开，对旧对端自动降级明文）。
     pub compress: bool,
+    /// QUIC 遇旧服务端（对 0x0D 回 0x00）时允许回退明文 0x05。**默认 false**
+    /// （fail-closed，轮 2 F1：主动中间人可伪装旧服务端强制降级——0x05 无
+    /// S→C 证明，盲接受型 MITM 可窃取载荷并令客户端假成功）。确需对接旧对端
+    /// 时显式开启（CLI --allow-legacy-pair / GUI 配置），或改用 --pin（钉扎即绑定）。
+    pub allow_legacy_pair: bool,
     /// 进度上报（规格 §3.1 100ms 节流；None = 不上报，CLI 路径零开销）。
     pub progress: Option<crate::progress::Reporter>,
     /// 传输统计（M5'：成功完成记账；None = 不记）。
@@ -55,6 +60,7 @@ impl Default for SendOptions {
             encrypt: true,
             quic_pin: None,
             compress: false,
+            allow_legacy_pair: false,
             progress: None,
             stats: None,
         }
@@ -178,21 +184,35 @@ where
     Ok(())
 }
 
-/// QUIC 建连 + 配对（通道绑定优先；遇旧服务端自动回退明文 0x05 并记警告——
-/// TECH-STACK §7.11：回退仅可能发生在旧服务端上，新版服务端对明文 0x05 强制拒绝）。
+/// QUIC 建连 + 配对（通道绑定优先；旧服务端回退**默认拒绝**——轮 2 F1：
+/// 单个未认证字节不足以区分「旧服务端」与「伪装旧服务端的主动中间人」，
+/// MITM 对 0x0D 回 0x00 即可把客户端逼进无 S→C 证明的明文 0x05 腿内窃取
+/// 载荷并令其假成功。TECH-STACK §7.11「回退只可能发生在旧服务端上」的前提
+/// 不成立——须 `allow_legacy_pair` 显式放行（fail-closed，规格 §1.4））。
 pub(crate) async fn connect_quic_auth(addr: SocketAddr, opts: &SendOptions) -> Result<QuicStream> {
     let (mut q, fp) = connect_quic_full(addr, opts.quic_pin).await?;
     if let Some(code) = opts.pairing_code.as_deref() {
-        if let Err(Error::AuthRejected(m)) = authenticate_bound(&mut q, code, &fp).await {
-            if !m.starts_with(LEGACY_DOWNGRADE) {
-                return Err(Error::AuthRejected(m)); // 配对码错误：如实上抛
+        match authenticate_bound(&mut q, code, &fp).await {
+            Ok(()) => {}
+            Err(Error::AuthRejected(m)) if m.starts_with(LEGACY_DOWNGRADE) => {
+                if !opts.allow_legacy_pair {
+                    return Err(Error::AuthRejected(format!(
+                        "{addr}: 对端不支持通道绑定配对（0x0D 被拒）——可能为旧版本，也可能是\
+                         主动中间人降级攻击；确认对端后可用 --allow-legacy-pair 显式放行，\
+                         或使用 --pin 钉扎（fail-closed）"
+                    )));
+                }
+                eprintln!(
+                    "[警告] 对端为旧版本（不支持通道绑定配对），按显式放行回退明文 0x05——该路径不防主动中间人"
+                );
+                let mut q2 = connect_quic(addr, opts.quic_pin).await?;
+                authenticate(&mut q2, Some(code)).await?;
+                return Ok(q2);
             }
-            eprintln!(
-                "[警告] 对端为旧版本（不支持通道绑定配对），回退明文 0x05——QUIC 无 --pin 时该路径不防主动中间人"
-            );
-            let mut q2 = connect_quic(addr, opts.quic_pin).await?;
-            authenticate(&mut q2, Some(code)).await?;
-            return Ok(q2);
+            // 其余任何失败（读超时/EOF/证明失配/配对码错误）一律上抛：
+            // 轮 2 修复——此前 if-let 只接 AuthRejected，超时等错误被静默吞掉后
+            // 以 Ok(未认证流) 继续，沉默型假服务端可令客户端跳过配对直传（旁路）。
+            Err(e) => return Err(e),
         }
     }
     Ok(q)

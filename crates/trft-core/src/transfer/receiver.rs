@@ -53,13 +53,19 @@ pub struct ConfirmRequest {
 
 /// 锁定门聚合键（轮 6 P2-3）：IPv4 按地址；**IPv6 按 /64 前缀**——
 /// SLAAC/隐私扩展让单机持有海量地址，按 /128 计数时每地址 ≤9 次即可无限绕过锁定。
+/// IPv4-mapped（`::ffff:a.b.c.d`）先归一到内嵌 IPv4（轮 2 F2：双栈监听上
+/// IPv4 对端以 mapped 形式呈现，若直接取高 64 位会把**全部 IPv4 来源与 ::1
+/// 折叠进同一桶 `::`**——任一攻击者即可连带锁定全部 IPv4 用户）。
 pub fn gate_key(ip: &IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => IpAddr::V4(*v4),
-        IpAddr::V6(v6) => {
-            let seg = u128::from(*v6) & !0xFFFF_FFFF_FFFF_FFFF; // 高 64 位
-            IpAddr::V6(std::net::Ipv6Addr::from(seg))
-        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let seg = u128::from(*v6) & !0xFFFF_FFFF_FFFF_FFFF; // 高 64 位
+                IpAddr::V6(std::net::Ipv6Addr::from(seg))
+            }
+        },
     }
 }
 
@@ -505,12 +511,12 @@ pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
 }
 
 /// 连接前置检查（并发闸 + 配对锁定）与后置记账（锁定计数/成功清零）。
-/// 并发闸许可（QUIC 在 TLS 握手前也要先拿闸）。
+/// 并发闸许可（QUIC 在 TLS 握手前也要先拿闸）。获取 30s 上限（轮 2 F3：
+/// 无上限时满闸下合法连接会**无限静默等待**——与 Web 面闸获取 30s 同纪律）。
 pub(crate) async fn conn_permit(opts: &RecvOptions) -> Result<tokio::sync::OwnedSemaphorePermit> {
-    opts.permits
-        .clone()
-        .acquire_owned()
+    tokio::time::timeout(Duration::from_secs(30), opts.permits.clone().acquire_owned())
         .await
+        .map_err(|_| proto("并发闸获取超时（30s，接收器连接过载）"))?
         .map_err(|e| proto(e.to_string()))
 }
 
@@ -530,12 +536,7 @@ pub(crate) async fn conn_precheck(
     if !ip_allowed(peer.ip(), opts.ip_filter_mode, &opts.ip_filter_list) {
         return Err(Error::Rejected(format!("{}: 被 IP 过滤规则拒绝", peer.ip())));
     }
-    let permit = opts
-        .permits
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| proto(e.to_string()))?;
+    let permit = conn_permit(opts).await?;
     if opts.pairing_code.is_some() && opts.gate.lock().await.locked(&peer.ip()) {
         return Err(Error::AuthRejected(format!("{peer}: 配对失败次数过多，已临时锁定")));
     }
@@ -1089,16 +1090,17 @@ pub(crate) async fn publish_part(part: &Path, dir: &Path, name: &str) -> Result<
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
-                // 卷不支持硬链接（FAT32/exFAT/部分网络共享）：退化为
-                // 「拷到临时半成品名 + rename 到最终名」——崩溃窗口内留下的
-                // 也只是 .trft-part（孤儿清扫可回收），不会以最终名残留半成品（轮 1）。
-                let tmp = unique_part(dir, name);
+                // 卷不支持硬链接（FAT32/exFAT/部分网络共享）：退化为「create_new
+                // 直接创建 candidate + 拷贝 + sync」——与 UDP 同步版/Web 上传回退
+                // 同口径（轮 2 F4：Windows rename 静默替换既有文件，resolve_conflict
+                // 探测与 rename 之间的拷贝窗口可被并发发布者利用静默覆盖）。
+                // 失败路径清掉 candidate，不以最终名残留半成品（M6' 轮 8 同纪律）。
                 let copied = async {
                     let mut src = tokio::fs::File::open(part).await?;
                     let mut dst = tokio::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
-                        .open(&tmp)
+                        .open(&candidate)
                         .await?;
                     let r = tokio::io::copy(&mut src, &mut dst).await;
                     let synced = dst.sync_all().await;
@@ -1106,21 +1108,16 @@ pub(crate) async fn publish_part(part: &Path, dir: &Path, name: &str) -> Result<
                     r.and(synced)
                 }
                 .await;
-                if let Err(e) = copied {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(Error::Io(e));
-                }
-                match std::fs::rename(&tmp, &candidate) {
+                match copied {
                     Ok(()) => {
                         let _ = std::fs::remove_file(part);
                         return Ok(candidate);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let _ = std::fs::remove_file(&tmp);
                         continue; // 并发发布方抢先占用冲突名 → 重取冲突名
                     }
                     Err(e) => {
-                        let _ = std::fs::remove_file(&tmp);
+                        let _ = std::fs::remove_file(&candidate);
                         return Err(Error::Io(e));
                     }
                 }
@@ -1243,6 +1240,27 @@ mod tests {
         assert!(g.locked(&ip), "达到阈值必须锁定");
         g.success(&ip);
         assert!(!g.locked(&ip), "成功清零");
+    }
+
+    /// 轮 2 F2 判别：IPv4-mapped IPv6 不得与 ::1 / 其他 mapped 地址共享锁定桶——
+    /// 修复前全部折叠进 `::`，一次锁定连带全部 IPv4 用户。
+    #[test]
+    fn gate_key_maps_ipv4_mapped_to_embedded_v4() {
+        let a: IpAddr = "::ffff:1.2.3.4".parse().unwrap();
+        let b: IpAddr = "::ffff:1.2.3.5".parse().unwrap();
+        let lo: IpAddr = "::1".parse().unwrap();
+        let native: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(gate_key(&a), gate_key(&native), "mapped 与原生 IPv4 同源同键");
+        assert_ne!(gate_key(&a), gate_key(&b), "不同 mapped 地址不得共享键");
+        assert_ne!(gate_key(&a), gate_key(&lo), "mapped 不得与回环共享键");
+        // 行为判别：mapped 来源达阈值只锁它自己，不连带 ::1。
+        let mut g = PairingGate::default();
+        for _ in 0..LOCKOUT_THRESHOLD {
+            g.fail(&a);
+        }
+        assert!(g.locked(&a), "达阈值必须锁");
+        assert!(!g.locked(&lo), "::1 不得被连带锁定");
+        assert!(!g.locked(&b), "其他 mapped 地址不得被连带锁定");
     }
 
     #[test]

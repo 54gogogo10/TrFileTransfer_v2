@@ -215,6 +215,9 @@ impl SendRequest {
             encrypt: !self.noencrypt,
             compress: !self.nocompress && compress_default,
             quic_pin: parse_pin(&self.pin)?,
+            // GUI 无旧对端放行开关：0x0D 降级一律 fail-closed（轮 2 F1；
+            // 需对接旧 QUIC 对端时用 CLI --allow-legacy-pair 或 --pin）。
+            allow_legacy_pair: false,
             progress: reporter,
             stats,
         })

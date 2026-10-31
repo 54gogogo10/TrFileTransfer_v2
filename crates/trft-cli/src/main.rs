@@ -83,6 +83,10 @@ enum Cmd {
         /// 无 --pin 时 --udt 不防主动中间人）
         #[arg(long = "pin")]
         quic_pin: Option<String>,
+        /// 显式放行「旧服务端降级明文 0x05」（0x0D 被拒时；默认拒绝——
+        /// 无法区分旧服务端与伪装旧服务端的中间人降级攻击）
+        #[arg(long = "allow-legacy-pair")]
+        allow_legacy_pair: bool,
     },
     /// 无人值守接收
     Recv {
@@ -119,6 +123,9 @@ enum Cmd {
         /// 关闭 0x08 压缩协商（默认开）
         #[arg(long)]
         nocompress: bool,
+        /// 显式放行「旧服务端降级明文 0x05」（0x0D 被拒时；默认拒绝）
+        #[arg(long = "allow-legacy-pair")]
+        allow_legacy_pair: bool,
     },
     /// 文件库校验（重算 SHA-256；发现不一致退出码 1）
     Verify {
@@ -189,6 +196,7 @@ fn stream_opts(
     encrypt: bool,
     compress: bool,
     pin: Option<[u8; 32]>,
+    allow_legacy_pair: bool,
 ) -> SendOptions {
     SendOptions {
         pairing_code: code,
@@ -198,6 +206,7 @@ fn stream_opts(
         encrypt,
         compress,
         quic_pin: pin,
+        allow_legacy_pair,
         progress: None,
         // 规格 §3.3 stats.log：CLI 与 GUI 共享同一统计（TECH-STACK §7.10）。
         stats: Some(std::sync::Arc::new(trft_core::stats::StatsLog::default_log())),
@@ -234,7 +243,7 @@ async fn main() {
 async fn run() -> i32 {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Send { ip, port, file, folder, text, proto, code, limit, srcport, chunks, passes, fec_parity, nofec, noencrypt, nocompress, quic_pin } => {
+        Cmd::Send { ip, port, file, folder, text, proto, code, limit, srcport, chunks, passes, fec_parity, nofec, noencrypt, nocompress, quic_pin, allow_legacy_pair } => {
             if let Err(e) = validate_code(&code) {
                 return usage_fail(&e);
             }
@@ -286,7 +295,7 @@ async fn run() -> i32 {
                     Err(e) => fail(&format!("发送失败: {e}")),
                 };
             }
-            let opts = stream_opts(code, limit, srcport, proto, !noencrypt, !nocompress, pin);
+            let opts = stream_opts(code, limit, srcport, proto, !noencrypt, !nocompress, pin, allow_legacy_pair);
             let r = match (folder, file, text) {
                 (Some(f), _, _) => send_folder(addr, &f, &opts).await,
                 // 规格 §3.2 AutoRetry：单文件首选 0x03（含降级 0x00）；--chunks 走 0x02。
@@ -386,7 +395,7 @@ async fn run() -> i32 {
                 }
             }
         }
-        Cmd::Sync { folder, ip, port, proto, code, limit, nocompress } => {
+        Cmd::Sync { folder, ip, port, proto, code, limit, nocompress, allow_legacy_pair } => {
             if proto == Proto::Udp {
                 return usage_fail("单向 UDP 不支持文件夹传输（仅单文件，规格 §3.6）");
             }
@@ -402,6 +411,7 @@ async fn run() -> i32 {
                 pairing_code: code,
                 speed_limit_bps: limit.unwrap_or(0).min(10_000_000) * 1024,
                 compress: !nocompress,
+                allow_legacy_pair,
                 // CLI 与 GUI 同享 stats.log（TECH-STACK §7.10；轮 5 P2：sync 此前漏注）。
                 stats: Some(std::sync::Arc::new(trft_core::stats::StatsLog::default_log())),
                 ..Default::default()

@@ -204,3 +204,103 @@ async fn blind_accept_fake_server_rejected_by_s2c_proof() {
     assert!(r.is_err(), "盲接受型假服务端必须被 S→C 证明拒绝");
     timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
 }
+
+/// 轮 2 F1 判别：**伪装旧服务端的强制降级必败**。主动中间人无配对码，对 0x0D
+/// 回裸 0x00（伪装旧服务端）→ 客户端若自动回退明文 0x05 → MITM 盲接受（0x05 无
+/// S→C 证明）→ 窃取载荷并令客户端假成功。修复前默认路径即如此（PoC 实证），
+/// 修复后默认必须失败；仅显式 allow_legacy_pair 放行才走降级（放行后允许成功）。
+#[tokio::test]
+async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    use trft_core::protocol::io::{read_n, read_str_u16, read_u64, read_u8, write_all, write_u8};
+    use trft_core::protocol::frame::{T_PAIRING, T_PAIRING_BOUND};
+
+    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let addr = ep.local_addr().unwrap();
+    let stole = StdArc::new(AtomicBool::new(false));
+    let stole2 = stole.clone();
+
+    // 伪装旧服务端的 MITM：0x0D → 裸 0x00；0x05 → 盲接受 + 窃取载荷 + 回 OK。
+    let server = tokio::spawn(async move {
+        let mut conn_count = 0u32;
+        while let Some(inc) = ep.accept().await {
+            let Ok(conn) = inc.await else { continue };
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else { continue };
+            let _ = read_u8(&mut recv).await; // 版本字节
+            let Ok(t) = read_u8(&mut recv).await else { continue };
+            conn_count += 1;
+            match t {
+                T_PAIRING_BOUND => {
+                    // 伪装旧服务端：对未知帧回裸 0x00（无 0x1D 盐前导）。
+                    // FIN 优雅收尾并保活 300ms——QUIC CONNECTION_CLOSE 会作废
+                    // 未确认的流数据，立即 drop 连接会让 0x00 字节永远到不了对端。
+                    let _ = write_u8(&mut send, 0x00).await;
+                    let _ = send.finish();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                T_PAIRING => {
+                    // 盲接受明文 0x05：盐 → 吞证明 → OK（不知配对码也放行）。
+                    let _ = write_all(&mut send, &[7u8; 16]).await;
+                    let _ = read_n(&mut recv, 32).await;
+                    let _ = write_u8(&mut send, 0x01).await;
+                    // 窃取载荷：0x00 帧（名 + 大小 + 载荷 + 哈希）照单全收。
+                    let frame_ok = matches!(read_u8(&mut recv).await, Ok(0x00))
+                        && read_str_u16(&mut recv).await.is_ok();
+                    let size = if frame_ok { read_u64(&mut recv).await.unwrap_or(0) } else { 0 };
+                    if frame_ok {
+                        let mut left = size;
+                        let mut buf = vec![0u8; 4096];
+                        while left > 0 {
+                            let want = std::cmp::min(4096, left) as usize;
+                            if tokio::io::AsyncReadExt::read_exact(&mut recv, &mut buf[..want])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            left -= want as u64;
+                        }
+                        if left == 0 {
+                            let _ = read_n(&mut recv, 32).await;
+                            stole2.store(true, Ordering::SeqCst); // 载荷已到手
+                            let _ = write_u8(&mut send, 0x01).await; // 令客户端假成功
+                            // FIN + 保活：最终状态字节必须送达（同上——立即 drop 会作废未确认数据）。
+                            let _ = send.finish();
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        conn_count
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("downgrade-victim.bin");
+    std::fs::write(&src, b"confidential payload").unwrap();
+
+    // 默认（allow_legacy_pair=false）：必须失败，且载荷不得被窃取。
+    let victim = SendOptions {
+        transport: Transport::Quic,
+        pairing_code: Some("987654".into()),
+        ..Default::default()
+    };
+    let r = trft_core::transfer::sender::send_file(addr, &src, &victim).await;
+    assert!(r.is_err(), "伪装旧服务端强制降级必须被默认拒绝（不得进入明文 0x05 腿）");
+    assert!(!stole.load(Ordering::SeqCst), "默认路径不得让 MITM 窃取载荷");
+
+    // 显式放行：允许降级（对接真旧服务端的出口；此时成功是用户决策）。
+    let allowed = SendOptions {
+        transport: Transport::Quic,
+        pairing_code: Some("987654".into()),
+        allow_legacy_pair: true,
+        ..Default::default()
+    };
+    trft_core::transfer::sender::send_file(addr, &src, &allowed)
+        .await
+        .expect("显式放行后降级路径应可用");
+    assert!(stole.load(Ordering::SeqCst), "放行走 0x05（测试前提自检）");
+    server.abort();
+}

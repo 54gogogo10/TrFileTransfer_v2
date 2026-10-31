@@ -26,6 +26,10 @@ use trft_core::transfer::receiver::PairingGate;
 /// 规格 §6.1：整请求 4GB、单文件 2GB。
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// 请求体空闲读超时（轮 2 F6）：头读超时（15s）只覆盖请求头阶段；
+/// 慢滴 body（每 chunk 1 字节/数秒）可无限占用并发闸——空闲 60s 即断。
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 规格 §6.1：HTTP 共享并发 32。
 pub const MAX_CONCURRENCY: usize = 32;
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
@@ -673,11 +677,16 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
     let mut saved: Vec<String> = Vec::new();
     let mut field_count: usize = 0;
     loop {
-        let mut field = match mp.next_field().await {
-            Ok(Some(f)) => f,
-            Ok(None) => break,
-            Err(_) => {
+        // 请求体空闲超时（轮 2 F6）：头读超时只覆盖请求头阶段，慢滴 body
+        // 可无限占用并发闸（每 chunk 1 字节/数秒即绕过任何总量上限）。
+        let mut field = match tokio::time::timeout(BODY_IDLE_TIMEOUT, mp.next_field()).await {
+            Ok(Ok(Some(f))) => f,
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => {
                 return (StatusCode::BAD_REQUEST, "multipart 解析失败").into_response();
+            }
+            Err(_) => {
+                return (StatusCode::REQUEST_TIMEOUT, "上传请求体空闲超时").into_response();
             }
         };
         field_count += 1;
@@ -721,8 +730,8 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
         let mut too_big = false;
         use tokio::io::AsyncWriteExt as _;
         loop {
-            match field.chunk().await {
-                Ok(Some(chunk)) => {
+            match tokio::time::timeout(BODY_IDLE_TIMEOUT, field.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
                     written += chunk.len() as u64;
                     if written > st.max_upload_bytes {
                         too_big = true;
@@ -733,10 +742,15 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
                         return (StatusCode::INTERNAL_SERVER_ERROR, "写入失败").into_response();
                     }
                 }
-                Ok(None) => break,
-                Err(_) => {
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => {
                     let _ = tokio::fs::remove_file(&part).await;
                     return (StatusCode::BAD_REQUEST, "上传中断").into_response();
+                }
+                Err(_) => {
+                    // 空闲超时：断开并清理（闸随连接释放）。
+                    let _ = tokio::fs::remove_file(&part).await;
+                    return (StatusCode::REQUEST_TIMEOUT, "上传请求体空闲超时").into_response();
                 }
             }
         }
