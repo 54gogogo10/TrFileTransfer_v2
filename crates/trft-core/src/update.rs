@@ -133,11 +133,20 @@ fn parse_url(raw: &str) -> Result<Url> {
         None => (rest, "/"),
     };
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && !h.contains(']') || (h.starts_with('[')) => {
+        // IPv6 字面量：`[::1]:8443` 带端口才解析；裸 `[::1]`（无端口）走默认端口
+        // 分支（轮 4 F9——此前裸 v6 字面量误入本分支，p.parse 必败报「端口非法」）。
+        Some((h, p))
+            if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && h.starts_with('[') && h.ends_with(']') =>
+        {
             let port: u16 = p.parse().map_err(|_| proto("端口非法"))?;
             (h.trim_matches(|c| c == '[' || c == ']'), port)
         }
-        _ => (authority, if https { 443 } else { 80 }),
+        // 非字面量主机名（或裸 IPv4）带端口。
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && !h.contains(':') => {
+            let port: u16 = p.parse().map_err(|_| proto("端口非法"))?;
+            (h, port)
+        }
+        _ => (authority.trim_matches(|c| c == '[' || c == ']'), if https { 443 } else { 80 }),
     };
     if host.is_empty() {
         return Err(proto("URL 缺少主机"));
@@ -435,12 +444,15 @@ async fn download_into<W: tokio::io::AsyncWrite + Unpin + Send>(
         }};
     }
     // 从 io/pending 取一行（CRLF 定界）——chunked 块长行用（轮 5 P2）。
+    // 行长上限 8KB（轮 4 F4）：合法块长行远短于此；恶意更新源发无 CRLF 的
+    // GB 级字节流不得无界缓冲（对照 read_body 已有的 2×max 上限）。
     async fn read_line(
         io: &mut (impl tokio::io::AsyncRead + Unpin + Send),
         pending: &mut Vec<u8>,
         pos: &mut usize,
         chunk: &mut [u8; 64 * 1024],
     ) -> Result<String> {
+        const MAX_LINE: usize = 8 * 1024;
         loop {
             if let Some(idx) = pending[*pos..].windows(2).position(|w| w == b"
 ") {
@@ -451,6 +463,9 @@ async fn download_into<W: tokio::io::AsyncWrite + Unpin + Send>(
             if *pos > 0 {
                 pending.drain(..*pos);
                 *pos = 0;
+            }
+            if pending.len() > MAX_LINE {
+                return Err(proto("chunked 块长行超过 8KB 上限（疑似恶意源）"));
             }
             let n = tokio::time::timeout(Duration::from_secs(60), io.read(chunk))
                 .await

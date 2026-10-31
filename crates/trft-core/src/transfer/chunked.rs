@@ -17,8 +17,8 @@ use crate::protocol::frame::{
     STATUS_OK, STATUS_REJECT, T_CHUNKED, T_CHUNK_END, T_COVERAGE_QUERY, sanitize_name,
 };
 use crate::protocol::io::{
-    read_n, read_n_long, read_str_u16, read_u32, read_u64, read_u8, read_u8_long, write_all,
-    write_str_u16, write_u32, write_u64, write_u8,
+    read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, read_u8_long,
+    write_all, write_str_u16, write_u32, write_u64, write_u8,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use crate::transfer::receiver::{RecvOptions, publish_part};
@@ -384,16 +384,31 @@ where
     if offset > total || offset + plen as u64 > total {
         return Err(proto(format!("块区间 [{offset},{}) 越界（total={total}）", offset + plen as u64)));
     }
-    let payload = read_n_long(s, plen as usize).await?;
+    // 流式读入（轮 4 F3）：不按声明预分配整段（read_n_long 会让 40B 帧头
+    // 钉住 8MB 提交内存 ×64 闸至 300s 超时）；与 0x00/0x03 同纪律按固定
+    // CHUNK 缓冲逐片读、逐片经 receive 幂等落盘（相邻片在区间表中合并）。
     // 与其余接收路径同纪律：保存目录先建（ensure 的 create_new 依赖它存在）；
     // 目录按对端解析（PerDeviceFolder/AutoArchive），会话建立时固定。
     let dir = crate::transfer::receiver::resolve_save_dir(opts, peer.ip());
     tokio::fs::create_dir_all(&dir).await?;
+    let mut buf = vec![0u8; CHUNK.min(MAX_CHUNK_PAYLOAD as usize)];
+    let mut pos = offset;
+    let mut left = plen as u64;
     let started = std::time::Instant::now();
-    let completed = opts
-        .chunk_sessions
-        .receive(gid, &name, total, offset, &payload, &dir)
-        .await?;
+    let mut completed = false;
+    while left > 0 {
+        let want = buf.len().min(left as usize);
+        read_exact_long(s, &mut buf[..want]).await?;
+        if opts
+            .chunk_sessions
+            .receive(gid, &name, total, pos, &buf[..want], &dir)
+            .await?
+        {
+            completed = true;
+        }
+        pos += want as u64;
+        left -= want as u64;
+    }
     if completed {
         opts.chunk_sessions.finish(gid, opts).await?;
         // 组装发布即成功记账（0x02 无独立应答帧；重试收敛于成功不重复入账——
@@ -632,15 +647,22 @@ async fn send_complement(
         if n > MAX_MERGED_RANGES {
             return Err(proto("0x0B 应答区间数超上限"));
         }
-        let mut ranges = Vec::with_capacity(n);
-        for _ in 0..n {
-            let off = read_u64(&mut s).await?;
-            let len = read_u64(&mut s).await?;
-            if len == 0 || len > size.saturating_sub(off) {
-                return Err(proto("0x0B 应答区间非法"));
+        // 整段应答读加 60s 总预算（轮 4 F5）：恶意服务端逐字段 1 字节/29s
+        // 可把单任务拖至数天；合法应答（内存直答）远快于此。
+        let ranges = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut ranges = Vec::with_capacity(n);
+            for _ in 0..n {
+                let off = read_u64(&mut s).await?;
+                let len = read_u64(&mut s).await?;
+                if len == 0 || len > size.saturating_sub(off) {
+                    return Err(proto("0x0B 应答区间非法"));
+                }
+                ranges.push((off, off + len));
             }
-            ranges.push((off, off + len));
-        }
+            Ok(ranges)
+        })
+        .await
+        .map_err(|_| proto("0x0B 应答读取超时（60s 总预算）"))??;
         complement_of(&ranges, size)
     } else {
         vec![(0, size)] // 旧对端回退：全量重发（规格 §3.1）

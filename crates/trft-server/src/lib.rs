@@ -526,10 +526,15 @@ fn parse_range(h: &str, size: u64) -> Result<Option<RangeSpec>, ()> {
     }
     let (a, b) = spec.split_once('-').ok_or(())?;
     if a.is_empty() {
-        // 后缀区间：bytes=-N（最后 N 字节；N=0 不可满足）
+        // 后缀区间：bytes=-N（最后 N 字节；N=0 不可满足）。
+        // N ≥ size：按 RFC 9110 §14.1.2 视为整个表示（回 200 全量，轮 4 F7——
+        // 此前误回 416；断点续传客户端请求超出表示长度的后缀属常见边界）。
         let n: u64 = b.parse().map_err(|_| ())?;
-        if n == 0 || n > size {
+        if n == 0 {
             return Err(());
+        }
+        if n >= size {
+            return Ok(None); // 调用方按无 Range 处理（200 全量）
         }
         Ok(Some(RangeSpec { start: size - n, end: size - 1 }))
     } else {
@@ -950,11 +955,18 @@ fn url_escape(s: &str) -> String {
 /// axum::serve 的替代：手动 serve 每条连接并设置 hyper `header_read_timeout`——
 /// 慢速只发半个请求头的连接 15 秒后被掐断，32 个并发闸不再能被永久占满。
 /// main 与 GUI 共享同一入口（行为一致）。
+/// - 轮 4 F1：**必须配 Timer**——hyper 在每次读请求头时无条件武装该超时，
+///   无 Timer 时（`Time::Empty`）每个 HTTP/1 请求直接 panic（debug/release 双
+///   实证：明文 Web 面整体不可用；此前被进程内 oneshot 测试缺口掩盖）。
+/// - 轮 4 F2：不再用 `server-auto`（h2c prior-knowledge 绕过 h1 专属的
+///   header_read_timeout 且无 idle 上限——静默 h2 连接永生）。目标客户端
+///   （手机浏览器）明文下只走 HTTP/1，直接用 http1 Builder。
 pub async fn serve_with_header_timeout(
     listener: tokio::net::TcpListener,
     router: axum::Router,
 ) -> std::io::Result<()> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper::server::conn::http1;
+    use hyper_util::rt::{TokioIo, TokioTimer};
     use tower::util::ServiceExt as _;
     loop {
         let (socket, remote_addr) = listener.accept().await?;
@@ -967,14 +979,15 @@ pub async fn serve_with_header_timeout(
                     let mut req = req.map(axum::body::Body::new);
                     req.extensions_mut()
                         .insert(axum::extract::ConnectInfo(remote_addr));
-                        app.oneshot(req).await.map_err(|e| {
-                            std::io::Error::other(format!("router 调用失败: {e}"))
-                        })
-                    }
-                },
-            ));
-            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-            builder.http1().header_read_timeout(std::time::Duration::from_secs(15));
+                    app.oneshot(req).await.map_err(|e| {
+                        std::io::Error::other(format!("router 调用失败: {e}"))
+                    })
+                }
+            }));
+            let mut builder = http1::Builder::new();
+            builder
+                .timer(TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_secs(15));
             let _ = builder.serve_connection(TokioIo::new(socket), service).await;
         });
     }

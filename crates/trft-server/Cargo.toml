@@ -13,7 +13,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # 规格 §6.1「头读超时 15s」：axum::serve 不暴露 hyper 的 header_read_timeout，
 # 手动 serve 连接（轮 2 P1）；tokio-util 供流式下载 ReaderStream。
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 

@@ -948,10 +948,14 @@ pub async fn serve_udp_on(socket: UdpSocket, opts: UdpRecvOptions, events: Optio
         }
         let (n, peer) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
-            // Windows：缓冲小于数据报 → WSAEMSGSIZE(10040)——一个超长垃圾包
-            // 不得杀死整个接收器（轮 4 P1：LAN kill switch，已实测复现）。
-            // 合法帧上限 1525B，超长包必为垃圾 → 丢弃续收。
-            Err(e) if e.raw_os_error() == Some(10040) => {
+            // 缓冲小于数据报 → MSGSIZE——一个超长垃圾包不得杀死整个接收器
+            // （轮 4 P1：LAN kill switch，已实测复现）。合法帧上限 1525B，
+            // 超长包必为垃圾 → 丢弃续收。跨平台错误码（轮 4 F6：此前仅匹配
+            // Windows 10040，Linux EMSGSIZE=90 仍会杀死接收器）：
+            // 10040=WSAEMSGSIZE(Windows) / 90=EMSGSIZE(Linux) / 40(macOS) / 97(FreeBSD)。
+            Err(e)
+                if matches!(e.raw_os_error(), Some(10040) | Some(90) | Some(40) | Some(97)) =>
+            {
                 continue;
             }
             Err(e) => return Err(crate::error::Error::Io(e)),

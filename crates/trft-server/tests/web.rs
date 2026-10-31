@@ -389,3 +389,65 @@ async fn chinese_filename_roundtrip() {
     assert!(cd.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v2.txt"), "RFC5987 编码: {cd}");
     assert_eq!(body_bytes(res.into_body()).await, b"\xE5\x86\x85\xE5\xAE\xB9");
 }
+
+// ============ 真实 TCP 驱动（轮 4 F1 判别） ============
+
+/// 轮 4 F1 判别：HTTP/1 请求经**真实 TCP** 必须正常应答——修复前 hyper 未配
+/// Timer，每次读请求头即 panic（连接 RST，一个字节都拿不到；oneshot 测试
+/// 不经 TCP 故 175 绿掩盖）。去修复（去掉 .timer）本测试必红。
+#[tokio::test]
+async fn real_tcp_get_serves_without_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = trft_server::build_router(state_with_auth(dir.path().to_path_buf(), "123456"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(trft_server::serve_with_header_timeout(listener, app));
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(10), sock.read(&mut buf))
+        .await
+        .expect("应答不得超时")
+        .expect("连接不得被重置（panic 面）");
+    assert!(n > 0, "必须读到应答字节（修复前每个 h1 请求 panic → RST → 0 字节）");
+    assert!(buf.starts_with(b"HTTP/1.1 200"), "应答开头: {}", String::from_utf8_lossy(&buf[..n.min(32)]));
+    srv.abort();
+}
+
+/// 轮 4 F1/F2 判别：半开请求头连接必须被 ~15s 掐断（slowloris 守卫）。
+#[tokio::test]
+async fn half_open_header_is_cut_after_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = trft_server::build_router(state_with_auth(dir.path().to_path_buf(), "123456"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(trft_server::serve_with_header_timeout(listener, app));
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    use tokio::io::AsyncWriteExt;
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // 半个头，不发结尾
+    // 服务器必须在 ~15s（+裕量）内关闭连接；修复前（无 Timer）永不关闭。
+    let mut buf = [0u8; 64];
+    let t0 = std::time::Instant::now();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        use tokio::io::AsyncReadExt;
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    let elapsed = t0.elapsed();
+    assert!(read.is_ok(), "半开连接必须在 20s 内被关闭（slowloris 守卫）");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(10) && elapsed <= std::time::Duration::from_secs(19),
+        "关闭时机应在头读超时附近，实际 {elapsed:?}"
+    );
+    srv.abort();
+}

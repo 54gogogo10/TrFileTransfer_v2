@@ -137,6 +137,13 @@
    - **接收器并发闸获取加 30s 上限**（与 Web 面同纪律；满闸下合法连接不再无限静默等待）；**Web 请求体空闲 60s 超时**（头读超时只覆盖头阶段，慢滴 body 可占闸）；
    - **非硬链接卷发布回退改 create_new + 拷贝**（Windows rename 静默替换 → 并发同名 TOCTOU 覆盖窗口；与 UDP/Web 同口径，代价是崩溃窗口内可能残留最终名半成品——错误路径仍有清理兜底）；
    - **登记接受（不修）**：0x08 解压内存仅单段 64MB 上限、无跨连接聚合计账（64 并发 × ~60KB 压缩流 ≈ 4GB 瞬时，纯可用性、瞬时性；单段上限为规格 §6.1 声明值）；接收器慢滴连接占用（每读窗口内滴 1 字节可长持许可——闸获取超时已缓解排队侧，占用侧需空闲预算机制，量大未做）。
+14. **第二轮全量审查·轮 4（输入校验/DoS）新增口径**（2026-11-01）：
+   - **Web serve 必须配 Timer**（轮 2 修复自身缺陷，debug/release 双实证）：hyper 在每次读请求头时无条件武装 `header_read_timeout`，无 Timer 时 `Time::Empty` 直接 **panic**——明文 HTTP/1 全量请求被 RST、slowloris 守卫归零，而进程内 oneshot 测试不经真实 TCP 掩盖了整链失效。已补真实 TCP e2e（GET 成功 + 半开头 15s 掐断，去 Timer 必红）；
+   - **去掉 `server-auto`**（h2c prior-knowledge 绕过 h1 专属 header_read_timeout 且无 idle 上限，静默 h2 连接永生）；目标客户端（手机浏览器）明文只走 HTTP/1，改 `hyper::server::conn::http1` 直连；
+   - **0x02 块载荷改流式读**（固定 CHUNK 缓冲逐片落盘）：此前 `read_n_long` 按声明预分配整段——40B 帧头即可钉住 8MB × 64 闸至 300s（与 0x00/0x03 同纪律收敛）；
+   - **更新器 chunked 块长行 8KB 上限**（恶意更新源无 CRLF 流不再无界缓冲）；**0x0B 应答读 60s 总预算**（恶意服务端逐字段拖延不再把单任务拖至数天）；**UDP MSGSIZE 跨平台错误码**（此前仅 Windows 10040，Linux/macOS/BSD 的 EMSGSIZE 仍会杀死接收器）；
+   - **Web 后缀 Range `bytes=-N` 且 N≥size 回 200 全量**（RFC 9110 §14.1.2；此前误 416）；**更新 URL 裸 IPv6 字面量**（`https://[::1]/m`）可解析（默认端口）；
+   - **登记接受（不修）**：GUI invoke 信任边界（`http_start(dir)`/`stats_export_csv(path)`/`monitor_start(watch_dir)` 接受前端任意路径、`devices_record` 可标 User 来源）——前端为本产品自带代码（无注入链，渲染均 textContent），本地攻击者模型出界；后续若开放第三方前端再收紧。
 
 ## 8. 记录在案的否决项
 
