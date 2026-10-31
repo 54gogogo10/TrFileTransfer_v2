@@ -26,6 +26,14 @@ pub async fn read_u8<R: AsyncRead + Unpin>(r: &mut R) -> Result<u8> {
     Ok(b[0])
 }
 
+/// 长任务窗口的单字节读：服务端应答前可能做全文件哈希（0x03 skip 判定 /
+/// 0x04 位图核对——冷缓存下静默可达数分钟，规格 §6.1 长任务读窗口）。
+pub async fn read_u8_long<R: AsyncRead + Unpin>(r: &mut R) -> Result<u8> {
+    let mut b = [0u8; 1];
+    read_exact_t(r, &mut b, LONG_READ_TIMEOUT).await?;
+    Ok(b[0])
+}
+
 pub async fn read_n<R: AsyncRead + Unpin>(r: &mut R, n: usize) -> Result<Vec<u8>> {
     let mut v = vec![0u8; n];
     read_exact_t(r, &mut v, READ_TIMEOUT).await?;

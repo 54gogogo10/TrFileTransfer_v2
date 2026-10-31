@@ -363,7 +363,13 @@ where
                 return Err(Error::AuthRejected("服务端证明校验失败（疑似中间人）".into()));
             }
         }
-        (None, _) => {}
+        // 与服务端对称：无码但对端出示了证明 → 读掉 32B 保持字节流同步
+        // （诚实对端不可达——无码客户端 flags_c=0 必被有码服务端拒绝；跨实现
+        // 互通时按 WIRE-PROTOCOL §2.1 的条件可选布局不得跳读，轮 1 F6）。
+        (None, true) => {
+            let _ = crate::protocol::io::read_n(&mut enc, 32).await?;
+        }
+        (None, false) => {}
     }
     let authed = code.is_some();
     Ok((enc, authed))

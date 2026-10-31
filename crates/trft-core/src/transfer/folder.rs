@@ -15,7 +15,7 @@ use crate::transfer::receiver::{
     PartGuard, RecvOptions, publish_part, resolve_root, space_ok,
 };
 use crate::transfer::resume;
-use crate::transfer::sender::{SendOptions, authenticate, connect, connect_quic_auth};
+use crate::transfer::sender::{SendOptions, StackPlan, connect_quic_auth, connect_stack};
 use crate::transfer::{CHUNK, Transport};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -88,10 +88,11 @@ pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> R
     let outcome = crate::progress::Outcome::new(opts.progress.clone());
     let started = std::time::Instant::now();
     let res = match opts.transport {
+        // 经 connect_stack 接线 0x09 加密（轮 1 F3：此前 0x01 直连明文——
+        // opts.encrypt 被静默忽略，配对场景载荷全程明文，未声明的降级）。
+        // 0x01 为基础帧：无需能力探询、不协商压缩（保持既有线上行为）。
         Transport::Tcp => {
-            let mut s = connect(addr, opts.src_port).await?;
-            s.set_nodelay(true).ok();
-            authenticate(&mut s, opts.pairing_code.as_deref()).await?;
+            let (mut s, _) = connect_stack(addr, opts, StackPlan::default()).await?;
             send_folder_over(&mut s, &root_name, &files, opts).await
         }
         Transport::Quic => {

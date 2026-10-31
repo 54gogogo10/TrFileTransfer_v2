@@ -3,7 +3,8 @@
 //!
 //! 帧布局：20B 公共头 + 载荷
 //! - START: u16 名长 + 名 + u64 大小 + u32 块长 + u8 fec + u8 parity
-//! - DATA : seq = 全局块序号，载荷 = 该块（末组由发送端补零到块长）
+//! - DATA : seq = 全局块序号，载荷 = 该块实际字节（末块 = 余数，不补零；
+//!          RS 编码/恢复内部按块长补零，END 前 set_len 裁剪）
 //! - PARITY: u32 组号 + u8 分片序号(≥k) + 分片载荷
 //! - END  : 32B SHA-256
 
@@ -173,7 +174,11 @@ impl UdpPlan {
                         let seq = g * FEC_DATA_SHARDS as u64 + idx as u64;
                         // 末组补零分片不发送：接收端视其为已知零分片。
                         if seq < self.chunk_count {
-                            let frame = self.data_frame(seq, &shard);
+                            // 末块线上载荷 = 实际余数（与接收端精确长度校验配对，轮 1 F2；
+                            // RS 编码分片仍按块长补零——恢复路径写全块长，END 前 set_len 裁剪）。
+                            let real =
+                                (self.chunk_len as u64).min(self.size - seq * self.chunk_len as u64) as usize;
+                            let frame = self.data_frame(seq, &shard[..real]);
                             lim.acquire(frame.len() as u64).await;
                             socket.send_to(&frame, addr).await?;
                         }
@@ -232,7 +237,10 @@ impl UdpPlan {
                         let seq = g * FEC_DATA_SHARDS as u64 + idx as u64;
                         // 末组补零分片不发送：接收端视其为已知零分片。
                         if seq < self.chunk_count {
-                            data.push(self.data_frame(seq, &shard));
+                            // 末块线上载荷 = 实际余数（与 send_pass 同口径，轮 1 F2）。
+                            let real =
+                                (self.chunk_len as u64).min(self.size - seq * self.chunk_len as u64) as usize;
+                            data.push(self.data_frame(seq, &shard[..real]));
                         }
                     } else {
                         parity.push(self.parity_frame(g as u32, idx as u8, &shard));
@@ -1107,6 +1115,32 @@ mod tests {
         }
         let dest = out.join("b.bin");
         assert!(dest.exists(), "FEC 应恢复丢失分片");
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    /// 轮 1 F2 判别：FEC 模式 size % 1200 ≠ 0 时，末块必须能**直接经 DATA 帧**
+    /// 落盘（不得依赖末组 PARITY 恢复）。修复前发送侧末块补零到块长 → 被接收端
+    /// 精确长度校验拒绝 → PARITY 全丢时整文件不可交付，本测试必红。
+    #[tokio::test]
+    async fn fec_last_remainder_chunk_delivered_via_data_without_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, data) = make_file(dir.path(), "r.bin", 5000).await; // 4×1200 + 余 200
+        let plan = build_plan(&src, &UdpSendOptions { fec: true, ..Default::default() }).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        for f in plan.start_frames() {
+            eng.handle(&f);
+        }
+        let (data_frames, _parity_dropped, hash) = plan.build_pass(&src).await.unwrap();
+        // 全部 PARITY 丢失：交付只能依赖 DATA 帧。
+        for d in &data_frames {
+            eng.handle(d);
+        }
+        for e in plan.end_frames(&hash) {
+            eng.handle(&e);
+        }
+        let dest = out.join("r.bin");
+        assert!(dest.exists(), "末块必须经 DATA 帧直接落盘（不依赖 PARITY）");
         assert_eq!(std::fs::read(&dest).unwrap(), data);
     }
 

@@ -18,8 +18,8 @@ use crate::protocol::frame::{
     T_RESUME_FILE, T_RESUME_FOLDER, sanitize_name, sanitize_rel,
 };
 use crate::protocol::io::{
-    read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, write_all, write_str_u16,
-    write_u32, write_u64, write_u8,
+    read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, read_u8_long, write_all,
+    write_str_u16, write_u32, write_u64, write_u8,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use crate::transfer::folder::collect_files;
@@ -148,6 +148,8 @@ pub(crate) async fn session_lock(
 }
 
 /// 目标文件哈希：先查摘要缓存（免费），未命中现算（判错方向不对称：宁可多算）。
+/// 现算结果回填缓存（免费填充——刚算出的摘要就是事实，重试/下次同步收敛，
+/// 否则大库冷缓存下每次同步都对同一批文件整文件重算，轮 1 F4）。
 pub(crate) async fn dest_hash(
     opts: &RecvOptions,
     rel: &str,
@@ -161,10 +163,14 @@ pub(crate) async fn dest_hash(
         }
     }
     let d = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || sha256_file(&d).ok())
+    let computed = tokio::task::spawn_blocking(move || sha256_file(&d).ok())
         .await
         .ok()
-        .flatten()
+        .flatten();
+    if let (Some(h), Some(cache)) = (&computed, &opts.hash_cache) {
+        cache.lock().await.insert(rel, size, mtime, *h);
+    }
+    computed
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> u64 {
@@ -522,6 +528,7 @@ where
 
 // ============ 0x03 客户端 ============
 
+#[derive(Debug)]
 pub(crate) enum ResumeNego {
     /// 从 serverOffset 续传。
     Proceed(u64),
@@ -534,11 +541,13 @@ pub(crate) enum ResumeNego {
 }
 
 /// 0x03 协商：读服务端 0x10 应答并判别（对端不支持 → 降级 0x00 路径）。
+/// 首字节用长任务窗口——服务端 skip 判定可能先对既有目标整文件现算哈希
+/// （冷缓存下静默数分钟，规格 §6.1；轮 1 F4）。
 async fn read_nego<S>(s: &mut S, size: u64) -> Result<ResumeNego>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let first = read_u8(s).await;
+    let first = read_u8_long(s).await;
     let first = match first {
         Ok(b) => b,
         Err(_) => return Ok(ResumeNego::Unsupported), // 旧对端拒绝后直接断开
@@ -767,8 +776,9 @@ pub async fn send_folder_resume(
         metas.push((rel.clone(), path.clone(), size, mtime));
     }
 
-    // 位图应答。
-    let first = read_u8(&mut s).await?;
+    // 位图应答。首字节用长任务窗口——服务端逐项核对可能整文件现算哈希
+    // （冷缓存大库静默数分钟，规格 §6.1；轮 1 F4）。
+    let first = read_u8_long(&mut s).await?;
     if first != R_MANIFEST {
         return Err(proto(format!("0x11 应答异常: 0x{first:02X}")));
     }
@@ -869,5 +879,52 @@ mod tests {
         let c = session_lock(&opts, &ip, "b.txt").await;
         assert!(Arc::ptr_eq(&a, &b));
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    /// 轮 1 F4 判别：服务端应答前 31s 哈希静默不得令 0x10 协商读判
+    /// Unsupported/超时——修复前 read_nego 首字节用 30s 普通窗口，本测试必红。
+    #[tokio::test(start_paused = true)]
+    async fn nego_read_survives_long_hashing_silence() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // 模拟服务端冷缓存下对目标整文件现算哈希（> 30s 普通读窗口）。
+            tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+            server.write_all(&[R_RESUME_NEGO, STATUS_OK]).await.unwrap();
+            server.write_all(&100u64.to_le_bytes()).await.unwrap();
+        });
+        let nego = read_nego(&mut client, 200).await.unwrap();
+        assert!(
+            matches!(nego, ResumeNego::Proceed(100)),
+            "31s 静默后协商必须正常读到 0x10，实际: {nego:?}"
+        );
+    }
+
+    /// 轮 1 F4 判别：dest_hash 现算后必须回填缓存（重试收敛）——
+    /// 修复前缓存恒未命中，同一文件每次判定都整文件重算。
+    #[tokio::test]
+    async fn dest_hash_backfills_cache_after_fresh_compute() {
+        use crate::hashcache::HashCache;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.bin");
+        std::fs::write(&dest, b"hello world").unwrap();
+        let mtime = mtime_of(&std::fs::metadata(&dest).unwrap());
+        let opts = RecvOptions {
+            hash_cache: Some(Arc::new(tokio::sync::Mutex::new(HashCache::load(
+                &dir.path().join("nonexistent-cache.txt"),
+                7,
+            )))),
+            ..Default::default()
+        };
+        let expect = sha256_file(&dest).unwrap();
+        // 第一次：缓存未命中 → 现算。
+        assert_eq!(dest_hash(&opts, "x.bin", 11, mtime, &dest).await, Some(expect));
+        // 第二次：必须命中缓存（回填生效——未回填则此处 Some 但经现算，
+        // 判别口径改为直接查缓存表本身）。
+        assert_eq!(
+            opts.hash_cache.as_ref().unwrap().lock().await.get("x.bin", 11, mtime),
+            Some(expect),
+            "现算后必须回填缓存"
+        );
     }
 }

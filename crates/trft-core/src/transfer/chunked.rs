@@ -17,8 +17,8 @@ use crate::protocol::frame::{
     STATUS_OK, STATUS_REJECT, T_CHUNKED, T_CHUNK_END, T_COVERAGE_QUERY, sanitize_name,
 };
 use crate::protocol::io::{
-    read_n, read_n_long, read_str_u16, read_u32, read_u64, read_u8, write_all, write_str_u16,
-    write_u32, write_u64, write_u8,
+    read_n, read_n_long, read_str_u16, read_u32, read_u64, read_u8, read_u8_long, write_all,
+    write_str_u16, write_u32, write_u64, write_u8,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use crate::transfer::receiver::{RecvOptions, publish_part};
@@ -40,7 +40,11 @@ const SESSION_TTL: Duration = Duration::from_secs(600);
 pub(crate) struct GroupState {
     ranges: Vec<(u64, u64)>, // 已写盘区间（合并、升序）
     covered: u64,
+    /// 组装进行中（写盘守卫：覆盖达成即置位，阻止迟到块穿透发布）。
     assembling: bool,
+    /// 组装已成功（0x0C 判 0x01 的唯一依据）。**覆盖达成 ≠ assembled**——
+    /// 未目睹组装成功不得报成功（规格 §7.1：结果未知 ≠ 成功）。
+    assembled: bool,
 }
 
 pub(crate) struct GroupSession {
@@ -51,6 +55,8 @@ pub(crate) struct GroupSession {
     file: tokio::sync::Mutex<tokio::fs::File>,
     state: tokio::sync::Mutex<GroupState>,
     last_seen_ms: AtomicU64,
+    /// 组装结论唤醒（finish 成功/失败时唤醒 0x0C 等待者）。
+    notify: std::sync::Arc<tokio::sync::Notify>,
     /// 进度上报（会话创建时注册；None = 不上报）。
     report: Option<crate::progress::Reporter>,
 }
@@ -198,8 +204,10 @@ impl ChunkTracker {
                 ranges: Vec::new(),
                 covered: 0,
                 assembling: false,
+                assembled: false,
             }),
             last_seen_ms: AtomicU64::new(now),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             report: self.progress.as_ref().map(|h| h.register("recv", name, total)),
         });
         map.insert(gid, s.clone());
@@ -250,26 +258,36 @@ impl ChunkTracker {
     }
 
     /// 组装：现算整文件 SHA-256 → 原子发布。**成功后会话保留为已完成态**
-    /// （state.assembling 恒真）：迟到的 0x0C 判 0x01、0x0B 回满覆盖、重复块幂等
-    /// 跳过——重试收敛于成功而非二次发布。失败路径移除会话（0x0C 随后回
-    /// 0x00，客户端整组重来——无假成功窗口）。
+    /// （assembling 恒真 + assembled 置位）：迟到的 0x0C 判 0x01、0x0B 回满覆盖、
+    /// 重复块幂等跳过——重试收敛于成功而非二次发布。失败路径移除会话并唤醒
+    /// 等待中的 0x0C（回 0x00，客户端整组重来——无假成功窗口）。
     pub(crate) async fn finish(&self, gid: [u8; 16], opts: &RecvOptions) -> Result<()> {
-        let (part, name, report) = {
+        let (part, name, report, notify) = {
             let map = self.sessions.lock().await;
             let Some(s) = map.get(&gid) else {
                 return Err(proto("分块会话不存在（组装）"));
             };
-            (s.part.clone(), s.name.clone(), s.report.clone())
+            (s.part.clone(), s.name.clone(), s.report.clone(), s.notify.clone())
         };
         if let Err(e) = self.assemble(&part, &name, opts).await {
-            let mut map = self.sessions.lock().await;
-            map.remove(&gid);
+            {
+                let mut map = self.sessions.lock().await;
+                map.remove(&gid);
+            }
             let _ = std::fs::remove_file(&part);
             if let Some(r) = &report {
                 r.fail();
             }
+            notify.notify_waiters();
             return Err(proto(format!("分块组装失败: {e}")));
         }
+        {
+            let map = self.sessions.lock().await;
+            if let Some(s) = map.get(&gid) {
+                s.state.lock().await.assembled = true;
+            }
+        }
+        notify.notify_waiters();
         if let Some(r) = &report {
             r.finish();
         }
@@ -300,18 +318,38 @@ impl ChunkTracker {
         Some(st.ranges.clone())
     }
 
-    /// 0x0C 判决：0x01 组装完成 / 0x02 会话在但未覆盖 / 0x00 会话不存在。
+    /// 0x0C 判决：0x01 **组装成功** / 0x02 会话在但未覆盖（或组装未出结论）/
+    /// 0x00 会话不存在。组装进行中时等待 finish 的结论（长任务窗口）——
+    /// 「覆盖达成」只代表组装**开始**，未目睹组装成功不得回 0x01（轮 1 F1）。
     pub(crate) async fn end_status(&self, gid: [u8; 16]) -> u8 {
-        let map = self.sessions.lock().await;
-        match map.get(&gid) {
-            None => STATUS_REJECT,
-            Some(s) => {
-                if s.state.lock().await.assembling {
-                    STATUS_OK
-                } else {
-                    STATUS_INCOMPLETE
+        loop {
+            let sess = {
+                let map = self.sessions.lock().await;
+                map.get(&gid).cloned()
+            };
+            let Some(s) = sess else { return STATUS_REJECT };
+            // 先注册唤醒再查状态（防「查完→注册前」窗口丢结论通知）。
+            let notified = s.notify.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            {
+                let st = s.state.lock().await;
+                if st.assembled {
+                    return STATUS_OK;
+                }
+                if !st.assembling {
+                    return STATUS_INCOMPLETE;
                 }
             }
+            // 组装中：等 finish 结论（成功置 assembled / 失败移除会话）。
+            if tokio::time::timeout(crate::protocol::io::LONG_READ_TIMEOUT, notified)
+                .await
+                .is_err()
+            {
+                // 长窗口仍无结论：回未完成（fail-closed；客户端补发轮会再问）。
+                return STATUS_INCOMPLETE;
+            }
+            // 被唤醒：重查（会话可能已被失败路径移除 → 下一轮回 0x00）。
         }
     }
 }
@@ -465,7 +503,8 @@ async fn send_chunks_conn(
     }
     write_u8(&mut s, T_CHUNK_END).await?;
     write_all(&mut s, &gid).await?;
-    let st = read_u8(&mut s).await?;
+    // 组装结论可能要等整文件 SHA-256 + 发布（大文件数秒以上）——长任务读窗口。
+    let st = read_u8_long(&mut s).await?;
     let _ = s.shutdown().await;
     Ok(st)
 }
@@ -578,7 +617,9 @@ async fn send_complement(
     size: u64,
     path: &Path,
 ) -> Result<bool> {
-    let (mut s, _) = connect_stack(addr, opts, StackPlan { probe_caps: false, compress: opts.compress }).await?;
+    // probe_caps: true——压缩协商依赖能力位（false 时 caps=0 → 补发轮恒明文直传，
+    // 可压缩数据补发流量放大，轮 1 F8）。
+    let (mut s, _) = connect_stack(addr, opts, StackPlan { probe_caps: true, compress: opts.compress }).await?;
     write_u8(&mut s, T_COVERAGE_QUERY).await?;
     write_all(&mut s, &gid).await?;
     let st = read_u8(&mut s).await?;
@@ -656,5 +697,56 @@ mod tests {
         assert!(!covered_range(&r, 0, 301));
         // 部分覆盖不算覆盖（规格 §1.4 判错方向不对称）。
         assert!(!covered_range(&[(0, 50), (60, 100)], 0, 100));
+    }
+
+    /// 轮 1 F1 判别：**覆盖达成（组装开始）≠ 组装完成**——0x0C 在组装窗口内
+    /// 不得判 0x01。修复前 assembling 置位即回 STATUS_OK（组装失败 → 假成功），
+    /// 本测试用例在修复前必然红。
+    #[tokio::test(start_paused = true)]
+    async fn end_status_waits_for_assembly_outcome_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let tracker = ChunkTracker::default();
+        let gid = [0xABu8; 16];
+        let payload = vec![7u8; 3000];
+        // 三个块覆盖 [0,3000)：最后一块返回 completed=true（组装开始）。
+        let c0 = tracker.receive(gid, "a.bin", 3000, 0, &payload[..1000], &out).await.unwrap();
+        let c1 = tracker.receive(gid, "a.bin", 3000, 1000, &payload[1000..2000], &out).await.unwrap();
+        let c2 = tracker.receive(gid, "a.bin", 3000, 2000, &payload[2000..], &out).await.unwrap();
+        assert!((c0, c1, c2) == (false, false, true));
+        // 组装尚未完成（finish 未被调用）：0x0C 必须不是 0x01。
+        // 暂停时钟下等待窗口立即到期——修复前此处直接回 STATUS_OK（红）。
+        let st = tracker.end_status(gid).await;
+        assert_ne!(st, STATUS_OK, "组装进行中不得判 0x01（假成功窗口）");
+        assert_eq!(st, STATUS_INCOMPLETE);
+    }
+
+    /// 轮 1 F1 判别（续）：组装成功 → 0x01；组装失败 → 会话移除 → 0x00。
+    #[tokio::test(start_paused = true)]
+    async fn end_status_reflects_assembly_success_and_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let opts = RecvOptions { save_dir: out.clone(), ..Default::default() };
+        let tracker = ChunkTracker::default();
+
+        // 成功路径。
+        let g1 = [0x11u8; 16];
+        let payload = vec![1u8; 2000];
+        tracker.receive(g1, "ok.bin", 2000, 0, &payload[..1000], &out).await.unwrap();
+        tracker.receive(g1, "ok.bin", 2000, 1000, &payload[1000..], &out).await.unwrap();
+        tracker.finish(g1, &opts).await.unwrap();
+        assert_eq!(tracker.end_status(g1).await, STATUS_OK, "组装成功后 0x0C 判 0x01");
+        // 组装成功后会话保留完成态：0x0B 回满覆盖（迟到查询稳定收敛）。
+        assert_eq!(tracker.ranges_of(g1).await, Some(vec![(0, 2000)]));
+
+        // 失败路径：删除半成品令组装（哈希）失败 → 会话移除 → 0x00。
+        let g2 = [0x22u8; 16];
+        tracker.receive(g2, "bad.bin", 2000, 0, &payload[..1000], &out).await.unwrap();
+        tracker.receive(g2, "bad.bin", 2000, 1000, &payload[1000..], &out).await.unwrap();
+        std::fs::remove_file(group_part_path(&out, "bad.bin", &g2)).unwrap();
+        tracker.finish(g2, &opts).await.unwrap_err();
+        assert_eq!(tracker.end_status(g2).await, STATUS_REJECT, "组装失败必须判 0x00（无假成功）");
     }
 }

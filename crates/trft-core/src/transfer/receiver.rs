@@ -822,7 +822,10 @@ where
         };
         match t {
             T_SINGLE_FILE => {
-                confirm_once(peer, opts, &mut confirmed).await?;
+                if let Err(e) = confirm_once(peer, opts, &mut confirmed).await {
+                    write_u8(&mut s, STATUS_REJECT).await?;
+                    return Err(e);
+                }
                 if let Err(e) = recv_single(&mut s, peer, opts).await {
                     write_u8(&mut s, STATUS_REJECT).await?;
                     return Err(e);
@@ -831,7 +834,10 @@ where
                 *handled += 1;
             }
             T_FOLDER => {
-                confirm_once(peer, opts, &mut confirmed).await?;
+                if let Err(e) = confirm_once(peer, opts, &mut confirmed).await {
+                    write_u8(&mut s, STATUS_REJECT).await?;
+                    return Err(e);
+                }
                 if let Err(e) = recv_folder_over(&mut s, peer, opts).await {
                     write_u8(&mut s, STATUS_REJECT).await?;
                     return Err(e);
@@ -841,7 +847,15 @@ where
             }
             T_TEXT => {
                 let t0 = Instant::now();
-                let text = recv_text(&mut s).await?;
+                // 载荷非法（>1MB/非 UTF-8）也必须回拒绝字节——「处理后必回」
+                // （WIRE-PROTOCOL §3；轮 1 F5：直接断连令客户端只见 EOF）。
+                let text = match recv_text(&mut s).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        write_u8(&mut s, STATUS_REJECT).await?;
+                        return Err(e);
+                    }
+                };
                 if let Some(tx) = &opts.text_tx {
                     let _ = tx.send(text.clone());
                 }
@@ -851,12 +865,18 @@ where
                 *handled += 1;
             }
             T_CHUNKED if opts.enable_chunked => {
-                confirm_once(peer, opts, &mut confirmed).await?;
+                if let Err(e) = confirm_once(peer, opts, &mut confirmed).await {
+                    write_u8(&mut s, STATUS_REJECT).await?;
+                    return Err(e);
+                }
                 // 块帧无独立应答；覆盖达成即在 handler 内组装发布。
                 chunked::recv_chunk_frame(&mut s, peer, opts).await?;
             }
             T_CHUNK_END if opts.enable_chunked => {
-                confirm_once(peer, opts, &mut confirmed).await?;
+                if let Err(e) = confirm_once(peer, opts, &mut confirmed).await {
+                    write_u8(&mut s, STATUS_REJECT).await?;
+                    return Err(e);
+                }
                 // 收尾判决由 handler 直答（0x01/0x02），会话不存在回 0x00 + 连接失败。
                 chunked::recv_chunk_end(&mut s, opts).await?;
                 *handled += 1;
@@ -866,7 +886,10 @@ where
                 chunked::recv_coverage_query(&mut s, opts).await?;
             }
             T_RESUME_FILE if opts.enable_resume => {
-                confirm_once(peer, opts, &mut confirmed).await?;
+                if let Err(e) = confirm_once(peer, opts, &mut confirmed).await {
+                    write_u8(&mut s, STATUS_REJECT).await?;
+                    return Err(e);
+                }
                 if let Err(e) = resume::recv_resume_file(&mut s, peer, opts).await {
                     write_u8(&mut s, STATUS_REJECT).await?;
                     return Err(e);
@@ -875,7 +898,10 @@ where
                 *handled += 1;
             }
             T_RESUME_FOLDER if opts.enable_resume => {
-                confirm_once(peer, opts, &mut confirmed).await?;
+                if let Err(e) = confirm_once(peer, opts, &mut confirmed).await {
+                    write_u8(&mut s, STATUS_REJECT).await?;
+                    return Err(e);
+                }
                 if let Err(e) = resume::recv_resume_folder(&mut s, peer, opts).await {
                     write_u8(&mut s, STATUS_REJECT).await?;
                     return Err(e);
