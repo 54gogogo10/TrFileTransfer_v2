@@ -51,7 +51,7 @@ const L10N = {
     saved: "设置已保存", save_fail: "保存失败", copied: "已复制", copy_fail: "复制失败",
     started: "已启动", stopped: "已停止", http_on: "共享已开启", http_off: "共享未运行",
     verify_done: "校验完成", send_fail: "发送失败", lang_locked: "传输进行中，语言切换已锁定",
-    queue_sent: "队列已全部执行",
+    queue_sent: "队列已全部执行", queue_full: "队列已达 500 项上限",
     tab_stats: "历史",
     stats_summary: "统计概览", refresh: "刷新", export_csv: "导出 CSV", stats_clear: "全部清除",
     st_today: "今日次数", st_today_bytes: "今日流量", st_week_bytes: "7 天流量", st_total: "累计次数", st_total_bytes: "累计流量",
@@ -113,7 +113,7 @@ const L10N = {
     saved: "Settings saved", save_fail: "Save failed", copied: "Copied", copy_fail: "Copy failed",
     started: "started", stopped: "stopped", http_on: "Sharing started", http_off: "Sharing not running",
     verify_done: "Verify finished", send_fail: "Send failed", lang_locked: "Language locked during transfers",
-    queue_sent: "Queue finished",
+    queue_sent: "Queue finished", queue_full: "Queue reached the 500-item limit",
     tab_stats: "History",
     stats_summary: "Overview", refresh: "Refresh", export_csv: "Export CSV", stats_clear: "Clear all",
     st_today: "Today", st_today_bytes: "Today bytes", st_week_bytes: "7-day bytes", st_total: "Total count", st_total_bytes: "Total bytes",
@@ -382,6 +382,7 @@ function persistQueue() {
 $("#btn-queue-add").addEventListener("click", () => {
   const p = $("#send-path").value.trim();
   if (!p) return;
+  if (queueItems.length >= 500) { toast(t("queue_full"), "err"); return; }
   queueItems.push({ kind: sendKind, path: p });
   renderQueue();
   persistQueue();
@@ -1093,7 +1094,10 @@ function setupDragDrop() {
           updateKindRows();
         }
       } else if (paths.length > 1) {
-        paths.forEach((f) => queueItems.push({ kind: "file", path: f }));
+        for (const f of paths) {
+          if (queueItems.length >= 500) { toast(t("queue_full"), "err"); break; }
+          queueItems.push({ kind: "file", path: f });
+        }
         renderQueue();
       }
     }
@@ -1101,6 +1105,11 @@ function setupDragDrop() {
 }
 
 /* ============ 传输统计与历史（规格 §3.3，M5'） ============ */
+let refreshStatsTimer = null;
+function scheduleStatsRefresh() {
+  if (refreshStatsTimer) return;
+  refreshStatsTimer = setTimeout(() => { refreshStatsTimer = null; refreshStats(); }, 1000);
+}
 async function refreshStats() {
   try {
     const s = await invoke("stats_summary");
@@ -1284,7 +1293,8 @@ async function wireEvents() {
       log("err", "#" + p.id + " " + t("send_fail") + ": " + (p.error || ""));
       toast(t("send_fail") + ": " + p.error, "err");
     }
-    refreshStats();
+    for (const [k, v] of taskByProgress) { if (v === p.id) taskByProgress.delete(k); }
+    scheduleStatsRefresh();
   });
   await listen("trft://text", (ev) => {
     const text = ev.payload;

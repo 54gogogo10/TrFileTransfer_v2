@@ -46,6 +46,8 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.expect("端口绑定失败");
     let auth_note = if args.code.is_some() { "鉴权=配对码" } else { "无鉴权（仅建议回环）" };
     eprintln!("Web 共享[{auth_note}]: http://{addr}/ → {}", args.dir.display());
+    // 上传半成品孤儿清扫（轮 5 P2-2：Drop 守卫不覆盖进程被杀，7 天口径与 core 一致）。
+    trft_server::cleanup_upload_orphans(&args.dir);
     // 头读超时 15s（规格 §6.1；轮 2 P1——slowloris 不得占满并发闸）。
     trft_server::serve_with_header_timeout(listener, app)
         .await

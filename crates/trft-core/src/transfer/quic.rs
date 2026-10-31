@@ -202,6 +202,8 @@ pub async fn serve_quic_on(endpoint: quinn::Endpoint, cert_fp: [u8; 32], opts: R
                     while set.join_next().await.is_some() {}
                     return Err(proto("QUIC endpoint 已关闭"));
                 };
+                // 收割已完成任务（轮 5：完成条目驻留 ~190B/连接，随 accept 周期回收）。
+                while set.try_join_next().is_some() {}
                 let o = opts.clone();
                 let c = served.clone();
                 set.spawn(async move {

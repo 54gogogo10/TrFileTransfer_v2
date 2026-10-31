@@ -952,6 +952,43 @@ fn url_escape(s: &str) -> String {
 
 // ============ 连接级 serve（规格 §6.1 头读超时 15s，轮 2 P1） ============
 
+/// Web 上传半成品（`.up*.part`）孤儿清扫（轮 5 P2-2）：Drop 守卫只覆盖
+/// handler 正常返回/panic/cancel；进程被强杀/崩溃时守卫不执行——TCP/UDP/
+/// 续传半成品均有 7 天孤儿清扫兜底（「与进程被杀同口径」），Web 上传半成品
+/// 此前不在任何清扫器覆盖内，落在用户共享目录永久残留。启动时按 7 天清扫
+///（与 core `cleanup_part_orphans` 同口径；深度封顶防符号链接环）。
+pub fn cleanup_upload_orphans(dir: &std::path::Path) {
+    fn walk(dir: &std::path::Path, depth: u32) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let now = std::time::SystemTime::now();
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1);
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            // 上传半成品形态："{stem}.up{8 位 hex}{ext}.part"。
+            if !(name.contains(".up") && name.ends_with(".part")) {
+                continue;
+            }
+            if let Ok(md) = e.metadata() {
+                if md
+                    .modified()
+                    .map(|t| now.duration_since(t).map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600)).unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+    walk(dir, 0);
+}
+
 /// axum::serve 的替代：手动 serve 每条连接并设置 hyper `header_read_timeout`——
 /// 慢速只发半个请求头的连接 15 秒后被掐断，32 个并发闸不再能被永久占满。
 /// main 与 GUI 共享同一入口（行为一致）。

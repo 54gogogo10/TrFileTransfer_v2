@@ -1056,6 +1056,9 @@ pub async fn http_start(
         _ => cfg.save_dir_tcp.clone(),
     };
     let _ = std::fs::create_dir_all(&dir);
+    // 上传半成品孤儿清扫（轮 5 P2-2：Drop 守卫不覆盖进程被杀——7 天口径与
+    // core 半成品清扫一致，`http_start` 是共享目录的天然启动钩子）。
+    trft_server::cleanup_upload_orphans(&dir);
     // `?t=` 令牌派生密钥（轮 6 P2-4）：每安装随机 32B，持久化 config——
     // 泄漏只作废令牌（换密钥），不回传低熵配对码。守卫不跨 await。
     let secret = {
@@ -1688,6 +1691,9 @@ fn text_history_path() -> PathBuf {
 }
 
 /// 追加一条（时间戳	文本）；超过 200 条重写保留末 200。
+/// 单条截断至 2KB（轮 5 P2-3）：协议允许 1MB 文本——不截断时稳态历史可达
+/// ~200MB，且每条触发全量重读+重写（磁盘写放大 200:1、async worker 阻塞）；
+/// 前端展示只取 120 字符，2KB 足够。
 pub fn text_history_append(text: &str) {
     let path = text_history_path();
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
@@ -1698,6 +1704,12 @@ pub fn text_history_append(text: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let one_line = text.replace('\n', " ").replace('\r', " ");
+    let one_line = if one_line.chars().count() > 2048 {
+        let cut: String = one_line.chars().take(2048).collect();
+        format!("{cut}…")
+    } else {
+        one_line
+    };
     lines.push(format!("{stamp}	{one_line}"));
     let keep: Vec<String> = if lines.len() > 200 { lines[lines.len() - 200..].to_vec() } else { lines };
     let mut out = String::new();

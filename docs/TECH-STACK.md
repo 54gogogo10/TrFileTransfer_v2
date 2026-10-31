@@ -144,6 +144,13 @@
    - **更新器 chunked 块长行 8KB 上限**（恶意更新源无 CRLF 流不再无界缓冲）；**0x0B 应答读 60s 总预算**（恶意服务端逐字段拖延不再把单任务拖至数天）；**UDP MSGSIZE 跨平台错误码**（此前仅 Windows 10040，Linux/macOS/BSD 的 EMSGSIZE 仍会杀死接收器）；
    - **Web 后缀 Range `bytes=-N` 且 N≥size 回 200 全量**（RFC 9110 §14.1.2；此前误 416）；**更新 URL 裸 IPv6 字面量**（`https://[::1]/m`）可解析（默认端口）；
    - **登记接受（不修）**：GUI invoke 信任边界（`http_start(dir)`/`stats_export_csv(path)`/`monitor_start(watch_dir)` 接受前端任意路径、`devices_record` 可标 User 来源）——前端为本产品自带代码（无注入链，渲染均 textContent），本地攻击者模型出界；后续若开放第三方前端再收紧。
+15. **第二轮全量审查·轮 5（资源泄漏/性能）新增口径**（2026-11-01）：
+   - **摘要缓存 degraded 模式条目数硬封顶**（`DEGRADED_MAP_CAP` = 200,000，满则清空重建，摊还 O(1)）——轮 5 PoC 实证：degraded（目录不可写→纯内存）下唯一收敛路径（8MB 日志重写触发的两代淘汰）不可达且 `degraded` 永不恢复，200 万条 +260MB 零收敛；判别测试 `degraded_mode_map_is_bounded`（去 clear 必红）。注：分代淘汰在 degraded 下不可用（gen 恒不前进），故取计数封顶而非代数淘汰；
+   - **Web 上传半成品 `.up*.part` 并入孤儿清扫**（`cleanup_upload_orphans`，7 天口径与 core 一致；server main 与 GUI `http_start` 启动时执行——Drop 守卫不覆盖进程被杀，此前不在任何清扫器覆盖内、落在用户共享目录永久残留）；
+   - **文本历史单条截断 2KB**（协议允许 1MB 文本——不截断时稳态历史 ~200MB 且每条全量重写，写放大 200:1；前端展示只取 120 字符）；
+   - **常驻接收器 JoinSet 随 accept 收割**（`try_join_next` 排空——完成条目驻留 ~190B/连接，此前仅 accept 出错分支 join）；
+   - **前端**：`taskByProgress` 终态摘除（只增不减 ~100B/任务）、`refreshStats` 终态 1s 防抖（群发/队列 500 项完成风暴下每任务两次全量读盘 → 合并一次）、队列 push 钳 500（与后端 `queue_save` 上限对齐，超限此前静默丢持久化）；
+   - **登记接受（不修）**：UDP `events` 通道逐包直发无节流——生产两调用点（CLI/GUI）均传 `None`，节流真身在 `opts.progress` Reporter 侧；公开 API 的可达性地雷，后续接线者须自行节流（udp.rs 注释已有自警）。§6.2 各内存封顶设计点复核结论：UDP 位集/FEC 超块/进度节流/容量防线全部成立，摘要缓存 degraded 路径已补（本条第 1 项）。
 
 ## 8. 记录在案的否决项
 

@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const DEFAULT_TTL_DAYS: u32 = 7;
 /// 日志重写阈值（规格 §3.1/§6.1：8MB）。
 pub const REWRITE_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// degraded（不可写→纯内存）模式的条目数防线（轮 5 P2-1）：可写路径经
+/// 8MB 重写 + 两代淘汰收敛；degraded 下无日志可触发收敛，按条目数封顶
+/// （≈ 可写路径两代窗口的量级，130B/条 → 上限 ≈ 26MB 内存）。
+pub const DEGRADED_MAP_CAP: usize = 200_000;
 
 /// FNV-1a 64 位行校验。
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -104,11 +108,18 @@ impl HashCache {
 
     /// 插入：内存立即生效；持久化走追加日志（FNV 行校验），写失败静默退化为内存缓存。
     /// 超过重写阈值（默认 8MB）时先收敛再追加；代数盖章在收敛之后（本条属于新一代）。
+    /// degraded（不可写）模式下无日志可触发分代收敛（gen 恒不前进，两代淘汰
+    /// 不可用）——按**条目数硬封顶**，满则整体清空重建（轮 5 P2-1：此前
+    /// degraded 下 map 无界增长，PoC 实证 200 万条 +260MB 零收敛；判错方向 =
+    /// 清空后多算一次哈希，与既有语义一致；清空每 CAP 次插入一次，摊还 O(1)）。
     pub fn insert(&mut self, path: &str, size: u64, mtime: u64, hash: [u8; 32]) {
         if path.contains('|') {
             return; // 格式冲突，放弃缓存该条目（判错方向：多算一次）
         }
         self.append_line(path, size, mtime, hash); // 可能触发重写（gen+1）
+        if self.degraded && self.map.len() >= DEGRADED_MAP_CAP {
+            self.map.clear();
+        }
         self.map.insert((fnv1a(path.as_bytes()), size, mtime), (hash, self.gen));
     }
 
@@ -320,5 +331,26 @@ mod tests {
         c.insert("k", 1, 1, h);
         assert!(c.degraded(), "不可写必须标记退化");
         assert_eq!(c.get("k", 1, 1), Some(h), "内存缓存必须继续工作");
+    }
+
+    /// 轮 5 P2-1 判别：degraded（纯内存）模式下 map 必须**有界**——
+    /// 修复前唯一收敛路径（8MB 日志重写）不可达，200 万条 PoC 实证 +260MB
+    /// 零收敛；修复后条目数硬封顶（满则清空重建）。
+    #[test]
+    fn degraded_mode_map_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("no-such-subdir").join("cache.txt");
+        let mut c = HashCache::load(&p, 0);
+        c.insert("probe", 0, 0, [0u8; 32]);
+        assert!(c.degraded(), "前提自检：该路径必须处于 degraded");
+        // 灌 2× 上限条目——最早条目必须已被清空（修复前全部驻留，首条可查）。
+        let cap = DEGRADED_MAP_CAP as u64;
+        for i in 0..(cap * 2) {
+            c.insert(&format!("f{i}"), i, i, [1u8; 32]);
+        }
+        assert_eq!(c.get("f0", 0, 0), None, "degraded 下达上限后最早的条目必须被清出（否则 map 无界）");
+        // 最后一次清空发生在临近末尾——最末条目必然在表内。
+        let last = cap * 2 - 1;
+        assert!(c.get(&format!("f{last}"), last, last).is_some(), "最近的条目应可用");
     }
 }

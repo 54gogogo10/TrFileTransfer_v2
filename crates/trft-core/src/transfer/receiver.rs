@@ -492,6 +492,9 @@ pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        // 收割已完成任务（轮 5 P2-3 组：JoinSet 完成条目驻留
+                        // ~190B/连接——仅 accept 出错分支 join 的话万级连接 ≈ 2MB）。
+                        while set.try_join_next().is_some() {}
                         let o = opts.clone();
                         let counter = served.clone();
                         set.spawn(async move {
