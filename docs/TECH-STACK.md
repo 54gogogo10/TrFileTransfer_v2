@@ -171,6 +171,19 @@
    - 收尾修复：测试面 2 条编译警告（r6 引入，全 workspace 唯二告警破口）；`is_upload_part_name` 收紧为自产名严格同形（`.up`+8hex+单段 ext+`.part`，附判别单测——宽松 contains(".up") 理论误伤用户文件）；EMSGSIZE 注释平台值更正（FreeBSD/Solaris）；
    - 轮 1/轮 3 的完整发现清单与判别记录补入 REVIEW-LOG（此前仅在 commit message，文档欠账）；
    - **队列重试不区分错误类**（AuthRejected 等不可重试错误也重试至 QueueRetries 次——规格未限定错误类，仅浪费尝试，登记接受）。
+19. **GUI 对齐批**（2026-11-01，第四轮对齐需求；规格缺口补齐 + 在案打磨项闭环 + 视觉精致化）：
+   - **已对齐规格**：GUI 日志上限 200→500（§3.7）；**发送面板 SrcPort 输入**（§3.1/§12.1，CLI `--srcport` 同源；UDP 隐藏；`SendRequest.srcPort` + `sync_start` 接线 + 队列快照第 13 字段跨重启持久化，旧行兼容回读）；**输入校验全面化**（§3.7：表驱动 `FIELD_CHECKS` 覆盖端口/分块 1-8/轮数 1-5/校验片 1-8/限速/缓存天数/配对码 4-12 位数字/IP/群发目标逐行/路径非法字符 `< > : " | ? *`（剥盘符）/更新 URL http(s)——非法红框 + 淡红底 + `title` ToolTip，空值中性，语言切换后 ToolTip 随刷）；**EN 模式中文残留清理**（§3.7 双语纪律：`send_cancel` 终态事件补机器字段 `reason`，前端由比较 `"已取消"` 字符串改判 `reason==="cancelled"`；按设备明细 `" 文件"` 后缀改 L10N）；
+   - **QueueItem camelCase 缺失修复**（本轮顺带发现）：`queue_save` 的 `Vec<QueueItem>` 无 `#[serde(rename_all="camelCase")]`——前端持久化发 `fecParity` 键、结构体期望 `fec_parity`，serde 对缺失 Option 静默给 None，**队列 UDP 三参数（passes/fecParity/nofec）跨重启持久化实际在丢**（轮 7 F2 只修了执行路径 `SendRequest`，持久化路径漏网）；补改名对齐，附队列快照 srcPort 同口径；
+   - **在案打磨项闭环**：统一确认模态 `confirmDialog`（Promise，danger 变体）替换 `window.confirm` ×2（队列完成后动作 §3.2 / 统计全部清除）；接收确认弹窗排队（`confirmQueue` 依次呈现 + 标题徽标 (i/N)——并发确认不再后到覆盖先到，fail-closed 时限仍由后端 31s 看门狗兜底）；更新提示单 toast 双动作（安装+跳过合并）；
+   - **视觉精致化**（token 体系不动、布局不变）：交互过渡 120ms（btn/seg/tab/输入框）、token 化细滚动条、`:focus-visible` 焦点环、`.btn.danger` 危险操作警示色、进度卡状态色条（running/done/failed 左缘）、invalid 淡红底、toast/modal 进场动画、`prefers-reduced-motion` 全量守卫；`data-i18n-ph` 占位符双语支持；
+   - **文字截断/遮挡专项排查**（对齐批收尾）：① SrcPort 占位文案在 w80 输入框内截断（zh「源端口（可选）」/en「Source port (optional)」）——缩短为「源端口」/「Src port」；② **动态空状态 L10N 残留**（预存在）：5 处 JS 动态创建的空状态 li（队列/设备/文本历史/按设备明细/传输历史）未挂 `data-i18n`，语言切换后 applyLang 刷不到（实测英文界面残留中文「暂无记录」）——统一挂 `li.dataset.i18n` 随 applyLang 刷新；其余 6 页签 × 中英 × 1080/880 宽、长文件名进度卡（含按钮组）、长防火墙 toast、绑定地址下拉浮层逐项目检无截断/遮挡；
+   - **「生成配对码」移正**（用户反馈轮）：此前生成勾选误置于**发送面板**——发送侧应填对端配对码，随机生成填入必然认证失败（对端未配对时亦无意义）；移至**设置页配对码旁**（本机接收侧，规格 §3.3 口径）并补齐 `PairingLength` 位数输入（config 键此前有键无 UI，4–12 红框校验 + 保存接线 + 无效回落默认生成）；生成源 `Math.random()` → **CSPRNG**（`crypto.getRandomValues` + 拒绝采样消模偏差）——配对码是认证凭据，可预测随机属弱点；发送/监控面板配对码占位改「对端配对码」/"Receiver's code" 明示方向；
+20. **离线便携版**（2026-11-01，GUI 对齐批延伸）：
+   - **机制**：GUI exe 旁存在 `WebView2Runtime\`（含 `msedgewebview2.exe` 判别标记）即视为微软 Fixed Version 固定版运行时——`main()` 最前 `use_portable_webview2()` 设 `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`（外部已显式指定时不覆盖）并**跳过 Evergreen 检测**（离线机器无 Evergreen，不得引导下载）；主版本单 exe 不变（Evergreen 自动跟进微软安全补丁），便携版不自动更新——安全更新代价由离线场景补偿；
+   - **构建**：`build.bat`（CRLF+GBK——cmd 三坑：LF 破坏括号块解析、UTF-8 中文乱码、括号块内 echo 的 `)` 提前闭块）产出三件套 + `.sha256` 边车 + `TrFileTransfer-GUI-<版>-portable.zip`（`build\WebView2FixedRuntime\` 就绪才打包，否则跳过并提示）；`build\fetch-webview2-fixed.ps1` 获取运行时：`-CabPath` 官方固定版 cab（许可最干净，第三方再分发走此路）或无参快照本机 Evergreen（布局同构，自用/内网足够）——edgeupdates API 已不再提供 WebView2 Fixed Version 条目；
+   - **判别验证的坑（登记）**：WebView2 **进程池复用**——同 user-data-dir + 同版本时新建 WebView 直连已有浏览器池，executable folder 不参与 →「启动后看 msedgewebview2.exe 子进程路径」的判别测试必须**先杀净进程池冷启动**，否则假阴性（实测两次误报「便携未生效」均为此因）；冷启动判别通过（子进程路径落在便携目录）。
+   - **验证**：181 项测试全绿（0 告警）；实机启动 + mock `__TAURI__` 浏览器测试床交互冒烟（红框/ToolTip/双语/双主题/确认模态/排队徽标/进度卡三态/语言锁全部过）；
+   - **登记接受（不修）**：同步会话对话框维持登记不做（磁盘即状态模型下语义弱化，用户拍板）；core 错误串中文 Display 在 EN 模式直接展示（文案集中 L10N 纪律仅约束前端，core 错误国际化属独立批次）。
 
 ## 8. 记录在案的否决项
 

@@ -1,3 +1,7 @@
 /target
 *.trft-part
 release
+
+# WebView2 fixed-version runtime snapshot (portable build source, ~900MB)
+/build/WebView2FixedRuntime/
+/.zcode/

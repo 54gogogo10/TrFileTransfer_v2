@@ -23,7 +23,8 @@ const L10N = {
     discovering: "发现中…", online: "在线", known: "已知",
     group_targets: "群发目标（每行 ip:port）", group_send: "并行群发", group_summary: "群发完成",
     group_bad_target: "非法目标（跳过）", paused: "已暂停", resume: "继续", cancel_task: "取消",
-    text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码",
+    text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
+    code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
     kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本",
     path: "路径", text: "文本", browse: "浏览…", target: "目标", pairing: "配对码",
@@ -36,11 +37,11 @@ const L10N = {
     recent: "最近接收", none: "暂无记录",
     share_start: "开启共享", share_stop: "停止共享", address: "网卡地址", share_url: "链接", copy: "复制",
     qr_hint: "手机浏览器扫码即可浏览 / 上传 / 下载共享目录。",
-    verify_desc: "聚合扫描全部已配置保存目录，重算 SHA-256 与摘要缓存比对（规格 §3.5）。",
+    verify_desc: "聚合扫描全部已配置保存目录，重算 SHA-256 与摘要缓存比对。",
     verify_start: "开始校验", verify_stop: "停止",
     v_scanned: "已扫描", v_hit: "一致", v_fresh: "无记录", v_bad: "不一致", v_unread: "无法读取",
     settings_general: "通用", notify: "完成通知", autostart: "开机自启",
-    folder_mode: "发送方式", mode_sync: "差量同步 0x04（二次只传差异）", mode_plain: "整夹发送 0x01（全量）",
+    folder_mode: "发送方式", mode_sync: "差量同步（二次只传差异）", mode_plain: "整夹发送（全量）",
     sync_hint: "按 (源路径, 目标地址) 派生稳定会话 ID，与 CLI sync 互相接力",
     settings_limits: "限速与 UDP", send_limit_lbl: "发送限速 KB/s", recv_limit_lbl: "接收限速 KB/s",
     udp_passes_lbl: "UDP 重发轮数", fec: "FEC 前向纠错", udp_parity_lbl: "校验片",
@@ -69,6 +70,19 @@ const L10N = {
     install_now: "立即安装", installing: "安装中…", install_done: "已安装，即将重启", install_fail: "安装失败",
     confirm_msg: "设备 {d}（{p}）请求向本机发送文件。是否允许？",
     confirm_expired: "确认已过期",
+    srcport_ph: "源端口",
+    chunks_lbl: "分块数", chunks_ph: "4",
+    files_unit: "文件",
+    cancelled: "已取消",
+    confirm_yn: "请确认", confirm_ok: "确认", confirm_cancel: "取消",
+    invalid_ip: "IP 格式不正确",
+    invalid_port: "端口须为 1-65535 的整数",
+    invalid_num: "须为非负整数",
+    invalid_range: "须为 {min}-{max} 的整数",
+    invalid_path: "路径含非法字符 < > : \" | ? *",
+    invalid_url: "URL 须以 http:// 或 https:// 开头",
+    invalid_code: "配对码须为 4-12 位数字",
+    invalid_group: "存在非法目标行（应为 ip:port）",
   },
   en: {
     tab_send: "Send", tab_recv: "Receive", tab_share: "Share", tab_verify: "Verify", tab_settings: "Settings",
@@ -86,7 +100,8 @@ const L10N = {
     discovering: "Discovering…", online: "online", known: "known",
     group_targets: "Group targets (ip:port per line)", group_send: "Send to all", group_summary: "Group send finished",
     group_bad_target: "Invalid target (skipped)", paused: "Paused", resume: "Resume", cancel_task: "Cancel",
-    text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code",
+    text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
+    code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
     kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text",
     path: "Path", text: "Text", browse: "Browse…", target: "Target", pairing: "Pairing",
@@ -99,11 +114,11 @@ const L10N = {
     recent: "Recent received", none: "No records",
     share_start: "Start sharing", share_stop: "Stop sharing", address: "NIC address", share_url: "URL", copy: "Copy",
     qr_hint: "Scan with a mobile browser to browse / upload / download the shared folder.",
-    verify_desc: "Scan all configured save dirs, re-hash SHA-256 and compare with the digest cache (spec §3.5).",
+    verify_desc: "Scan all configured save dirs, re-hash SHA-256 and compare with the digest cache.",
     verify_start: "Start verify", verify_stop: "Stop",
     v_scanned: "Scanned", v_hit: "Matched", v_fresh: "No record", v_bad: "Mismatch", v_unread: "Unreadable",
     settings_general: "General", notify: "Notifications", autostart: "Launch on startup",
-    folder_mode: "Send mode", mode_sync: "Delta sync 0x04 (changes only)", mode_plain: "Full folder 0x01",
+    folder_mode: "Send mode", mode_sync: "Delta sync (changes only)", mode_plain: "Full folder send",
     sync_hint: "Stable session ID from (source path, target) — interoperates with CLI sync",
     settings_limits: "Limits & UDP", send_limit_lbl: "Send limit KB/s", recv_limit_lbl: "Recv limit KB/s",
     udp_passes_lbl: "UDP passes", fec: "FEC", udp_parity_lbl: "Parity",
@@ -132,6 +147,19 @@ const L10N = {
     install_now: "Install now", installing: "Installing…", install_done: "Installed, restarting", install_fail: "Install failed",
     confirm_msg: "Device {d} ({p}) wants to send files to this machine. Allow?",
     confirm_expired: "Confirmation expired",
+    srcport_ph: "Src port",
+    chunks_lbl: "Chunks", chunks_ph: "4",
+    files_unit: "files",
+    cancelled: "Cancelled",
+    confirm_yn: "Please confirm", confirm_ok: "Confirm", confirm_cancel: "Cancel",
+    invalid_ip: "Invalid IP address",
+    invalid_port: "Port must be an integer 1-65535",
+    invalid_num: "Must be a non-negative integer",
+    invalid_range: "Must be an integer {min}-{max}",
+    invalid_path: "Path contains illegal characters < > : \" | ? *",
+    invalid_url: "URL must start with http:// or https://",
+    invalid_code: "Pairing code must be 4-12 digits",
+    invalid_group: "Invalid target line (expected ip:port)",
   },
 };
 
@@ -169,6 +197,8 @@ function fmtBytes(n) {
 function applyLang() {
   document.documentElement.lang = lang === "zh" ? "zh-CN" : "en-US";
   $$("[data-i18n]").forEach((el) => { el.textContent = t(el.dataset.i18n); });
+  // 占位符同走 L10N（data-i18n-ph）——与文案纪律一致。
+  $$("[data-i18n-ph]").forEach((el) => { el.placeholder = t(el.dataset.i18nPh); });
   $("#lang-zh").classList.toggle("active", lang === "zh");
   $("#lang-en").classList.toggle("active", lang === "en");
   localStorage.setItem("trft-lang", lang);
@@ -186,7 +216,8 @@ function applyTheme() {
 media.addEventListener("change", () => applyTheme());
 
 /* ============ Toast / 日志 ============ */
-function toast(msg, cls, actionText, onAction) {
+// actions: [{ text, fn }]（兼容旧签名 toast(msg, cls, actionText, onAction)——B3：一个 toast 可挂多个动作）。
+function toast(msg, cls, actionText, onAction, extraActions) {
   const layer = $("#toast-layer");
   const el = document.createElement("div");
   el.className = "toast " + (cls || "");
@@ -194,12 +225,20 @@ function toast(msg, cls, actionText, onAction) {
   span.className = "tmsg";
   span.textContent = msg;
   el.appendChild(span);
-  if (actionText) {
-    const btn = document.createElement("button");
-    btn.className = "tbtn";
-    btn.textContent = actionText;
-    btn.addEventListener("click", () => { onAction(); el.remove(); });
-    el.appendChild(btn);
+  const actions = [];
+  if (actionText) actions.push({ text: actionText, fn: onAction });
+  if (extraActions) actions.push(...extraActions);
+  if (actions.length) {
+    const wrap = document.createElement("span");
+    wrap.className = "tbtns";
+    for (const a of actions) {
+      const btn = document.createElement("button");
+      btn.className = "tbtn";
+      btn.textContent = a.text;
+      btn.addEventListener("click", () => { a.fn(); el.remove(); });
+      wrap.appendChild(btn);
+    }
+    el.appendChild(wrap);
   }
   layer.appendChild(el);
   setTimeout(() => el.remove(), 8000);
@@ -229,7 +268,7 @@ function log(level, msg) {
   li.className = level || "";
   li.textContent = new Date().toLocaleTimeString() + "  " + msg;
   list.prepend(li);
-  while (list.children.length > 200) list.lastChild.remove();
+  while (list.children.length > 500) list.lastChild.remove(); // 规格 §3.7：UI 日志上限 500 条
 }
 
 /* ============ 页签 ============ */
@@ -255,6 +294,8 @@ function updateKindRows() {
   // 0x02 并行分块与 UDP 单发都只对单文件有意义（规格 §3.6）。
   $("#btn-send-chunked").classList.toggle("hidden", !(isFile && !isUdp));
   $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp));
+  // 源端口仅连接型协议可绑定（§3.1；UDP 无连接语义，与 CLI --srcport 约束同口径）。
+  $("#send-srcport").classList.toggle("hidden", isUdp);
 }
 $$("#kind-seg .seg-btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -274,30 +315,89 @@ $("#btn-browse").addEventListener("click", async () => {
 const RE_V4 = /^\d{1,3}(\.\d{1,3}){3}$/;
 const RE_V6 = /^\[[0-9a-fA-F:]+\]$|^[0-9a-fA-F:]+$/;
 
-function validateField(el, ok) {
-  // 空值中性（规格 §3.7），非法红框。
-  el.classList.toggle("invalid", el.value.trim() !== "" && !ok);
+/* ============ 输入校验（规格 §3.7：端口 1-65535 仅数字、IP 字面量、配对码仅数字、
+   路径非法字符、更新 URL 须 http(s)——非法红框 + ToolTip，空值中性） ============ */
+// 数字仅接受纯数字（收紧 parseInt("80abc")===80 的旧口径）。
+const numOk = (min, max) => (v) => {
+  v = v.trim();
+  if (v === "") return true;
+  if (!/^\d+$/.test(v)) return false;
+  const n = parseInt(v, 10);
+  return n >= min && n <= max;
+};
+const ipOk = (v) => { v = v.trim(); return v === "" || RE_V4.test(v) || RE_V6.test(v); };
+const codeOk = (v) => { v = v.trim(); return v === "" || /^[0-9]{4,12}$/.test(v); };
+// Windows 非法字符集；剥离盘符前缀 `X:`（其中的冒号合法）。
+const pathOk = (v) => {
+  v = v.trim();
+  return v === "" || !/[<>:"|?*]/.test(v.replace(/^[a-zA-Z]:/, ""));
+};
+const urlOk = (v) => { v = v.trim(); return v === "" || /^https?:\/\//i.test(v); };
+// 群发目标：每行 ip:port（IPv6 方括号同 parseTarget 口径）；空框中性。
+const groupTargetsOk = (v) => {
+  const lines = v.split("\n").map((x) => x.trim()).filter(Boolean);
+  if (!lines.length) return true;
+  return lines.every((ln) => {
+    const m = parseTarget(ln);
+    return !!m && !!m.ip && m.port >= 1 && m.port <= 65535;
+  });
+};
+
+// 校验表：sel 可命中多个元素；args 供 {min}/{max} 占位文案。
+const FIELD_CHECKS = [
+  { sel: "#send-ip", ok: ipOk, tip: "invalid_ip" },
+  { sel: "#send-port", ok: numOk(1, 65535), tip: "invalid_port" },
+  { sel: "#send-srcport", ok: numOk(1, 65535), tip: "invalid_port" },
+  { sel: "#send-chunks", ok: numOk(1, 8), tip: "invalid_range", args: [1, 8] },
+  { sel: "#send-code", ok: codeOk, tip: "invalid_code" },
+  { sel: "#send-limit", ok: numOk(0, 10000000), tip: "invalid_num" },
+  { sel: "#send-passes", ok: numOk(1, 5), tip: "invalid_range", args: [1, 5] },
+  { sel: "#send-parity", ok: numOk(1, 8), tip: "invalid_range", args: [1, 8] },
+  { sel: "#send-path", ok: pathOk, tip: "invalid_path" },
+  { sel: "#group-targets", ok: groupTargetsOk, tip: "invalid_group" },
+  { sel: "#monitor-ip", ok: ipOk, tip: "invalid_ip" },
+  { sel: "#monitor-port", ok: numOk(1, 65535), tip: "invalid_port" },
+  { sel: "#monitor-code", ok: codeOk, tip: "invalid_code" },
+  { sel: "#monitor-dir", ok: pathOk, tip: "invalid_path" },
+  { sel: "#http-port", ok: numOk(1, 65535), tip: "invalid_port" },
+  { sel: "#cfg-code", ok: codeOk, tip: "invalid_code" },
+  { sel: "#cfg-pairing-len", ok: numOk(4, 12), tip: "invalid_range", args: [4, 12] },
+  { sel: "#cfg-cache-days", ok: numOk(0, 36500), tip: "invalid_num" },
+  { sel: "#cfg-limit", ok: numOk(0, 10000000), tip: "invalid_num" },
+  { sel: "#cfg-recv-limit", ok: numOk(0, 10000000), tip: "invalid_num" },
+  { sel: "#cfg-passes", ok: numOk(1, 5), tip: "invalid_range", args: [1, 5] },
+  { sel: "#cfg-parity", ok: numOk(1, 8), tip: "invalid_range", args: [1, 8] },
+  { sel: "#cfg-update-url", ok: urlOk, tip: "invalid_url" },
+  { sel: ".cfg-dir", ok: pathOk, tip: "invalid_path" },
+  { sel: ".recv-dir", ok: pathOk, tip: "invalid_path" },
+  { sel: ".recv-port", ok: numOk(1, 65535), tip: "invalid_port" },
+];
+
+function checkField(el, chk) {
+  const good = chk.ok(el.value);
+  el.classList.toggle("invalid", !good);
+  // ToolTip：非法时给出具体原因；合法/空清除。
+  el.title = good ? "" : t(chk.tip).replace("{min}", chk.args ? chk.args[0] : "").replace("{max}", chk.args ? chk.args[1] : "");
 }
 
+let revalidateFields = null; // 语言切换后重跑（ToolTip 文案随语言刷新）
 function wireValidation() {
-  const ip = $("#send-ip");
-  const port = $("#send-port");
-  const code = $("#send-code");
-  const chk = () => {
-    const v = ip.value.trim();
-    validateField(ip, RE_V4.test(v) || RE_V6.test(v));
-    const p = parseInt(port.value, 10);
-    validateField(port, port.value.trim() === "" || (p >= 1 && p <= 65535));
-    const c = code.value.trim();
-    validateField(code, c === "" || /^[0-9]{4,12}$/.test(c));
-  };
-  [ip, port, code].forEach((el) => el.addEventListener("input", chk));
-  chk();
+  const runs = [];
+  for (const chk of FIELD_CHECKS) {
+    for (const el of $$(chk.sel)) {
+      const run = () => checkField(el, chk);
+      el.addEventListener("input", run);
+      runs.push(run);
+    }
+  }
+  revalidateFields = () => runs.forEach((run) => run());
+  revalidateFields();
 }
 
 function sendRequest(kindOverride) {
   const proto = $("#send-proto").value;
   const kind = kindOverride || sendKind;
+  const srcPort = parseInt($("#send-srcport").value, 10);
   const req = {
     kind: proto === "udp" ? "udpfile" : kind,
     path: $("#send-path").value.trim() || null,
@@ -308,6 +408,7 @@ function sendRequest(kindOverride) {
     code: $("#send-code").value.trim() || null,
     limit: parseInt($("#send-limit").value, 10) || null,
     chunks: null,
+    srcPort: $("#send-srcport").classList.contains("hidden") || !srcPort ? null : srcPort,
     nocompress: !$("#send-compress").checked,
     noencrypt: !$("#send-encrypt").checked,
     passes: parseInt($("#send-passes").value, 10) || null,
@@ -316,10 +417,16 @@ function sendRequest(kindOverride) {
     pin: null,
   };
   const errs = [];
-  if (!/^\d{1,3}(\.\d{1,3}){3}$|^\[[0-9a-fA-F:]+\]$|^[0-9a-fA-F:]+$/.test(req.ip)) errs.push(t("target"));
-  if (!(req.port >= 1 && req.port <= 65535)) errs.push(t("port"));
+  // 提交门与红框同口径（仅数字）：红框标非法的字段不再被 parseInt 静默放行。
+  const raw = (sel) => $(sel).value.trim();
+  if (!ipOk(raw("#send-ip"))) errs.push(t("target"));
+  if (!numOk(1, 65535)(raw("#send-port"))) errs.push(t("port"));
+  if (raw("#send-srcport") !== "" && !numOk(1, 65535)(raw("#send-srcport"))) errs.push(t("port"));
   const code = req.code;
   if (code && !(/^[0-9]{4,12}$/.test(code))) errs.push(t("pairing"));
+  if (raw("#send-limit") !== "" && !numOk(0, 10000000)(raw("#send-limit"))) errs.push(t("limit"));
+  if (raw("#send-passes") !== "" && !numOk(1, 5)(raw("#send-passes"))) errs.push(t("passes"));
+  if (raw("#send-parity") !== "" && !numOk(1, 8)(raw("#send-parity"))) errs.push(t("fec_parity"));
   if (kind !== "text" && !req.path) errs.push(t("path"));
   if (kind === "text" && !req.text) errs.push(t("text"));
   // 轮 7 F8：GUI 补 CLI 同款 UDP 约束（此前给的是晦涩 IO 错误）。
@@ -332,7 +439,13 @@ async function doSend(chunked) {
   if (errs.length) { toast(errs.join(", "), "err"); return; }
   try {
     if (chunked) {
-      req.chunks = Math.min(8, Math.max(1, parseInt($("#send-chunks").value, 10) || 4));
+      // 提交门：红框已标非法时分块数不再 clamp 静默放行（红框与实际行为一致）。
+      const cv = $("#send-chunks").value.trim();
+      if (cv !== "" && !numOk(1, 8)(cv)) {
+        toast(t("invalid_range").replace("{min}", 1).replace("{max}", 8), "err");
+        return;
+      }
+      req.chunks = Math.min(8, Math.max(1, parseInt(cv, 10) || 4));
       await startTask({ kind: "chunked", req });
     } else if (sendKind === "folder" && $("#folder-mode").value === "sync" && req.proto !== "udp") {
       // 0x04 差量同步：稳定会话 ID，二次只传差异（规格 §3.1/§3.2）。
@@ -344,14 +457,6 @@ async function doSend(chunked) {
     toast(String(e), "err");
   }
 }
-$("#send-gen-code-on").addEventListener("click", () => {
-  if (!$("#send-gen-code-on").checked) return;
-  const len = Math.min(12, Math.max(4, appState.config.pairing_length || 6));
-  let code = "";
-  for (let i = 0; i < len; i += 1) code += Math.floor(Math.random() * 10);
-  $("#send-code").value = code;
-});
-
 $("#btn-send").addEventListener("click", () => doSend(false));
 $("#btn-send-chunked").addEventListener("click", () => doSend(true));
 
@@ -362,6 +467,7 @@ function renderQueue() {
   if (!queueItems.length) {
     const li = document.createElement("li");
     li.className = "empty";
+    li.dataset.i18n = "queue_empty"; // 挂 data-i18n：语言切换由 applyLang 统一刷新
     li.textContent = t("queue_empty");
     list.appendChild(li);
     return;
@@ -384,11 +490,13 @@ function persistQueue() {
   const items = queueItems.map((q) => q.snap
     ? { kind: q.kind, path: q.path, ip: q.snap.ip, port: q.snap.port, proto: q.snap.proto,
         code: q.snap.code, limit: q.snap.limit, nocompress: q.snap.nocompress, noencrypt: q.snap.noencrypt,
-        passes: q.snap.passes, fecParity: q.snap.fecParity, nofec: q.snap.nofec }
+        passes: q.snap.passes, fecParity: q.snap.fecParity, nofec: q.snap.nofec,
+        srcPort: q.snap.srcPort || null }
     : { kind: q.kind, path: q.path });
   invoke("queue_save", { items }).catch((e) => toast(t("send_fail") + ": " + e, "err"));
 }
 function queueSnapshot() {
+  const sp = parseInt($("#send-srcport").value, 10);
   return {
     ip: $("#send-ip").value.trim(),
     port: parseInt($("#send-port").value, 10),
@@ -400,6 +508,7 @@ function queueSnapshot() {
     passes: parseInt($("#send-passes").value, 10) || null,
     fecParity: parseInt($("#send-parity").value, 10) || null,
     nofec: $("#send-nofec").checked,
+    srcPort: sp >= 1 && sp <= 65535 ? sp : null,
   };
 }
 $("#btn-queue-add").addEventListener("click", () => {
@@ -442,16 +551,17 @@ $("#btn-queue-run").addEventListener("click", async () => {
       code: sp.code, limit: sp.limit,
       chunks: null, nocompress: sp.nocompress, noencrypt: sp.noencrypt,
       passes: sp.passes, fecParity: sp.fecParity, nofec: !!sp.nofec, pin: null,
+      srcPort: sp.srcPort || null,
     };
   });
-  // 完成后动作执行前确认（规格 §3.2：执行前弹确认）。
+  // 完成后动作执行前确认（规格 §3.2：执行前弹确认；关机/休眠按危险操作呈现）。
   const ad = $("#after-done").value;
   if (ad !== "none") {
     let msg;
     if (ad === "shutdown") msg = t("confirm_shutdown");
     else if (ad === "sleep") msg = t("confirm_sleep");
     else msg = t("confirm_command") + $("#after-command").value + t("confirm_tail");
-    if (!window.confirm(msg)) return;
+    if (!(await confirmDialog(msg, { danger: ad === "shutdown" || ad === "sleep" }))) return;
   }
   try {
     await invoke("send_queue", {
@@ -520,6 +630,7 @@ function renderDevices(devices) {
   if (!devices.length) {
     const li = document.createElement("li");
     li.className = "empty";
+    li.dataset.i18n = "none";
     li.textContent = t("none");
     list.appendChild(li);
     return;
@@ -715,6 +826,7 @@ async function startTask(entry) {
     id = await invoke("sync_start", {
       folder: req.path, ip: req.ip, port: req.port, proto: req.proto,
       code: req.code, limit: req.limit, nocompress: req.nocompress,
+      srcPort: req.srcPort || null,
     });
   } else if (kind === "chunked") {
     id = await invoke("send_chunked_start", { req });
@@ -757,6 +869,8 @@ function onProgress(ev) {
     }
     card.state.textContent = ev.state === "done" ? t("st_done") : t("st_failed");
     card.state.className = "pstate " + ev.state;
+    card.el.classList.toggle("done", ev.state === "done");
+    card.el.classList.toggle("failed", ev.state !== "done");
     if (ev.state === "done") beep();
     if (ev.kind === "recv" && ev.state === "done") addRecent(ev.name, ev.total);
     activeTransfers = Math.max(0, activeTransfers - 1);
@@ -892,6 +1006,7 @@ function renderTextHistory(items) {
   if (!items.length) {
     const li = document.createElement("li");
     li.className = "empty";
+    li.dataset.i18n = "th_empty";
     li.textContent = t("th_empty");
     list.appendChild(li);
     return;
@@ -1023,6 +1138,7 @@ function fillShareDirOptions() {
 function fillSettings() {
   const c = appState.config;
   $("#cfg-code").value = c.pairing_code || "";
+  $("#cfg-pairing-len").value = c.pairing_length || 6;
   $("#cfg-notify").checked = !!c.notify_enabled;
   $$(".cfg-dir").forEach((inp) => { inp.value = c[inp.dataset.key] || ""; });
   $("#cfg-sync-strict").checked = !!c.sync_verify_content;
@@ -1052,9 +1168,15 @@ function fillSettings() {
 }
 
 async function saveSettings() {
+  // 提交门：红框字段不再放行（与发送面板同口径）。
+  if ($("#cfg-pairing-len").classList.contains("invalid")) {
+    toast(t("invalid_range").replace("{min}", 4).replace("{max}", 12), "err");
+    return;
+  }
   const c = JSON.parse(JSON.stringify(appState.config));
   const code = $("#cfg-code").value.trim();
   c.pairing_code = code || null;
+  c.pairing_length = parseInt($("#cfg-pairing-len").value, 10) || 6;
   c.notify_enabled = $("#cfg-notify").checked;
   c.notify_sound = $("#cfg-notify-sound").checked;
   c.sync_verify_content = $("#cfg-sync-strict").checked;
@@ -1085,6 +1207,25 @@ async function saveSettings() {
   }
 }
 $("#btn-save-cfg").addEventListener("click", saveSettings);
+
+/* 生成配对码（设置页 = 本机接收侧，规格 §3.3 PairingLength 4-12）。
+   用户反馈轮移正：此前「生成」误置于发送面板——发送侧应填对端配对码，
+   随机生成填入必然认证失败。CSPRNG（crypto.getRandomValues + 拒绝采样消模偏差）
+   ——配对码是认证凭据，Math.random 可预测属弱点。 */
+$("#btn-gen-code").addEventListener("click", () => {
+  const lenRaw = $("#cfg-pairing-len").value.trim();
+  const parsed = parseInt(lenRaw, 10);
+  // 位数无效（空/越界红框）回落 config 默认——不得把空串写进配对码框。
+  const len = parsed >= 4 && parsed <= 12 ? parsed : (appState.config.pairing_length || 6);
+  const buf = new Uint8Array(1);
+  let code = "";
+  for (let i = 0; i < len; i += 1) {
+    let b = 250;
+    while (b >= 250) { crypto.getRandomValues(buf); b = buf[0]; } // 拒绝 250-255，0-9 均匀
+    code += b % 10;
+  }
+  $("#cfg-code").value = code;
+});
 
 $$(".cfg-dir-browse").forEach((btn) => {
   btn.addEventListener("click", async () => {
@@ -1169,6 +1310,7 @@ async function refreshStats() {
     if (!s.by_device || !s.by_device.length) {
       const li = document.createElement("li");
       li.className = "empty";
+      li.dataset.i18n = "none";
       li.textContent = t("none");
       dl.appendChild(li);
     } else {
@@ -1179,7 +1321,7 @@ async function refreshStats() {
         name.textContent = d.peer;
         const meta = document.createElement("span");
         meta.className = "pmeta";
-        meta.textContent = d.count + " ×  " + fmtBytes(d.bytes) + "  " + d.files + " 文件";
+        meta.textContent = d.count + " ×  " + fmtBytes(d.bytes) + "  " + d.files + " " + t("files_unit");
         li.appendChild(name);
         li.appendChild(meta);
         dl.appendChild(li);
@@ -1197,6 +1339,7 @@ async function refreshStatsRecords() {
     if (!rows.length) {
       const li = document.createElement("li");
       li.className = "empty";
+      li.dataset.i18n = "none";
       li.textContent = t("none");
       list.appendChild(li);
       return;
@@ -1218,7 +1361,7 @@ async function refreshStatsRecords() {
 $("#stats-direction").addEventListener("change", refreshStatsRecords);
 $("#btn-stats-refresh").addEventListener("click", refreshStats);
 $("#btn-stats-clear").addEventListener("click", async () => {
-  if (!window.confirm(t("stats_clear_confirm"))) return;
+  if (!(await confirmDialog(t("stats_clear_confirm"), { danger: true }))) return;
   try { await invoke("stats_clear"); await refreshStats(); } catch (e) { toast(String(e), "err"); }
 });
 $("#btn-stats-export").addEventListener("click", async () => {
@@ -1286,11 +1429,78 @@ $("#btn-monitor-stop").addEventListener("click", async () => {
   $("#btn-monitor-stop").disabled = true;
 });
 
-/* ============ 接收前确认弹窗（规格 §3.3：无应答 = 拒绝，fail-closed） ============ */
+/* ============ 通用确认模态（B1：替代 window.confirm——风格与接收确认弹窗统一） ============ */
+function confirmDialog(msg, opts) {
+  let ov = $("#yn-overlay");
+  if (!ov) {
+    ov = document.createElement("div");
+    ov.id = "yn-overlay";
+    ov.className = "hidden";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    const title = document.createElement("div");
+    title.className = "modal-title";
+    title.id = "yn-title";
+    const body = document.createElement("div");
+    body.className = "modal-msg";
+    body.id = "yn-msg";
+    const btns = document.createElement("div");
+    btns.className = "modal-btns";
+    const no = document.createElement("button");
+    no.className = "btn";
+    no.id = "btn-yn-cancel";
+    const yes = document.createElement("button");
+    yes.className = "btn primary";
+    yes.id = "btn-yn-ok";
+    btns.appendChild(no);
+    btns.appendChild(yes);
+    modal.appendChild(title);
+    modal.appendChild(body);
+    modal.appendChild(btns);
+    ov.appendChild(modal);
+    document.body.appendChild(ov);
+  }
+  $("#yn-title").textContent = (opts && opts.title) || t("confirm_yn");
+  $("#yn-msg").textContent = msg;
+  const yes = $("#btn-yn-ok");
+  const no = $("#btn-yn-cancel");
+  yes.textContent = t("confirm_ok");
+  yes.className = (opts && opts.danger) ? "btn danger" : "btn primary";
+  no.textContent = t("confirm_cancel");
+  ov.classList.remove("hidden");
+  return new Promise((resolve) => {
+    yes.onclick = () => { ov.classList.add("hidden"); resolve(true); };
+    no.onclick = () => { ov.classList.add("hidden"); resolve(false); };
+  });
+}
+
+/* ============ 接收前确认弹窗（规格 §3.3：无应答 = 拒绝，fail-closed） ============
+   B2：并发确认排队呈现——单 overlay 逐个展示（标题徽标 i/N），后到不再覆盖先到；
+   等待队列中的请求其 30s 时限由后端看门狗兜底（前端排队不延长 fail-closed 时限）。 */
 let confirmTimer = null;
+const confirmQueue = []; // { id, device, peer }
+let confirmShowing = null;
 function showConfirm(id, device, peer) {
+  confirmQueue.push({ id, device, peer });
+  if (confirmShowing) {
+    // 已有弹窗在展示：即时更新标题徽标提示积压（i/N）——
+    // pumpConfirm 对正展示中的弹窗不动作，徽标必须在这里刷新。
+    $("#confirm-title").textContent = t("confirm_title") + " (" + (confirmQueue.length + 1) + ")";
+    return;
+  }
+  pumpConfirm();
+}
+function pumpConfirm() {
+  if (confirmShowing || !confirmQueue.length) return;
+  confirmShowing = confirmQueue.shift();
+  const { id, device, peer } = confirmShowing;
   const ov = $("#confirm-overlay");
   $("#confirm-msg").textContent = t("confirm_msg").replace("{d}", device).replace("{p}", peer);
+  // 排队徽标：仅积压 >1 时呈现（i/N）。
+  const total = confirmQueue.length + 1;
+  $("#confirm-title").textContent = total > 1
+    ? t("confirm_title") + " (" + total + ")"
+    : t("confirm_title");
   ov.classList.remove("hidden");
   let left = 30;
   const cd = $("#confirm-count");
@@ -1309,7 +1519,9 @@ function showConfirm(id, device, peer) {
 }
 async function closeConfirm(id, allow) {
   $("#confirm-overlay").classList.add("hidden");
+  confirmShowing = null;
   try { await invoke("confirm_reply", { id, allow }); } catch (e) { /* 已超时/不存在 */ }
+  pumpConfirm();
 }
 
 /* ============ 事件接线 ============ */
@@ -1366,9 +1578,10 @@ async function wireEvents() {
       }
     }
     if (p.ok) { log("ok", "#" + p.id + " " + (p.summary || "OK")); if (p.summary) beep(); }
-    else if (p.error === "已取消") {
+    else if (p.reason === "cancelled") {
       // 轮 7 F5：主动取消不是失败——warn 日志即可，不弹失败 toast。
-      log("warn", "#" + p.id + " " + (p.error || ""));
+      // 机器字段 reason 判别（后端 send_cancel 补发）；人读文案走 L10N。
+      log("warn", "#" + p.id + " " + t("cancelled"));
     }
     else {
       log("err", "#" + p.id + " " + t("send_fail") + ": " + (p.error || ""));
@@ -1451,6 +1664,7 @@ function setLang(v) {
   applyLang();
   renderQueue();
   renderAddrDropdowns();
+  if (revalidateFields) revalidateFields(); // ToolTip 文案随语言刷新
   // 轮 7 F11：即时持久化（与 qr-address 一致）——否则关窗保存的 cfg 不含
   // 本次改动，重启丢语言。
   if (appState) {
@@ -1502,7 +1716,8 @@ $("#btn-log-clear").addEventListener("click", () => {
             ip: it.ip || "", port: it.port || 0, proto: it.proto || "tcp",
             code: it.code || null, limit: it.limit || null,
             nocompress: !!it.nocompress, noencrypt: !!it.noencrypt,
-            passes: it.passes || null, fecParity: it.fecParity || null, nofec: !!it.nofec } }
+            passes: it.passes || null, fecParity: it.fecParity || null, nofec: !!it.nofec,
+            srcPort: it.srcPort || null } }
         : { kind: it.kind, path: it.path });
     });
     renderQueue();
@@ -1526,7 +1741,8 @@ $("#btn-log-clear").addEventListener("click", () => {
     try {
       const r = await invoke("update_check");
       if (r.hasUpdate && r.version !== appState.config.skip_version) {
-        // 轮 7 P2：此前只有「跳过」没有「安装」——update_install 前端零触发点。
+        // 轮 7 P2：此前只有「跳过」没有「安装」；B3：双动作合并进同一 toast
+        // （此前两个独立 toast 叠叠覆盖，界面噪声大）。
         toast(t("update_found_toast") + ": " + r.version, "ok", t("install_now"), async () => {
           toast(t("installing"), "ok");
           try {
@@ -1534,11 +1750,10 @@ $("#btn-log-clear").addEventListener("click", () => {
             toast(t("install_done"), "ok");
             setTimeout(() => window.location.reload(), 1500);
           } catch (e) { toast(t("install_fail") + ": " + e, "err"); }
-        });
-        toast(t("update_found_toast") + ": " + r.version, "ok", t("skip_version"), async () => {
+        }, [{ text: t("skip_version"), fn: async () => {
           appState.config.skip_version = r.version;
           try { await invoke("save_config", { config: appState.config }); } catch (e) { /* 忽略 */ }
-        });
+        } }]);
         log("ok", t("update_found_toast") + ": " + r.version + " — " + r.url);
       }
     } catch (e) { /* 静默检查失败不打扰 */ }

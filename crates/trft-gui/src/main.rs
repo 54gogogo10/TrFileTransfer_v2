@@ -13,9 +13,16 @@ use state::AppState;
 use tauri::Manager;
 
 fn main() {
+    // 离线便携版（TECH-STACK §7.20）：exe 旁存在 WebView2Runtime\ 固定版运行时
+    // 则优先加载（须在 WebView2 检测/窗口创建前设置——loader 读环境变量定加载路径），
+    // 并跳过 Evergreen 检测——离线机器无 Evergreen，不该被引导去下载。
+    // 判别标记 msedgewebview2.exe 存在才启用；外部已显式指定时不覆盖。
+    #[cfg(windows)]
+    let portable = use_portable_webview2();
+
     // WebView2 运行时检测与引导（规格 §8.2 / TECH-STACK §7.1：缺失环境首次启动引导安装）。
     #[cfg(windows)]
-    if !webview2_check() {
+    if !portable && !webview2_check() {
         return;
     }
 
@@ -156,6 +163,26 @@ fn webview2_check() -> bool {
             .spawn();
     }
     false
+}
+
+/// 离线便携版：exe 旁 `WebView2Runtime\` 含 `msedgewebview2.exe` 即视为固定版
+/// 运行时（微软 Fixed Version 分发模式），经 `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`
+/// 交 loader 加载。返回是否已启用（启用时跳过 Evergreen 检测）。
+/// 固定版不随 Evergreen 自动更新——安全更新代价由离线场景补偿；
+/// 在线用户应使用单 exe 主版本（Evergreen 持续跟进微软补丁）。
+#[cfg(windows)]
+fn use_portable_webview2() -> bool {
+    if std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some() {
+        return true; // 外部显式指定优先（运维覆盖口），视同已就绪
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let Some(dir) = exe.parent().map(|d| d.join("WebView2Runtime")) else { return false };
+    if dir.join("msedgewebview2.exe").is_file() {
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &dir);
+        true
+    } else {
+        false
+    }
 }
 
 /// 原生 MessageBoxW（是/否）。true = 用户选择「是」。

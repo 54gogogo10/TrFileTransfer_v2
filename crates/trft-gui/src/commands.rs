@@ -179,6 +179,9 @@ pub struct SendRequest {
     pub fec_parity: Option<u8>,
     pub nofec: bool,
     pub pin: Option<String>,
+    /// 源端口可选绑定（规格 §3.1/§12.1 SrcPort；CLI --srcport 同源）。
+    /// UDP 单向不走此字段（无连接语义，前端对该协议隐藏输入）。
+    pub src_port: Option<u16>,
 }
 
 impl SendRequest {
@@ -217,7 +220,7 @@ impl SendRequest {
         Ok(SendOptions {
             pairing_code: self.code.clone(),
             speed_limit_bps: self.limit.unwrap_or(0).min(10_000_000) * 1024,
-            src_port: None,
+            src_port: self.src_port,
             transport,
             encrypt: !self.noencrypt,
             compress: !self.nocompress && compress_default,
@@ -498,6 +501,9 @@ pub fn send_cancel(app: tauri::AppHandle, id: u64, paused: Option<bool>) {
                 "ok": false,
                 "error": if is_pause { "已暂停" } else { "已取消" },
                 "paused": is_pause,
+                // 机器可读原因（规格 §3.7 双语纪律：前端不得比较人读文案——
+                // 此前前端比较 "已取消" 字符串，英文界面下失效）。
+                "reason": if is_pause { "paused" } else { "cancelled" },
             }),
         );
     }
@@ -614,6 +620,7 @@ pub async fn sync_start(
     code: Option<String>,
     limit: Option<u64>,
     nocompress: bool,
+    src_port: Option<u16>,
 ) -> Result<u64, String> {
     if proto == Proto::Udp {
         return Err("单向 UDP 不支持文件夹同步（仅单文件，规格 §3.6）".into());
@@ -642,6 +649,7 @@ pub async fn sync_start(
         transport: if proto == Proto::Udt { Transport::Quic } else { Transport::Tcp },
         pairing_code: code.clone(),
         speed_limit_bps: limit.unwrap_or(0).min(10_000_000) * 1024,
+        src_port,
         compress: !nocompress,
         progress: Some(reporter),
         stats: Some(app.state::<AppState>().stats.clone()),
@@ -1819,7 +1827,11 @@ pub fn text_history_clear() -> Result<(), String> {
 // 行格式 `kind|path|ip|port|proto|code|limit|nocompress|noencrypt`；旧版
 // 2 字段行按无快照恢复（运行时回落当前面板值，行为与旧版一致）。
 
+// camelCase 与前端 persistQueue 的键对齐（fec_parity ↔ fecParity、src_port ↔ srcPort）。
+// 无此改名时 serde 对缺失的 Option 字段静默给 None——队列 UDP 三参数跨重启持久化
+// 实际在丢（轮 7 F2 只修了执行路径 SendRequest，持久化路径漏网；本轮对齐补齐）。
 #[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueItem {
     pub kind: String,
     pub path: String,
@@ -1835,6 +1847,8 @@ pub struct QueueItem {
     pub passes: Option<u32>,
     pub fec_parity: Option<u8>,
     pub nofec: Option<bool>,
+    // 源端口（§3.1 可选绑定；第 13 字段，旧格式行缺省 = 不绑定）。
+    pub src_port: Option<u16>,
 }
 
 fn queue_path() -> PathBuf {
@@ -1873,6 +1887,10 @@ pub fn queue_load() -> Vec<serde_json::Value> {
                 v["fecParity"] = serde_json::json!(f[10].parse::<u8>().ok());
                 v["nofec"] = serde_json::json!(match f[11] { "1" => Some(true), "0" => Some(false), _ => None });
             }
+            // ≥13 字段：源端口（§3.1 可选绑定）。
+            if f.len() >= 13 {
+                v["srcPort"] = serde_json::json!(f[12].parse::<u16>().ok());
+            }
             Some(v)
         })
         .take(500)
@@ -1895,7 +1913,7 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
             continue; // 快照字段同样不得含分隔符
         }
         out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
 ",
             it.kind,
             it.path,
@@ -1909,6 +1927,7 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
             it.passes.map(|n| n.to_string()).unwrap_or_default(),
             it.fec_parity.map(|n| n.to_string()).unwrap_or_default(),
             it.nofec.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.src_port.map(|n| n.to_string()).unwrap_or_default(),
         ));
     }
     trft_core::config::atomic_write(&queue_path(), out.as_bytes()).map_err(err)

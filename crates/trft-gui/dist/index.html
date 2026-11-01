@@ -65,11 +65,13 @@
             <option value="udt">UDT (QUIC)</option>
             <option value="udp">UDP (单向)</option>
           </select>
-          <input type="text" id="send-chunks" class="mono w80" placeholder="1-8" />
+          <input type="text" id="send-srcport" class="mono w80" data-i18n-ph="srcport_ph" placeholder="源端口" />
+          <label class="lbl-s" data-i18n="chunks_lbl">分块数</label>
+          <input type="text" id="send-chunks" class="mono w80" data-i18n-ph="chunks_ph" placeholder="4" />
         </div>
         <div class="row">
           <label class="lbl" data-i18n="pairing">配对码</label>
-          <input type="text" id="send-code" class="mono w120" placeholder="——" />
+          <input type="text" id="send-code" class="mono w120" data-i18n-ph="code_ph_send" placeholder="对端配对码" />
           <label class="lbl-s" data-i18n="limit">KB/s</label>
           <input type="text" id="send-limit" class="mono w80" placeholder="0" />
           <label class="chk"><input type="checkbox" id="send-compress" checked /><span data-i18n="compress">压缩</span></label>
@@ -78,8 +80,8 @@
         <div class="row hidden" id="folder-opts">
           <label class="lbl" data-i18n="folder_mode">发送方式</label>
           <select id="folder-mode">
-            <option value="sync" data-i18n="mode_sync">差量同步 0x04（二次只传差异）</option>
-            <option value="plain" data-i18n="mode_plain">整夹发送 0x01（全量）</option>
+            <option value="sync" data-i18n="mode_sync">差量同步（二次只传差异）</option>
+            <option value="plain" data-i18n="mode_plain">整夹发送（全量）</option>
           </select>
           <span class="hint" data-i18n="sync_hint">按 (源路径, 目标地址) 派生稳定会话 ID，与 CLI sync 互相接力</span>
         </div>
@@ -94,7 +96,6 @@
           <button id="btn-send" class="btn primary" data-i18n="send">发送</button>
           <button id="btn-send-chunked" class="btn hidden" data-i18n="send_chunked">并行分块发送</button>
           <button id="btn-queue-add" class="btn" data-i18n="queue_add">加入队列</button>
-          <label class="chk"><input type="checkbox" id="send-gen-code-on" /><span data-i18n="gen_code">生成配对码</span></label>
           <span class="hint" data-i18n="drop_hint">可直接拖入文件/文件夹</span>
         </div>
         <div class="row">
@@ -127,7 +128,7 @@
             <option value="udt">UDT (QUIC)</option>
             <option value="udp">UDP (单向)</option>
           </select>
-          <input type="text" id="monitor-code" class="mono w120" placeholder="——" />
+          <input type="text" id="monitor-code" class="mono w120" data-i18n-ph="code_ph_send" placeholder="对端配对码" />
         </div>
         <div class="row"><span class="hint" data-i18n="monitor_hint">目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。</span></div>
         <ul id="monitor-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
@@ -146,7 +147,7 @@
           </select>
           <input type="text" id="after-command" class="mono w160 hidden" placeholder="cmd /C 命令" />
           <button id="btn-queue-run" class="btn small" data-i18n="queue_run">串行发送</button>
-          <button id="btn-queue-clear" class="btn small" data-i18n="queue_clear">清空</button>
+          <button id="btn-queue-clear" class="btn small danger" data-i18n="queue_clear">清空</button>
         </div>
         <ul id="queue-list" class="list"><li class="empty" data-i18n="queue_empty">队列为空</li></ul>
       </div>
@@ -161,7 +162,7 @@
           <span data-i18n="devices">设备</span>
           <span class="grow"></span>
           <button id="btn-discover" class="btn small" data-i18n="discover">发现设备</button>
-          <button id="btn-devices-clear" class="btn small" data-i18n="devices_clear">清空记忆</button>
+          <button id="btn-devices-clear" class="btn small danger" data-i18n="devices_clear">清空记忆</button>
         </div>
         <ul id="devices-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
       </div>
@@ -230,7 +231,7 @@
         <div class="card-title">
           <span data-i18n="text_history">文本历史（200 条）</span>
           <span class="grow"></span>
-          <button id="btn-th-clear" class="btn small" data-i18n="clear">清空</button>
+          <button id="btn-th-clear" class="btn small danger" data-i18n="clear">清空</button>
         </div>
         <ul id="text-history" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
       </div>
@@ -274,7 +275,7 @@
     <section class="pane" id="pane-verify">
       <div class="card">
         <div class="row">
-          <span class="hint grow" data-i18n="verify_desc">聚合扫描全部已配置保存目录，重算 SHA-256 与摘要缓存比对（规格 §3.5）。</span>
+          <span class="hint grow" data-i18n="verify_desc">聚合扫描全部已配置保存目录，重算 SHA-256 与摘要缓存比对。</span>
           <button id="btn-verify-start" class="btn primary" data-i18n="verify_start">开始校验</button>
           <button id="btn-verify-stop" class="btn" data-i18n="verify_stop">停止</button>
         </div>
@@ -301,7 +302,7 @@
           <span class="grow"></span>
           <button id="btn-stats-refresh" class="btn small" data-i18n="refresh">刷新</button>
           <button id="btn-stats-export" class="btn small" data-i18n="export_csv">导出 CSV</button>
-          <button id="btn-stats-clear" class="btn small" data-i18n="stats_clear">全部清除</button>
+          <button id="btn-stats-clear" class="btn small danger" data-i18n="stats_clear">全部清除</button>
         </div>
         <div class="verify-results">
           <div class="vstat"><b id="st-today-count">0</b><span data-i18n="st_today">今日次数</span></div>
@@ -333,7 +334,10 @@
         <div class="card-title" data-i18n="settings_general">通用</div>
         <div class="row">
           <label class="lbl" data-i18n="pairing">配对码</label>
-          <input type="text" id="cfg-code" class="mono w120" placeholder="4-12 位数字" />
+          <input type="text" id="cfg-code" class="mono w120" data-i18n-ph="code_ph_local" placeholder="4-12 位数字" />
+          <button id="btn-gen-code" class="btn small" data-i18n="gen_code">生成配对码</button>
+          <label class="lbl-s" data-i18n="pairing_len">配对码位数</label>
+          <input type="text" id="cfg-pairing-len" class="mono w60" placeholder="6" />
           <label class="chk"><input type="checkbox" id="cfg-notify" /><span data-i18n="notify">完成通知</span></label>
           <label class="chk"><input type="checkbox" id="cfg-autostart" /><span data-i18n="autostart">开机自启</span></label>
           <label class="chk"><input type="checkbox" id="cfg-notify-sound" /><span data-i18n="notify_sound">提示音</span></label>
@@ -428,7 +432,7 @@
   <!-- 接收前确认弹窗（规格 §3.3：30 秒无应答视为拒绝；fail-closed） -->
   <div id="confirm-overlay" class="hidden">
     <div class="modal">
-      <div class="modal-title" data-i18n="confirm_title">接收确认</div>
+      <div class="modal-title" id="confirm-title" data-i18n="confirm_title">接收确认</div>
       <div id="confirm-msg" class="modal-msg"></div>
       <div class="modal-count mono" id="confirm-count"></div>
       <div class="modal-btns">
