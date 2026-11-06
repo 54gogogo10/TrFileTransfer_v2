@@ -26,3 +26,6 @@ if-addrs = "0.13"
 # WebView2 运行时检测（规格 §8.2：缺失环境引导安装）+ HKCU Run 开机自启。
 winreg = "0.55"
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Power"] }
+
+[dev-dependencies]
+tempfile.workspace = true

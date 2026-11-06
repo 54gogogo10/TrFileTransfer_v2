@@ -205,13 +205,29 @@ async fn open_stream(url: &Url) -> Result<BoxIo> {
     }
 }
 
+/// 主机名还原成 URL/Host 头形态：IPv6 字面量必须带方括号。
+/// `parse_url` 存的是去掉方括号的裸地址（`::1`），直接拼进 `Host:` 会得到
+/// `::1:8443` 这种非法头（服务端 400）——本轮 F9。
+fn bracketed_host(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn host_header_of(url: &Url) -> String {
+    let host = bracketed_host(&url.host);
+    if (url.https && url.port != 443) || (!url.https && url.port != 80) {
+        format!("{host}:{}", url.port)
+    } else {
+        host
+    }
+}
+
 async fn request_and_head(url: &Url) -> Result<(BoxIo, Head)> {
     let mut io = open_stream(url).await?;
-    let host_header = if (url.https && url.port != 443) || (!url.https && url.port != 80) {
-        format!("{}:{}", url.host, url.port)
-    } else {
-        url.host.clone()
-    };
+    let host_header = host_header_of(url);
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: trft-updater\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         url.path, host_header
@@ -272,7 +288,13 @@ async fn http_get(raw_url: &str, max_bytes: usize) -> Result<Vec<u8>> {
             let next = if loc.contains("://") {
                 loc
             } else {
-                format!("{}://{}{}", if url.https { "https" } else { "http" }, url.host, loc)
+                // 相对重定向同样要还原 IPv6 方括号（F9）。
+                format!(
+                    "{}://{}{}",
+                    if url.https { "https" } else { "http" },
+                    bracketed_host(&url.host),
+                    loc
+                )
             };
             url = parse_url(&next)?;
             continue; // Connection: close，旧连接自然收尾
@@ -698,6 +720,21 @@ mod tests {
         assert!(parse_url("http://localhost/x").is_ok());
         assert!(parse_url("http://example.com/x").is_err(), "非回环明文必须拒绝");
         assert!(parse_url("ftp://example.com/x").is_err());
+    }
+
+    /// 本轮 F9：IPv6 更新源的 Host 头必须带方括号（裸 `::1:8443` 会被判非法）。
+    #[test]
+    fn ipv6_host_header_is_bracketed() {
+        let u = parse_url("https://[::1]:8443/m").unwrap();
+        assert_eq!(host_header_of(&u), "[::1]:8443");
+        let u = parse_url("https://[::1]/m").unwrap();
+        assert_eq!(host_header_of(&u), "[::1]", "默认端口不带端口后缀");
+        let u = parse_url("https://example.com/x").unwrap();
+        assert_eq!(host_header_of(&u), "example.com");
+        let u = parse_url("https://example.com:8443/x").unwrap();
+        assert_eq!(host_header_of(&u), "example.com:8443");
+        let u = parse_url("http://127.0.0.1:8080/x").unwrap();
+        assert_eq!(host_header_of(&u), "127.0.0.1:8080");
     }
 
     #[test]

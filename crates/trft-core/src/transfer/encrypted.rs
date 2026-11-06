@@ -313,7 +313,8 @@ where
     s.write_all(&cpub).await?;
     let t = crate::protocol::io::read_u8(&mut s).await?;
     if t != T_ENCRYPT_OK {
-        return Err(proto(format!("对端不接受加密（0x{t:02X}）")));
+        let _ = t;
+        return Err(proto("对端未启用加密，已中止"));
     }
     let spub = crate::protocol::io::read_n(&mut s, PUBKEY_LEN).await?;
     let keys = hs.finish_client(&spub)?;
@@ -474,7 +475,8 @@ mod tests {
             if this.pending {
                 this.pending = false;
                 this.woken = true;
-                let n = buf.len().min(1).max(1);
+                // 每次只放行 1 字节（强制走 Pending→同 buf 重试路径）；空 buf 读 0。
+                let n = 1.min(buf.len());
                 this.buf.extend_from_slice(&buf[..n.min(buf.len())]);
                 return Poll::Ready(Ok(n.min(buf.len())));
             }

@@ -6,6 +6,7 @@
 //! 协商（默认开，旧对端自动降级明文）。`sync` 走 0x04 文件夹同步（稳定会话 ID）。
 
 use clap::{Parser, ValueEnum};
+use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ enum Proto {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// 发送单文件、文件夹或文本（单文件首选 0x03 断点续传，自动重试 + 降级）
+    /// 发送单文件、文件夹或文本（单文件自动断点续传，失败重试并自动降级）
     Send {
         #[arg(long)]
         ip: String,
@@ -61,7 +62,7 @@ enum Cmd {
         limit: Option<u64>,
         #[arg(long)]
         srcport: Option<u16>,
-        /// 0x02 并行分块连接数 1–8（省略 = 0x03 自动续传，规格 §3.2）
+        /// 并行分块连接数 1–8（省略则使用断点续传）
         #[arg(long)]
         chunks: Option<u8>,
         /// 单向 UDP：重发轮数 1–5（默认 2）
@@ -73,18 +74,18 @@ enum Cmd {
         /// 单向 UDP：关闭 FEC
         #[arg(long)]
         nofec: bool,
-        /// 关闭 TCP 0x09 加密（默认开启；QUIC 由 TLS 承担）
+        /// 关闭传输加密（默认开启；QUIC 通道由 TLS 加密）
         #[arg(long)]
         noencrypt: bool,
-        /// 关闭 0x08 压缩协商（默认开；旧对端自动降级明文）
+        /// 关闭压缩（默认开启；旧对端自动按未压缩传输）
         #[arg(long)]
         nocompress: bool,
         /// QUIC 证书 SHA-256 指纹钉扎（64 位 hex；手动指定，不自动记录；
         /// 无 --pin 时 --udt 不防主动中间人）
         #[arg(long = "pin")]
         quic_pin: Option<String>,
-        /// 显式放行「旧服务端降级明文 0x05」（0x0D 被拒时；默认拒绝——
-        /// 无法区分旧服务端与伪装旧服务端的中间人降级攻击）
+        /// 显式放行旧版对端的明文配对（默认拒绝——
+        /// 无法区分旧版对端与伪装的中间人）
         #[arg(long = "allow-legacy-pair")]
         allow_legacy_pair: bool,
     },
@@ -98,14 +99,14 @@ enum Cmd {
         proto: Proto,
         #[arg(long)]
         code: Option<String>,
-        /// 收满 N 个成功帧数后退出（仅 tcp/udt）
+        /// 收满 N 个文件（次传输）后退出（仅 tcp/udt）
         #[arg(long)]
         count: Option<u64>,
-        /// 拒绝 TCP 0x09 加密升级（默认接受）
+        /// 拒绝接收端的传输加密升级（默认接受）
         #[arg(long)]
         noencrypt: bool,
     },
-    /// 文件夹同步（0x04 差量同步：只传差异、保留服务端已删除文件；稳定会话 ID 可接力）
+    /// 文件夹同步（差量同步：只传差异、保留服务端已删除文件；可接力续传）
     Sync {
         #[arg(long)]
         folder: PathBuf,
@@ -120,10 +121,10 @@ enum Cmd {
         /// 发送限速 KB/s（0=不限）
         #[arg(long)]
         limit: Option<u64>,
-        /// 关闭 0x08 压缩协商（默认开）
+        /// 关闭压缩（默认开启）
         #[arg(long)]
         nocompress: bool,
-        /// 显式放行「旧服务端降级明文 0x05」（0x0D 被拒时；默认拒绝）
+        /// 显式放行旧版对端的明文配对（默认拒绝）
         #[arg(long = "allow-legacy-pair")]
         allow_legacy_pair: bool,
     },
@@ -132,9 +133,9 @@ enum Cmd {
         #[arg(long)]
         dir: PathBuf,
     },
-    /// 自更新（ed25519 签名清单；更新源强制 https，规格 §5.1）
+    /// 自更新（更新清单需签名校验；更新源强制 https）
     Update {
-        /// 清单 URL（key=value + ed25519 签名；缺省读配置 UpdateUrl）
+        /// 更新清单 URL（缺省读取配置中的更新源）
         #[arg(long)]
         url: Option<String>,
         /// 仅检查（不下载不换入）
@@ -235,9 +236,28 @@ fn usage_fail(msg: &str) -> i32 {
     2
 }
 
-#[tokio::main]
-async fn main() {
-    std::process::exit(run().await);
+fn main() {
+    // Windows 主线程默认栈仅 1MB：debug 构建的异步发送调用链（0x03 → 加密/压缩
+    // 装饰器 → 帧循环）栈帧膨胀会溢出（cli_transfer 集成测试实测，100B 小文件
+    // 即崩；release 裕量同样无保障）。挪 16MB 大栈线程执行——rustc 自身同款做法。
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| std::process::exit(run_main()))
+        .expect("spawn main")
+        .join()
+        .unwrap_or_else(|e| std::process::exit(fail(&panic_reason(e))));
+}
+
+fn panic_reason(e: Box<dyn Any + Send>) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "panic".into())
+}
+
+fn run_main() -> i32 {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(run())
 }
 
 async fn run() -> i32 {
@@ -320,7 +340,7 @@ async fn run() -> i32 {
                     match send_file_chunked(addr, &f, &opts, n).await {
                         Ok(()) => Ok(()),
                         Err(trft_core::error::Error::Unsupported(m)) => {
-                            eprintln!("提示: {m}，回退自动续传（0x03→0x00）");
+                            eprintln!("提示: {m}，改用断点续传");
                             send_file_auto(addr, &f, &opts).await
                         }
                         Err(e) => Err(e),
@@ -456,7 +476,7 @@ async fn run() -> i32 {
                     0
                 }
                 Err(trft_core::error::Error::Unsupported(m)) => {
-                    fail(&format!("同步失败: {m}（同步需要 0x04 能力，旧对端请改用 send --folder）"))
+                    fail(&format!("同步失败: {m}（对端需支持文件夹同步；旧对端请改用 send --folder）"))
                 }
                 Err(e) => fail(&format!("同步失败: {e}")),
             }
@@ -522,8 +542,10 @@ async fn run() -> i32 {
             let work = trft_core::config::app_data_dir().join("updates");
             match trft_core::update::run_update(&manifest_url, &pubkey, env!("CARGO_PKG_VERSION"), &work).await {
                 Ok(Some(bak)) => {
-                    let _ = std::fs::remove_file(&bak); // 成功换入后清理备份
-                    println!("已更新并换入（旧文件备份 {}）", bak.display());
+                    // 备份只用于失败回滚：CLI 换入成功即清理，文案不得再宣称它还在
+                    // （本轮 F9——旧文案先删后打印，用户照提示去回滚会扑空）。
+                    let _ = std::fs::remove_file(&bak);
+                    println!("已更新并换入（下次启动生效）");
                     0
                 }
                 Ok(None) => {

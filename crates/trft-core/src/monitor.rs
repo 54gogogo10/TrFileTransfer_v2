@@ -174,10 +174,12 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         }
 
         // 拷贝完成判定（双重门；阻塞窗在 blocking 池）。
-        let dir = cfg.watch_dir.clone();
+        // check_path 已由 scan_dir 拼好（= watch_dir 下的完整路径），**不得**再
+        // join 一次 watch_dir——相对监控目录会被拼成 "drop/drop/a.bin"，
+        // metadata 恒失败 → 文件永远判不就绪（本轮 F2）。
         let window = cfg.stable_window;
         let check_path = front.clone();
-        let ready = tokio::task::spawn_blocking(move || copy_complete(&dir.join(&check_path), window))
+        let ready = tokio::task::spawn_blocking(move || copy_complete(&check_path, window))
             .await
             .unwrap_or(false);
         if !ready {
@@ -350,14 +352,20 @@ mod tests {
         let p = dir.path().join("grow.bin");
         std::fs::write(&p, vec![0u8; 100]).unwrap();
         // 模拟半截文件：检查期间仍在增长 → 稳定窗判不变。
+        // 确定性关键：写点间隔（200ms）< 稳定窗（300ms）——任意相隔一个稳定窗的
+        // 两次采样必跨至少一个写点、看到不同大小 → 必判不稳，无调度竞态
+        // （旧版单次写点 100ms 处存在真时钟 flaky：首次采样若被调度延迟跨过写点，
+        // 两次采样同大小 → 误判稳定 → 假红）。
         let dir2 = dir.path().to_path_buf();
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(200));
             std::fs::write(dir2.join("grow.bin"), vec![0u8; 500]).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::write(dir2.join("grow.bin"), vec![0u8; 1000]).unwrap();
         });
         assert!(!copy_complete(&p, Duration::from_millis(300)), "增长中的文件不得判就绪");
         writer.join().unwrap();
-        // 稳定后判就绪。
+        // 稳定后判就绪（写者已结束，无并发）。
         assert!(copy_complete(&p, Duration::from_millis(50)), "稳定文件必须判就绪");
     }
 
@@ -428,10 +436,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(std::fs::read(out.join("auto.bin")).unwrap(), b"monitor me");
-        assert!(
-            watch.join(SENT_DIR).join("auto.bin").exists(),
-            "成功后必须移入「已发送文件/」"
-        );
+        // 归档（rename 到「已发送文件/」）发生在**发送侧返回之后**，而上面的等待
+        // 条件是接收侧落盘——两者之间存在窗口（实跑曾偶发红）。此处等到归档为止，
+        // 保留断言强度而不是放宽判据。
+        let archived = watch.join(SENT_DIR).join("auto.bin");
+        let archive_deadline = Instant::now() + Duration::from_secs(5);
+        while !archived.exists() {
+            assert!(Instant::now() < archive_deadline, "成功后必须移入「已发送文件/」");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let _ = stx.send(true);
         let _ = h.await;
         server.abort();

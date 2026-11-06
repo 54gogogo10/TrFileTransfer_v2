@@ -212,7 +212,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Compressed<S> {
                     std::mem::take(&mut this.body)
                 }
                 MODE_DEFLATE => inflate(&this.body, raw_len).map_err(io_err)?,
-                other => return Poll::Ready(Err(io_err(format!("未知压缩模式 0x{other:02X}")))),
+                _ => return Poll::Ready(Err(io_err("压缩数据无法识别"))),
             };
             if plain.len() != raw_len {
                 return Poll::Ready(Err(io_err(format!(

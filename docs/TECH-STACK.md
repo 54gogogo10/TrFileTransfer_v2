@@ -182,8 +182,38 @@
    - **机制**：GUI exe 旁存在 `WebView2Runtime\`（含 `msedgewebview2.exe` 判别标记）即视为微软 Fixed Version 固定版运行时——`main()` 最前 `use_portable_webview2()` 设 `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`（外部已显式指定时不覆盖）并**跳过 Evergreen 检测**（离线机器无 Evergreen，不得引导下载）；主版本单 exe 不变（Evergreen 自动跟进微软安全补丁），便携版不自动更新——安全更新代价由离线场景补偿；
    - **构建**：`build.bat`（CRLF+GBK——cmd 三坑：LF 破坏括号块解析、UTF-8 中文乱码、括号块内 echo 的 `)` 提前闭块）产出三件套 + `.sha256` 边车 + `TrFileTransfer-GUI-<版>-portable.zip`（`build\WebView2FixedRuntime\` 就绪才打包，否则跳过并提示）；`build\fetch-webview2-fixed.ps1` 获取运行时：`-CabPath` 官方固定版 cab（许可最干净，第三方再分发走此路）或无参快照本机 Evergreen（布局同构，自用/内网足够）——edgeupdates API 已不再提供 WebView2 Fixed Version 条目；
    - **判别验证的坑（登记）**：WebView2 **进程池复用**——同 user-data-dir + 同版本时新建 WebView 直连已有浏览器池，executable folder 不参与 →「启动后看 msedgewebview2.exe 子进程路径」的判别测试必须**先杀净进程池冷启动**，否则假阴性（实测两次误报「便携未生效」均为此因）；冷启动判别通过（子进程路径落在便携目录）。
+21. **测试细化 + 集成测试补强**（2026-11-01，181 → 197 项）：
+   - **trft-gui 零测试清零**：crate 拆 lib + bin（Tauri 2 推荐结构，bin 仅入口）；`queue.txt` 序列化/解析抽纯函数（`queue_items_to_text`/`parse_queue_text`）并以 6 项互锁测试钉住——13 字段全量 round-trip、**serde 键对齐回归**（前端 persistQueue 确切 JSON 形状 ↔ QueueItem，钉死本批修的「camelCase 缺失 → 队列 UDP 参数跨重启静默丢失」事故类）、2/9/12 字段旧格式兼容、写侧 `|` 污染防御、解析层 500 钳制；SendRequest serde 契约 3 项（srcPort/passes/fecParity 落位 + 缺字段缺省 + display_name 三态）；便携版探测抽纯函数 `detect_portable_runtime` 3 单测（标记在/不在/外部指定优先）；
+   - **B2 测出真实缺陷并修复**：新增 CLI 跨进程集成测试（`tests/cli_transfer.rs`：子进程 recv --count 1 ↔ send 全链路）暴露 **`trft send` 主线程栈溢出**——Windows 主线程默认栈 1MB，debug 构建异步发送调用链（0x03 → 加密/压缩装饰器 → 帧循环）栈帧膨胀必崩（100B 小文件即崩、与大小无关），release 1MiB 压线失败（exit=1）——CLI 此前仅有退出码测试（错误路径不触达深调用链）、实机演练均为 release 大文件路径，故潜伏至今。修复：CLI 入口挪 16MB 大栈线程（rustc 同款做法），四组合（debug/release × 100B/1MiB）全过；
+   - **0x02 分块专项 e2e**（`tests/e2e_chunked.rs` ×3）：8 MiB 4 连接多分块边界（大于套件原 3 MiB 上限）、分块 × 配对 × 压缩全栈、对旧对端 Unsupported 后回退 0x03/0x00 **完整送达**（interop 测「会回退」，此处测「回退链路终点」）；
+   - **flaky 治理**：`monitor.rs` `copy_complete_rejects_growing_file` 真时钟竞态（旧版单写点 100ms 处，首次采样被调度延迟跨过写点 → 两次采样同大小 → 误判稳定假红，全量跑实测复发过）改双写点确定性构造——写点间隔 200ms < 稳定窗 300ms，任意相隔一窗的采样必跨写点；
+   - **环境事件（非项目缺陷，登记防误读）**：测试期间 C 盘 100% 满（TEMP 内历史审查 PoC 残留 ~2GB 已清理）引发 os error 1455 页面文件不足 / 瞬时 E0463 rlib 假性丢失 / 磁盘预检拒绝传输——同批症状（尤其 1455）先查磁盘水位再怀疑代码；
+   - **范围外维持**：UDP 真丢包 e2e（环回无丢包，引擎级 11 项单元覆盖）、>100MB 大文件（套件时长）、前端 JS 测试（无 Node 工具链，契约由 serde 键对齐测试在 Rust 侧钉住）。
    - **验证**：181 项测试全绿（0 告警）；实机启动 + mock `__TAURI__` 浏览器测试床交互冒烟（红框/ToolTip/双语/双主题/确认模态/排队徽标/进度卡三态/语言锁全部过）；
    - **登记接受（不修）**：同步会话对话框维持登记不做（磁盘即状态模型下语义弱化，用户拍板）；core 错误串中文 Display 在 EN 模式直接展示（文案集中 L10N 纪律仅约束前端，core 错误国际化属独立批次）。
+22. **第九轮审查修复（2026-11-01，197 → 203 项，全绿）**：
+   - **P1 队列成败判定**：`run_single_send` 以「任务从 tasks 表消失」当成功，而 `settle_send` 成败都摘表 → QueueRetries 重试恒不触发、失败恒计入「N 完成」、全失败仍执行关机/休眠/自定义命令。修复：`send_start` 拆 `spawn_send`（返回 `oneshot` 结果通道），`settle_send` 统一成型 `Result<(),String>` 并回传；队列改为等真实结果（24h 兜底、通道断开按失败）；
+   - **P2 监控相对目录**：`copy_complete(&dir.join(&check_path))` 对 `scan_dir` 已含前缀的路径二次 join → 相对监控目录恒判不就绪，改为直接使用 `check_path`；
+   - **P2 0x02 越界溢出**：`offset + plen` 在错误信息里二次求值，`offset=u64::MAX` 时 debug 溢出 panic（`--count` 串行分支会掀掉接收器）→ 改 `checked_add`，新增判别测试（修复前以 panic 失败）；
+   - **P2 CSV 公式注入**：统计导出对 `= + - @ \t \r` 开头的字段前置单引号（`path` 为对端可控文件名），新增判别测试；
+   - **P3 批次**：clippy `min_max`（deny-by-default）致 `--all-targets` 编译失败 → `1.min(buf.len())`；Cookie 解析遇无 `=` 段不再整体放弃（坏段跳过）+ 测试；`ip_match` 归一 IPv4-mapped（与 `gate_key` 同口径）+ 测试；`scrub::collect` 改 `file_type()` 不跟随链接 + 深度上限 32（junction 环栈溢出）；更新器 IPv6 的 Host 头/相对重定向补方括号 + 测试；CLI 更新成功后不再宣称「旧文件备份」仍在；`write_atomic` 去掉第二份 .bak 复制（注释与实现对齐）；discovery 恒真断言收紧为真判别。
+
+23. **构建 + GUI 实机全面测试**（2026-11-01，203 → 205 项）：
+   - **方法**：release 构建后以隔离 `APPDATA` 启动真实 GUI，用 UI Automation（Enumerate/Invoke/ValuePattern，不依赖鼠标焦点）驱动界面，配合 CLI 子进程与 HTTP 客户端做端到端判定，逐步截图留证；
+   - **P0 更新检查栈溢出（实机抓到，release-only）**：配置了 `UpdateUrl` 的用户**启动 3 秒后静默检查必崩**（APPCRASH 0xC00000FD，`thread 'main' has overflowed its stack`），手动点「检查更新」同样崩；debug 构建存活（`respond_async_serialized` 在 debug 走 `Box::pin`，release 深内联）→ 判定为默认 1MB 线程栈被 update 异步链（rustls 客户端配置 + 超时包装 + 连接 future）耗尽，与轮 9 修复的 CLI 主线程栈溢出同源。修复：`build.rs` 加 `/STACK:16777216`（PE 默认栈被无线程大小参数创建的线程继承）；实测配置 `UpdateUrl` 启动 12s + 手动检查均存活；
+   - **P1 `--count` × 0x02 并行分块互斥**：接收端把首条连接的中途判决 `INCOMPLETE`(0x02) 也计入 `--count`，`recv --count 1` 在收到第一个分片后即退出 → 发送端被 RST、落盘只剩 `.trft-part`（CLI 与 GUI 均实测复现）。修复：仅 `0x01`（已组装）计入；新增 e2e 判别测试 `chunked_with_count_one_receives_full_file`；
+   - **P2 Web 根目录上传后 404**：`/up/` 成功回 303 `/view/{path}`，根源时得到 `/view/`——axum 的 `{*path}` 通配要求至少一段，不匹配任何路由 → 浏览器落在 404 白页（下载/删除的取消链接同病）。修复：`view_url()` 统一（空路径回 `/`），覆盖上传跳转、删除跳转、取消链接、父目录链接；新增 web 测试 `root_upload_redirects_to_root_listing`；
+   - **P3 语言切换后动态列表不刷新**：统计「按设备」行在 EN 下残留中文「5 文件」（动态文本不在 `data-i18n` 覆盖内）。修复：`setLang` 重渲染 stats/devices；
+   - **实测通过项**：启动/渲染、六页签、收发全链路（GUI 收 CLI 发 5MiB+777 逐字节一致；GUI 发 CLI 收）、中文文本发送、队列 2 项串行发送、并行分块 0x02、监控目录自动发送+归档、HTTP 共享（列目录/下载/Range 206/上传/穿越拦截 400）、配对码（无码拒绝+有码成功）、校验（3 文件：一致 1/无记录 2；篡改后 1 不一致并点名）、设置持久化、中英与深浅主题；
+   - **未覆盖（登记）**：并行群发、文本历史列表、CSV 导出（原生保存对话框）、QUIC/UDP 接收器、托盘菜单与系统通知。
+
+24. **用户可见文案去协议化**（2026-11-01，205 → 206 项）：
+   - **原则**：线协议帧码（`0xNN`）、设计文档章节号、内部产物名一律不进用户可见输出——GUI 日志/传输历史、CLI 输出与 `--help`、系统通知、CSV 导出；
+   - **统计明细**：`0x00`/`0x01 文件夹`/`0x02 分块×N`/`0x03 续传`/`0x04 同步`/`0x06 文本` → 「直接发送/整夹发送/分块传输×N/续传传输/文件夹同步/文本消息」；旧 stats.log 在**读取时**按 `normalize_detail` 归一（幂等、不篡改未知文案、不改写用户文件，随下一次重写自然收敛）；
+   - **错误文案**：所有 `proto/Unsupported/Rejected` 去掉帧码、`fail-closed`、`会话/逐出/半成品` 等内部术语（「对端数据无法识别（协议版本可能不兼容）」「分块传输已中断」「续传协商失败」…）；
+   - **CLI 帮助**：`--chunks/--noencrypt/--nocompress/--allow-legacy-pair/--count/--pin/update` 的说明去掉 `0x0N` 与「规格 §x」，改为功能描述；
+   - **日志噪声**：防火墙提示日志由「netsh: <原始命令>」改为中文说明（命令仍留在可复制的 toast）；UDP 接收日志不再打印会话 ID（只报文件名）；
+   - **验证**：core 115 项单测（新增 `legacy_protocol_labels_are_normalized_on_load`）；GUI 实机历史/日志逐行确认无 `0x`；`trft send --help`/`update --help` 无帧码。
 
 ## 8. 记录在案的否决项
 

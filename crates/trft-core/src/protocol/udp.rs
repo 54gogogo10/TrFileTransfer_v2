@@ -32,7 +32,7 @@ impl UdpHeader {
             return Err(proto("UDP 包短于 20 字节公共头"));
         }
         if buf[0] != crate::protocol::PROTO_VERSION {
-            return Err(proto(format!("未知协议版本 0x{:02X}", buf[0])));
+            return Err(proto("UDP 协议版本不兼容（对端版本过新或过旧）"));
         }
         Ok(Self {
             frame: buf[1],

@@ -232,7 +232,10 @@ async fn auth_mw(
 fn cookie_of(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
-        let (k, v) = part.trim().split_once('=')?;
+        // 无 '=' 的段（代理/扩展塞进来的裸标记）必须**跳过**而不是整体放弃——
+        // 旧实现用 `? ` 提前返回 None，前面任一坏段都会让后面的会话 Cookie
+        // 找不到 → 已登录用户被踢回登录页（本轮 F6）。
+        let Some((k, v)) = part.trim().split_once('=') else { continue };
         if k == name {
             return Some(v.to_string());
         }
@@ -405,8 +408,8 @@ async fn view(st: &WebState, rel: &str) -> Response {
     if !rel.is_empty() {
         let parent = Path::new(rel).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         rows.push_str(&format!(
-            "<tr><td><a href=\"/view/{}\">[..]</a></td><td></td><td></td></tr>",
-            url_escape(&parent)
+            "<tr><td><a href=\"{}\">[..]</a></td><td></td><td></td></tr>",
+            view_url(&parent)
         ));
     }
     for e in &entries {
@@ -427,8 +430,8 @@ async fn view(st: &WebState, rel: &str) -> Response {
             format!("<a href=\"/del/{}\">删除</a>", url_escape(&sub))
         };
         rows.push_str(&format!(
-            "<tr><td><a href=\"/view/{}\">{}</a></td><td>{}</td><td>{dl}{del}</td></tr>",
-            url_escape(&sub),
+            "<tr><td><a href=\"{}\">{}</a></td><td>{}</td><td>{dl}{del}</td></tr>",
+            view_url(&sub),
             html_escape(&name),
             size_txt
         ));
@@ -833,7 +836,7 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
     if saved.is_empty() {
         return (StatusCode::BAD_REQUEST, "没有收到文件字段").into_response();
     }
-    (StatusCode::SEE_OTHER, [("Location", format!("/view/{}", url_escape(path)))], format!("已接收 {} 个文件", saved.len()))
+    (StatusCode::SEE_OTHER, [("Location", view_url(path))], format!("已接收 {} 个文件", saved.len()))
         .into_response()
 }
 
@@ -871,12 +874,12 @@ async fn delete_confirm(
          <form method=\"post\" action=\"/del/{}\">\
          <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
          <button type=\"submit\">确认删除</button>\
-         <a href=\"/view/{}\" style=\"margin-left:1rem\">取消</a>\
+         <a href=\"{}\" style=\"margin-left:1rem\">取消</a>\
          </form></body></html>",
         html_escape(&path),
         url_escape(&path),
         html_escape(&csrf),
-        url_escape(Path::new(&path).parent().map(|p| p.to_string_lossy()).unwrap_or_default().trim_matches('/')),
+        view_url(&Path::new(&path).parent().map(|p| p.to_string_lossy()).unwrap_or_default()),
     ))
     .into_response();
     if let Some(sc) = set_cookie {
@@ -922,7 +925,7 @@ async fn delete_submit(
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            Redirect::to(&format!("/view/{}", url_escape(parent.trim_matches('/')))).into_response()
+            Redirect::to(&view_url(&parent)).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "删除失败").into_response(),
     }
@@ -935,6 +938,18 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// 目录浏览 URL：根目录必须回 `/`。
+/// `/view/` 不匹配 axum 的 `{*path}` 通配（通配至少一段）→ 404；
+/// 实机测试发现：在共享根目录上传完成后，303 跳到 `/view/` 显示 404。
+fn view_url(rel: &str) -> String {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/view/{}", url_escape(rel))
+    }
 }
 
 fn url_escape(s: &str) -> String {
@@ -1064,5 +1079,20 @@ mod tests {
         assert!(!is_upload_part_name("a.up123.txt.part"), "hex 段长度/边界不符");
         assert!(!is_upload_part_name("a.upzzzzzzzz.txt.part"), "非 hex");
         assert!(!is_upload_part_name("a.up1a2b3c4d.t.x.part"), "扩展名含点非自产形");
+    }
+
+    /// 本轮 F6 判别：Cookie 头里出现无 `=` 的段（代理/扩展常见）时，后面的
+    /// 会话 Cookie 仍必须被找到。修复前 `split_once('=')?` 让整个查找提前返回 None
+    /// ——已登录用户被踢回登录页。
+    #[test]
+    fn cookie_skips_malformed_segments() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("flag; other=1; trft_sid=abc123; trft_csrf=zzz"),
+        );
+        assert_eq!(cookie_of(&h, SID_COOKIE).as_deref(), Some("abc123"));
+        assert_eq!(cookie_of(&h, CSRF_COOKIE).as_deref(), Some("zzz"));
+        assert_eq!(cookie_of(&h, "missing"), None);
     }
 }

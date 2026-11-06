@@ -197,7 +197,9 @@ pub fn new_token_secret() -> String {
     crate::hash::hex(&b)
 }
 
-/// .tmp 写入 → 现文件经原子换入复制为 .bak（非裸 copy，防撕裂备份）→ 主文件原子换入。
+/// 现文件 → `.bak`（同样走 `.tmp` 原子换入，防撕裂备份）→ 主文件原子换入。
+/// 注意：`.bak` 只在此处生成一次；`write_atomic` 内部**不再**做第二份 copy
+/// （本轮 F9：旧实现里 `.bak` 被写两遍，且注释宣称"非裸 copy"而实现是 copy）。
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     if path.exists() {
         let old = std::fs::read(path)?;
@@ -224,11 +226,8 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     tmp.write_all(data)?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    let bak = path.with_extension("bak");
-    if path.exists() && bak != path {
-        // 防自拷贝（src==dst 会以共享冲突失败）：对 .bak 目标跳过镜像。
-        std::fs::copy(path, &bak)?;
-    }
+    // 备份由 `atomic_write` 统一生成（且是原子换入而非 copy）——此处不得再做
+    // 第二份 copy：既重复写盘，也让"撕裂备份"重新出现（本轮 F9）。
     match tmp.persist(path) {
         Ok(_) => Ok(()),
         Err(e) => Err(Error::Io(e.error)),

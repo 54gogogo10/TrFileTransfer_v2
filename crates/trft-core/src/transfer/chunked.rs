@@ -160,7 +160,7 @@ impl ChunkTracker {
         });
         if let Some(s) = map.get(&gid) {
             if s.name != name || s.total != total {
-                return Err(proto("0x02 会话字段冲突（name/total 与既有组不一致）"));
+                return Err(proto("同名分块传输的参数不一致（文件名或大小）"));
             }
             s.last_seen_ms.store(now, Ordering::Relaxed);
             return Ok(s.clone());
@@ -183,7 +183,7 @@ impl ChunkTracker {
         let part = group_part_path(save_dir, name, &gid);
         // 磁盘预检（轮 1：0x02 此前缺席——规格 §3.1 口径对齐其余接收路径）。
         if !crate::transfer::receiver::space_ok(save_dir, total) {
-            return Err(proto("0x02: 磁盘可用空间不足（需要 ≥ 声明 + 64MB 余量）"));
+            return Err(proto("分块接收：磁盘可用空间不足（需要 ≥ 声明 + 64MB 余量）"));
         }
         let file = match tokio::fs::OpenOptions::new()
             .write(true)
@@ -200,9 +200,9 @@ impl ChunkTracker {
                     .create_new(true)
                     .open(&part)
                     .await
-                    .map_err(|e| proto(format!("创建分块半成品失败: {e}")))?
+                    .map_err(|e| proto(format!("创建分块临时文件失败: {e}")))?
             }
-            Err(e) => return Err(proto(format!("创建分块半成品失败: {e}"))),
+            Err(e) => return Err(proto(format!("创建分块临时文件失败: {e}"))),
         };
         let s = std::sync::Arc::new(GroupSession {
             name: name.to_string(),
@@ -235,7 +235,7 @@ impl ChunkTracker {
         save_dir: &Path,
     ) -> Result<bool> {
         if total == 0 {
-            return Err(proto("0x02 拒绝空文件（total=0）"));
+            return Err(proto("分块传输不支持空文件"));
         }
         if total > MAX_TRANSFER_SIZE {
             return Err(proto(format!("声明大小 {total} 超过 1 PiB 上限")));
@@ -274,7 +274,7 @@ impl ChunkTracker {
         let (part, name, report, notify) = {
             let map = self.sessions.lock().await;
             let Some(s) = map.get(&gid) else {
-                return Err(proto("分块会话不存在（组装）"));
+                return Err(proto("分块传输已中断（会话已失效）"));
             };
             (s.part.clone(), s.name.clone(), s.report.clone(), s.notify.clone())
         };
@@ -376,13 +376,19 @@ where
     let name = sanitize_name(&read_str_u16(s).await?)?;
     let plen = read_u32(s).await?;
     if total == 0 || total > MAX_TRANSFER_SIZE {
-        return Err(proto(format!("0x02 声明大小非法: {total}")));
+        return Err(proto(format!("分块声明大小非法: {total}")));
     }
     if plen as usize > MAX_CHUNK_PAYLOAD as usize {
         return Err(proto(format!("块载荷 {plen} 超过 8MB 上限")));
     }
-    if offset > total || offset + plen as u64 > total {
-        return Err(proto(format!("块区间 [{offset},{}) 越界（total={total}）", offset + plen as u64)));
+    // 越界判定必须先做 checked_add：offset 是对端给的 u64，直接相加在
+    // debug 构建会溢出 panic（release 回绕）——而错误信息里还会再算一次，
+    // 于是"拒绝越界"这条路径自己成了 panic 入口（本轮 F3）。
+    let end = offset
+        .checked_add(plen as u64)
+        .ok_or_else(|| proto(format!("块区间 [{offset},+{plen}) 溢出 u64")))?;
+    if offset > total || end > total {
+        return Err(proto(format!("块区间 [{offset},{end}) 越界（total={total}）")));
     }
     // 流式读入（轮 4 F3）：不按声明预分配整段（read_n_long 会让 40B 帧头
     // 钉住 8MB 提交内存 ×64 闸至 300s 超时）；与 0x00/0x03 同纪律按固定
@@ -413,13 +419,15 @@ where
         opts.chunk_sessions.finish(gid, opts).await?;
         // 组装发布即成功记账（0x02 无独立应答帧；重试收敛于成功不重复入账——
         // 组装后会话保留完成态，重复块/迟到 0x0C 不再触发 finish）。
-        crate::transfer::receiver::record_recv(opts, peer, total, 1, started, "0x02 分块", &name);
+        crate::transfer::receiver::record_recv(opts, peer, total, 1, started, "分块传输", &name);
     }
     Ok(())
 }
 
 /// 0x0C 收尾：回判决字节（会话不存在 → 0x00 + 连接失败）。
-pub(crate) async fn recv_chunk_end<S>(s: &mut S, opts: &RecvOptions) -> Result<()>
+/// 返回判决值：调用方据此判定「是否算一次成功接收」——0x02 中途判决
+/// （INCOMPLETE）不是成功事件（见 receiver 里的计数注释）。
+pub(crate) async fn recv_chunk_end<S>(s: &mut S, opts: &RecvOptions) -> Result<u8>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -427,9 +435,9 @@ where
     let st = opts.chunk_sessions.end_status(gid).await;
     write_u8(s, st).await?;
     if st == STATUS_REJECT {
-        return Err(proto("分块会话不存在（收尾）"));
+        return Err(proto("分块传输已中断（会话已失效）"));
     }
-    Ok(())
+    Ok(st)
 }
 
 /// 0x0B 覆盖率查询：直答合并区间（内存 tracker，规格 §3.1）。
@@ -556,7 +564,7 @@ pub async fn send_file_chunked(
     }
     let size = meta.len();
     if size == 0 {
-        return Err(config_err("0x02 不支持空文件（应回退 0x00）"));
+        return Err(config_err("分块传输不支持空文件（应改为直接发送）"));
     }
     if size > MAX_TRANSFER_SIZE {
         return Err(config_err("文件超过 1 PiB 声明上限"));
@@ -572,7 +580,7 @@ pub async fn send_file_chunked(
     let plan = StackPlan { probe_caps: true, compress: opts.compress };
     let (s0, caps) = connect_stack(addr, opts, plan).await?;
     if caps & crate::protocol::frame::CAP_CHUNKED == 0 {
-        return Err(Error::Unsupported("对端不支持 0x02 分块".into()));
+        return Err(Error::Unsupported("对端不支持分块传输（请升级对端）".into()));
     }
     let ranges = split_ranges(size, connections.clamp(1, 8) as usize);
     let started = std::time::Instant::now();
@@ -607,20 +615,20 @@ pub async fn send_file_chunked(
         }
     }
     if fatal {
-        return Err(Error::Rejected("分块会话丢失（对端逐出/重启），需整组重发".into()));
+        return Err(Error::Rejected("分块传输已中断（对端已清理或重启），需整组重发".into()));
     }
     if !saw_complete {
         for _ in 0..3 {
             if send_complement(addr, &opts2, gid, &name, size, &path2).await? {
                 outcome.finish();
-                crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("0x02 分块（补发）"), &name);
+                crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("分块传输（补发）"), &name);
                 return Ok(());
             }
         }
         return Err(Error::Rejected("分块补发 3 轮仍未覆盖完整文件".into()));
     }
     outcome.finish();
-    crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("0x02 分块×{connections}"), &name);
+    crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("分块传输×{connections}"), &name);
     Ok(())
 }
 
@@ -645,7 +653,7 @@ async fn send_complement(
         // 服务端合并区间 ≤ MAX_MERGED_RANGES（轮 4 P1：恶意接收端一帧
         // 触发 with_capacity(n×16B) ≈ 64GB 分配崩溃）。
         if n > MAX_MERGED_RANGES {
-            return Err(proto("0x0B 应答区间数超上限"));
+            return Err(proto("断点查询应答异常（区间数超上限）"));
         }
         // 整段应答读加 60s 总预算（轮 4 F5）：恶意服务端逐字段 1 字节/29s
         // 可把单任务拖至数天；合法应答（内存直答）远快于此。
@@ -655,14 +663,14 @@ async fn send_complement(
                 let off = read_u64(&mut s).await?;
                 let len = read_u64(&mut s).await?;
                 if len == 0 || len > size.saturating_sub(off) {
-                    return Err(proto("0x0B 应答区间非法"));
+                    return Err(proto("断点查询应答异常（区间非法）"));
                 }
                 ranges.push((off, off + len));
             }
             Ok(ranges)
         })
         .await
-        .map_err(|_| proto("0x0B 应答读取超时（60s 总预算）"))??;
+        .map_err(|_| proto("断点查询应答超时（60 秒）"))??;
         complement_of(&ranges, size)
     } else {
         vec![(0, size)] // 旧对端回退：全量重发（规格 §3.1）
@@ -704,6 +712,27 @@ mod tests {
         assert_eq!(got, vec![(100, 200)]);
         assert!(complement_of(&[], 50).len() == 1);
         assert!(complement_of(&[(0, 50)], 50).is_empty());
+    }
+
+    /// 本轮 F3 判别：offset = u64::MAX 时**必须回 Err**。
+    /// 修复前越界分支在错误信息里再算一次 `offset + plen`——debug 构建溢 panic
+    /// （release 只是回绕），本用例在修复前以 panic 失败。
+    #[tokio::test]
+    async fn oversized_offset_is_refused_without_panic() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[7u8; 16]); // groupId
+        frame.extend_from_slice(&u64::MAX.to_le_bytes()); // offset
+        frame.extend_from_slice(&1024u64.to_le_bytes()); // total
+        frame.extend_from_slice(&5u16.to_le_bytes()); // name len
+        frame.extend_from_slice(b"a.bin");
+        frame.extend_from_slice(&1u32.to_le_bytes()); // plen
+        client.write_all(&frame).await.unwrap();
+        let opts = crate::transfer::receiver::RecvOptions::default();
+        let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let r = recv_chunk_frame(&mut server, peer, &opts).await;
+        assert!(r.is_err(), "越界 offset 必须回 Err（不得溢出 panic / 回绕接受）");
     }
 
     #[test]

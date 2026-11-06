@@ -197,13 +197,13 @@ pub(crate) async fn connect_quic_auth(addr: SocketAddr, opts: &SendOptions) -> R
             Err(Error::AuthRejected(m)) if m.starts_with(LEGACY_DOWNGRADE) => {
                 if !opts.allow_legacy_pair {
                     return Err(Error::AuthRejected(format!(
-                        "{addr}: 对端不支持通道绑定配对（0x0D 被拒）——可能为旧版本，也可能是\
+                        "{addr}: 对端的配对校验方式较旧——可能为旧版本，也可能是\
                          主动中间人降级攻击；确认对端后可用 --allow-legacy-pair 显式放行，\
-                         或使用 --pin 钉扎（fail-closed）"
+                         或使用 --pin 钉扎（默认拒绝）"
                     )));
                 }
                 eprintln!(
-                    "[警告] 对端为旧版本（不支持通道绑定配对），按显式放行回退明文 0x05——该路径不防主动中间人"
+                    "[警告] 对端为旧版本（配对校验方式较旧），已按显式放行回退到明文配对——该路径不防主动中间人"
                 );
                 let mut q2 = connect_quic(addr, opts.quic_pin).await?;
                 authenticate(&mut q2, Some(code)).await?;
@@ -260,7 +260,7 @@ pub(crate) async fn connect_stack(
         match read_u8(&mut s).await? {
             T_COMPRESS_OK => s = Box::new(Compressed::new(s)),
             STATUS_REJECT => {} // 服务端未启用：宽容降级，明文继续
-            other => return Err(proto(format!("压缩协商应答异常: 0x{other:02X}"))),
+            _ => return Err(proto("压缩协商失败（对端应答无法识别）")),
         }
     }
     Ok((s, caps))
@@ -314,7 +314,7 @@ where
     let st = read_u8(s).await?;
     let _ = s.shutdown().await; // 干净收尾：让对端读到 EOF 而非连接重置
     if st != STATUS_OK {
-        return Err(Error::Rejected("接收端拒绝（状态 0x00）".into()));
+        return Err(Error::Rejected("接收端拒绝了本次传输".into()));
     }
     Ok(())
 }
@@ -333,7 +333,7 @@ where
     let st = read_u8(s).await?;
     let _ = s.shutdown().await;
     if st != STATUS_OK {
-        return Err(Error::Rejected("对端拒绝文本（状态 0x00）".into()));
+        return Err(Error::Rejected("对端拒绝接收文本消息".into()));
     }
     Ok(())
 }
@@ -386,7 +386,7 @@ pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Resu
         }
     };
     if res.is_ok() {
-        record_stats(opts, addr, text.as_bytes().len() as u64, 0, started, "0x06 文本", "<文本>");
+        record_stats(opts, addr, text.as_bytes().len() as u64, 0, started, "文本消息", "<文本>");
     }
     res
 }

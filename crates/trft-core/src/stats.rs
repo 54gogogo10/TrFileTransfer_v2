@@ -48,7 +48,7 @@ pub struct StatRecord {
     pub bytes: u64,
     pub files: u32,
     pub secs: u64,
-    /// 模式说明（如 "0x03 续传" / "UDP×2轮"）。
+    /// 模式说明（用户可见文案，如 "续传传输" / "UDP×2轮"；不得写帧码）。
     pub detail: String,
     /// 文件/文件夹名（文本传输为 `<文本>`）。
     pub path: String,
@@ -130,9 +130,47 @@ pub fn parse_line(line: &str) -> Option<StatRecord> {
         .ok()?;
     let (detail, path) = match parts.len() {
         6 => (String::new(), String::new()),
-        _ => (parts[6].to_string(), parts[7..].join("|")),
+        _ => (normalize_detail(parts[6]), parts[7..].join("|")),
     };
     Some(StatRecord { time, dir, peer, bytes, files, secs, detail, path })
+}
+
+/// 历史记录里的传输方式文案归一：
+/// 旧版本把线协议帧码写进了 stats.log（"0x03 续传" 等），用户可见历史里不该出现。
+/// 读入时统一映射成现在的说法，旧日志随下一次重写自然收敛（不改写用户文件）。
+fn normalize_detail(detail: &str) -> String {
+    let d = detail.trim();
+    if d.is_empty() {
+        return String::new();
+    }
+    let mapped = if d == "0x00" {
+        "直接发送"
+    } else if d.starts_with("0x00 skip") {
+        "已存在（跳过）"
+    } else if d.starts_with("0x00 空文件") {
+        "空文件"
+    } else if d.starts_with("0x01 文件夹") {
+        "整夹发送"
+    } else if d.starts_with("0x02 分块（补发）") {
+        "分块传输（补发）"
+    } else if let Some(rest) = d.strip_prefix("0x02 分块×") {
+        return format!("分块传输×{rest}");
+    } else if d.starts_with("0x02 分块") {
+        "分块传输"
+    } else if d.starts_with("0x03 skip") {
+        "已存在（跳过）"
+    } else if d.starts_with("0x03 续传") {
+        "续传传输"
+    } else if d.starts_with("0x03→0x00") {
+        "续传不可用，改为直接发送"
+    } else if d.starts_with("0x04 同步") {
+        "文件夹同步"
+    } else if d.starts_with("0x06 文本") {
+        "文本消息"
+    } else {
+        return detail.to_string();
+    };
+    mapped.to_string()
 }
 
 /// 时间列：Unix 秒 或 C# 旧格式本地时间字符串（"yyyy-MM-dd HH:mm:ss"，手解析——
@@ -237,11 +275,19 @@ pub fn summarize(records: &[StatRecord], now: u64, today_start: u64) -> StatsSum
 
 /// CSV 导出（UTF-8 BOM + 表头；RFC 4180 引号转义）。调用方写入文件。
 pub fn export_csv(records: &[StatRecord]) -> String {
+    /// RFC 4180 转义 + 公式注入防线（本轮 F4）：`path`/`detail` 含对端可控的
+    /// 文件名，以 `= + - @`（及制表/回车）开头时 Excel/LibreOffice 会当公式求值
+    /// ——前置单引号强制按文本解析（DDE/外链公式的经典入口）。
     fn esc(s: &str) -> String {
-        if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-            format!("\"{}\"", s.replace('"', "\"\""))
+        let formula_trigger = matches!(
+            s.chars().next(),
+            Some('=' | '+' | '-' | '@' | '\t' | '\r')
+        );
+        let body = if formula_trigger { format!("'{s}") } else { s.to_string() };
+        if body.contains(',') || body.contains('"') || body.contains('\n') || body.contains('\r') {
+            format!("\"{}\"", body.replace('"', "\"\""))
         } else {
-            s.to_string()
+            body
         }
     }
     let mut out = String::from("\u{feff}时间,方向,IP,字节,文件数,秒,Detail,Path\n");
@@ -277,7 +323,7 @@ mod tests {
             bytes,
             files: 1,
             secs: 1,
-            detail: "0x00".into(),
+            detail: "直接发送".into(),
             path: "a.bin".into(),
         }
     }
@@ -285,13 +331,14 @@ mod tests {
     #[test]
     fn line_roundtrip_and_legacy_six_fields() {
         let r = rec(1700000000, Direction::Send, "192.168.1.5", 12345);
+        // 旧格式行里的帧码在解析时归一成用户文案（见 normalize_detail）。
         let line = format!(
             "{}|S|192.168.1.5|12345|1|1|0x00|a.bin",
             r.time
         );
         let p = parse_line(&line).unwrap();
         assert_eq!(p.bytes, 12345);
-        assert_eq!(p.detail, "0x00");
+        assert_eq!(p.detail, "直接发送", "旧帧码必须归一（历史里不显示 0xNN）");
         // 旧 6 字段行照读。
         let old = "1700000001|R|10.0.0.2|7|1|0";
         let p2 = parse_line(old).unwrap();
@@ -322,14 +369,14 @@ mod tests {
         let p = dir.path().join("stats.log");
         let log = StatsLog::new(p.clone());
         for i in 0..100 {
-            log.record(Direction::Recv, "10.0.0.1", i, 1, 1, "0x00", "f.bin");
+            log.record(Direction::Recv, "10.0.0.1", i, 1, 1, "直接发送", "f.bin");
         }
         assert_eq!(log.load().len(), 100);
         // 压到阈值之上（6000 × ≈420B ≈ 2.5MB > 2MB）→ 重写保留末 5000。
         let big_line = format!("1|S|1.1.1.1|1|1|1|{}|y\n", "x".repeat(400));
         let big: String = big_line.repeat(6000);
         std::fs::write(&p, big).unwrap();
-        log.record(Direction::Recv, "10.0.0.1", 5, 1, 1, "0x00", "f.bin");
+        log.record(Direction::Recv, "10.0.0.1", 5, 1, 1, "直接发送", "f.bin");
         let after = std::fs::read_to_string(&p).unwrap();
         let n = after.lines().count();
         assert!(n <= REWRITE_KEEP + 1, "重写后必须收敛（实际 {n} 行）");
@@ -355,6 +402,20 @@ mod tests {
         assert_eq!(s.by_device[0].peer, "1.1.1.1", "按 count 降序");
     }
 
+    /// 兼容归一：旧 stats.log 写的是帧码，读入时换成用户可读文案，
+    /// 且幂等（新文案原样保留）、不篡改未知文案。
+    #[test]
+    fn legacy_protocol_labels_are_normalized_on_load() {
+        let d = |line: &str| parse_line(line).unwrap().detail;
+        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x03 续传|a.bin"), "续传传输");
+        assert_eq!(d("1700000000|R|127.0.0.1|1|1|1|0x00 skip|a.bin"), "已存在（跳过）");
+        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x02 分块×4|a.bin"), "分块传输×4");
+        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x04 同步|a.bin"), "文件夹同步");
+        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x06 文本|<文本>"), "文本消息");
+        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|续传传输|a.bin"), "续传传输", "幂等");
+        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|UDP×2轮|a.bin"), "UDP×2轮", "不篡改未知文案");
+    }
+
     #[test]
     fn csv_quotes_and_bom() {
         let mut r = rec(1, Direction::Send, "1.1.1.1", 2);
@@ -362,5 +423,24 @@ mod tests {
         let csv = export_csv(&[r]);
         assert!(csv.starts_with('\u{feff}'));
         assert!(csv.contains("\"a,b\"\"c\""), "RFC 4180 转义");
+    }
+
+    /// 本轮 F4 判别：对端可控的文件名以公式前缀开头时，导出必须强制文本。
+    /// 修复前 `=cmd|'/c calc'!A0` 原样落盘 → Excel 打开即求值。
+    #[test]
+    fn csv_neutralizes_formula_prefixes() {
+        for evil in ["=cmd|'/c calc'!A0", "+1+1", "-1+1", "@SUM(1,2)", "\tx"] {
+            let mut r = rec(1, Direction::Recv, "1.1.1.1", 2);
+            r.path = evil.into();
+            let csv = export_csv(&[r]);
+            let last = csv.lines().last().unwrap();
+            assert!(
+                last.ends_with(&format!(",'{evil}")) || last.ends_with(&format!(",\"'{evil}\"")),
+                "公式前缀必须前置单引号（实际: {last}）"
+            );
+        }
+        // 正常文件名不得被加引号（避免污染既有格式）。
+        let r = rec(1, Direction::Recv, "1.1.1.1", 2);
+        assert!(export_csv(&[r]).lines().last().unwrap().ends_with(",a.bin"));
     }
 }

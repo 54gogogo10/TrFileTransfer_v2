@@ -22,8 +22,16 @@ echo [2/3] refresh release artifacts + sha256 sidecars
 copy /y "target\release\trft.exe"          "release\TrFileTransfer-%VERSION%.exe" >nul || goto :fail
 copy /y "target\release\trft-gui.exe"      "release\TrFileTransfer-GUI-%VERSION%.exe" >nul || goto :fail
 copy /y "target\release\trft-server.exe"   "release\TrFileTransfer-server-%VERSION%.exe" >nul || goto :fail
+rem Prefer pwsh: when build.bat is launched from a PowerShell 7 session, PSModulePath
+rem carries PS7 module dirs, and 5.1 then tries to load PS7's Microsoft.PowerShell.Utility
+rem and fails (Get-FileHash becomes "not recognized") while still exiting 0 -- which used
+rem to write a corrupt .sha256 sidecar silently. Keep this file ASCII-only: cmd reads it in
+rem the OEM codepage, and UTF-8 chinese text can desync the parser (GBK trail bytes are ASCII).
+set "PSEXE=powershell"
+where pwsh >nul 2>nul
+if not errorlevel 1 set "PSEXE=pwsh"
 for %%F in ("TrFileTransfer-%VERSION%.exe" "TrFileTransfer-GUI-%VERSION%.exe" "TrFileTransfer-server-%VERSION%.exe") do (
-  powershell -NoProfile -Command "$h=(Get-FileHash -Algorithm SHA256 'release\%%~F').Hash.ToLower(); [IO.File]::WriteAllText('release\%%~F.sha256', \"$h *%%~F\", [Text.UTF8Encoding]::new($false))"
+  %PSEXE% -NoProfile -Command "$ErrorActionPreference='Stop'; try { $h=(Get-FileHash -Algorithm SHA256 'release\%%~F').Hash.ToLower(); [IO.File]::WriteAllText('release\%%~F.sha256', \"$h *%%~F\", [Text.UTF8Encoding]::new($false)) } catch { Write-Error $_; exit 1 }"
   if errorlevel 1 goto :fail
 )
 

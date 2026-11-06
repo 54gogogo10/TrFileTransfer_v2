@@ -119,6 +119,13 @@ impl Drop for PartGuard {
 /// IP 过滤匹配（规格 §3.3）：精确地址、`192.168.1.*` 通配（v4 末段）、CIDR（v4/v6
 /// 前缀位比对，跨族永不匹配）；坏条目不匹配（fail-closed）。
 pub fn ip_match(ip: IpAddr, pattern: &str) -> bool {
+    // 双栈监听（Linux 默认 v6only=0，或 Windows 上显式关掉 V6ONLY）时，IPv4 对端
+    // 以 `::ffff:a.b.c.d` 呈现：先归一到内嵌 IPv4，**与 gate_key 同口径**
+    // （本轮 F7——此前 Allow 模式会把全部 IPv4 拒掉、Deny 模式被 IPv4 整体绕过）。
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V4(_) => ip,
+    };
     let pat = pattern.trim();
     if pat.is_empty() {
         return false;
@@ -738,7 +745,7 @@ where
                     (T_PAIRING, Some(_)) => {
                         reject_pairing(
                             &mut s,
-                            format!("{peer}: QUIC 配对必须使用通道绑定证明（0x0D，旧版对端请升级）"),
+                            format!("{peer}: QUIC 通道的配对校验方式不兼容（旧版对端请升级）"),
                         )
                         .await?;
                     }
@@ -865,7 +872,7 @@ where
                 }
                 eprintln!("[文本] 来自 {peer}: {text}");
                 write_u8(&mut s, STATUS_OK).await?;
-                record_recv(opts, peer, text.as_bytes().len() as u64, 0, t0, "0x06 文本", "<文本>");
+                record_recv(opts, peer, text.as_bytes().len() as u64, 0, t0, "文本消息", "<文本>");
                 *handled += 1;
             }
             T_CHUNKED if opts.enable_chunked => {
@@ -882,8 +889,13 @@ where
                     return Err(e);
                 }
                 // 收尾判决由 handler 直答（0x01/0x02），会话不存在回 0x00 + 连接失败。
-                chunked::recv_chunk_end(&mut s, opts).await?;
-                *handled += 1;
+                // 只把「已组装完成」（0x01）计为一次成功：0x02 是「还没覆盖完」的
+                // 中途判决，多连接并行时每条连接各发一次 0x0C——旧实现把首个
+                // INCOMPLETE 也计入 --count，`recv --count 1` 会在收到第一个分片后
+                // 退出，发送端被 RST、落盘只剩 .trft-part（实测复现）。
+                if chunked::recv_chunk_end(&mut s, opts).await? == STATUS_OK {
+                    *handled += 1;
+                }
             }
             T_COVERAGE_QUERY if opts.enable_chunked => {
                 // 覆盖率查询：内存 tracker 直答合并区间（规格 §3.1）。
@@ -915,7 +927,9 @@ where
             }
             other => {
                 write_u8(&mut s, STATUS_REJECT).await?;
-                return Err(proto(format!("未知帧类型 0x{other:02X}")));
+                // 对端发了本端不认识的数据：只报「无法识别」，不把帧码写进用户可见错误。
+                let _ = other;
+                return Err(proto("对端数据无法识别（协议版本可能不兼容）"));
             }
         }
         // --count 语义按帧粒度收口：达标即收尾，杜绝单连接超收。
@@ -996,7 +1010,7 @@ where
     let claimed: [u8; 32] = read_n(s, 32).await?.try_into().unwrap();
     let actual = dig.finalize();
     if actual != claimed {
-        return Err(proto("SHA-256 不一致，已丢弃半成品"));
+        return Err(proto("校验不一致，未完成的文件已删除"));
     }
     drop(out);
 
@@ -1024,7 +1038,7 @@ where
             outcome.finish();
             // skip 也是免费填充点（现有文件哈希已被证实——规格 §3.1 免费填充路径）。
             resume::fill_cache_at(opts, &dest, size, actual).await;
-            record_recv(opts, peer, 0, 1, started, "0x00 skip", &name);
+            record_recv(opts, peer, 0, 1, started, "已存在（跳过）", &name);
             return Ok(()); // 新副本丢弃（guard 兜底删除 part）
         }
     }
@@ -1035,7 +1049,7 @@ where
     resume::fill_cache_at(opts, &final_dest, size, actual).await;
     eprintln!("[接收] {name} → {}", final_dest.display());
     outcome.finish();
-    record_recv(opts, peer, size, 1, started, "0x00", &name);
+    record_recv(opts, peer, size, 1, started, "直接发送", &name);
     Ok(())
 }
 
@@ -1183,6 +1197,24 @@ mod tests {
         assert!(!ip_allowed(ip, FilterMode::Allow, &[]));
         assert!(!ip_allowed(ip, FilterMode::Deny, &list));
         assert!(ip_allowed(ip, FilterMode::Deny, &[]));
+    }
+
+    /// 本轮 F7 判别：双栈监听下 IPv4 对端以 `::ffff:a.b.c.d` 呈现，过滤规则
+    /// 必须与 `gate_key` 同口径归一。修复前 Allow 模式把 IPv4 全拒（可用性），
+    /// Deny 模式被 IPv4 整体绕过（安全性）。
+    #[test]
+    fn ip_filter_normalizes_ipv4_mapped() {
+        use crate::config::FilterMode;
+        let mapped: IpAddr = "::ffff:192.168.1.5".parse().unwrap();
+        assert!(ip_match(mapped, "192.168.1.5"), "精确规则必须命中 mapped 对端");
+        assert!(ip_match(mapped, "192.168.1.0/24"), "CIDR 规则必须命中 mapped 对端");
+        assert!(ip_match(mapped, "192.168.1.*"), "通配规则必须命中 mapped 对端");
+        assert!(ip_allowed(mapped, FilterMode::Allow, &["192.168.1.0/24".to_string()]));
+        assert!(!ip_allowed(mapped, FilterMode::Deny, &["192.168.1.0/24".to_string()]));
+        // 真 IPv6 不受影响。
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        assert!(ip_match(v6, "fe80::/16"));
+        assert!(!ip_match(v6, "192.168.1.0/24"), "跨族仍不匹配");
     }
 
     #[tokio::test]

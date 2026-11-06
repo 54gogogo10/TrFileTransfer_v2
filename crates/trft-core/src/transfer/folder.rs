@@ -85,7 +85,7 @@ pub async fn send_folder_auto(addr: SocketAddr, root: &Path, opts: &SendOptions)
         Err(e) => match &e {
             Error::Config(_) | Error::AuthRejected(_) | Error::Unsupported(_) => Err(e),
             _ => {
-                eprintln!("[重试] 文件夹 0x01 失败（{e}），转 0x04 差量续传");
+                eprintln!("[重试] 整夹发送失败（{e}），改用差量同步");
                 let sid = resume::stable_session_id(root, &addr.to_string());
                 resume::send_folder_resume(addr, root, opts, sid, Some(&cache)).await
             }
@@ -139,7 +139,7 @@ async fn send_folder_inner(
         Ok((bytes, count)) => {
             outcome.finish();
             // 发送侧统计（轮 1：0x01 此前漏记——接收侧有记而发送侧缺席）。
-            crate::transfer::sender::record_stats(opts, addr, *bytes, *count, started, "0x01 文件夹", &root_name);
+            crate::transfer::sender::record_stats(opts, addr, *bytes, *count, started, "整夹发送", &root_name);
         }
         Err(_) => {}
     }
@@ -207,7 +207,7 @@ where
     let st = read_u8(s).await?;
     let _ = s.shutdown().await;
     if st != STATUS_OK {
-        return Err(Error::Rejected("接收端拒绝文件夹（状态 0x00）".into()));
+        return Err(Error::Rejected("接收端拒绝了文件夹传输".into()));
     }
     Ok((sent_bytes, files.len() as u32))
 }
@@ -307,7 +307,7 @@ where
             recv_files += 1;
         }
     }
-    crate::transfer::receiver::record_recv(opts, peer, recv_bytes, recv_files, started, "0x01 文件夹", &root_name);
+    crate::transfer::receiver::record_recv(opts, peer, recv_bytes, recv_files, started, "整夹发送", &root_name);
     eprintln!("[接收] 文件夹 {root_name}（{count} 个文件）→ {}", base.display());
     Ok(())
 }

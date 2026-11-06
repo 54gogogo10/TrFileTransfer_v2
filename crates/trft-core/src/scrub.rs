@@ -35,16 +35,52 @@ impl VerifyReport {
     }
 }
 
+/// 目录递归深度上限（与 `cleanup_part_orphans` 的 6 不同：校验要覆盖深目录树，
+/// 只作为**防环**兜底——配合"不进入链接目录"一起封死 junction 环导致的栈溢出）。
+const MAX_SCAN_DEPTH: u32 = 32;
+
 /// 收集待校验文件（先全量走一遍：GUI 进度条需要总数；不可读目录计一次 unreadable）。
-fn collect(root: &Path, out: &mut Vec<PathBuf>, unreadable: &mut u64) {
+/// 本轮 F8：此前用 `p.is_dir()`（跟随链接）且无深度上限——目录联接成环时
+/// `collect` 无限递归直到栈溢出。现改为 `file_type()` 不跟随链接：真目录才递归，
+/// 链接按"指向文件则校验、指向目录则跳过"处理。
+fn collect(
+    root: &Path,
+    depth: u32,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+    unreadable: &mut u64,
+) {
+    if depth > MAX_SCAN_DEPTH {
+        *unreadable += 1;
+        return;
+    }
+    // 目录环（junction 回指祖先）第二道防线：按真实路径去重，已走过的目录不再进入。
+    if let Ok(canon) = std::fs::canonicalize(root) {
+        if !visited.insert(canon) {
+            return;
+        }
+    }
     let Ok(rd) = std::fs::read_dir(root) else {
         *unreadable += 1;
         return;
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            collect(&p, out, unreadable);
+        let Ok(ft) = e.file_type() else {
+            *unreadable += 1;
+            continue;
+        };
+        if ft.is_symlink() {
+            // 链接不进入递归（目录联接环的唯一入口）；指向文件的链接仍需校验。
+            match std::fs::metadata(&p) {
+                Ok(m) if m.is_dir() => continue,
+                Ok(_) => out.push(p),
+                Err(_) => *unreadable += 1,
+            }
+            continue;
+        }
+        if ft.is_dir() {
+            collect(&p, depth + 1, visited, out, unreadable);
         } else if !e.file_name().to_str().map(crate::hashcache::is_cache_artifact).unwrap_or(false) {
             out.push(p);
         }
@@ -62,7 +98,8 @@ pub fn verify_dir(
 ) -> VerifyReport {
     let mut report = VerifyReport::default();
     let mut files = Vec::new();
-    collect(dir, &mut files, &mut report.unreadable);
+    let mut visited = std::collections::HashSet::new();
+    collect(dir, 0, &mut visited, &mut files, &mut report.unreadable);
     let total = files.len() as u64;
 
     // 排序保证确定性（目录枚举顺序不定）。
@@ -150,6 +187,34 @@ mod tests {
         assert_eq!(r2.hit, 2);
         assert_eq!(r2.fresh, 0);
         assert_eq!(r2.mismatches, vec!["a.txt".to_string()], "不一致必须点名");
+    }
+
+    /// 本轮 F8 判别：目录联接（junction）回指祖先时不得无限递归。
+    /// 修复前 `p.is_dir()` 跟随链接 + 无深度上限 → 栈溢出（测试进程直接崩）。
+    /// 环境不支持 junction（非 NTFS / 权限不足）时跳过，不误报。
+    #[test]
+    fn junction_cycle_does_not_recurse_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(sub.join("loop"))
+            .arg(dir.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let made = false;
+        if !made {
+            return; // 环境不支持目录联接
+        }
+        let cache_path = cache_file_for(dir.path());
+        let mut cache = HashCache::load(&cache_path, 0);
+        let r = verify_dir(dir.path(), &mut cache, None, None);
+        assert_eq!(r.scanned, 1, "联接环不得重复扫描（只应有 a.txt 一个文件）");
     }
 
     #[test]

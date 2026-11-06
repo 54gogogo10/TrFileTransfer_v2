@@ -1613,7 +1613,8 @@ async function wireEvents() {
   await listen("trft://firewall-hint", (ev) => {
     const p = ev.payload;
     toast(t("firewall_msg") + " " + p.command, "warn", t("copy"), () => navigator.clipboard.writeText(p.command));
-    log("warn", "netsh: " + p.command);
+    // 日志只写「需要放行防火墙」，原始命令留在可复制的 toast 里（不把实现细节写进日志）。
+    log("warn", t("firewall_msg"));
   });
   await listen("trft://log", (ev) => log(ev.payload.level, ev.payload.message));
   await listen("trft://confirm", (ev) => {
@@ -1664,6 +1665,10 @@ function setLang(v) {
   applyLang();
   renderQueue();
   renderAddrDropdowns();
+  // 动态渲染的列表不在 data-i18n 覆盖范围内：语言切换后必须重渲染，
+  // 否则中英混排（实机测试：按设备行残留「5 文件」/ 统计历史仍是旧文案）。
+  refreshStats();
+  reloadDevices();
   if (revalidateFields) revalidateFields(); // ToolTip 文案随语言刷新
   // 轮 7 F11：即时持久化（与 qr-address 一致）——否则关窗保存的 cfg 不含
   // 本次改动，重启丢语言。

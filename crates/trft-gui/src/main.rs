@@ -5,9 +5,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
-mod state;
-mod tray;
+use trft_gui::{commands, state, tray};
 
 use state::AppState;
 use tauri::Manager;
@@ -172,17 +170,32 @@ fn webview2_check() -> bool {
 /// 在线用户应使用单 exe 主版本（Evergreen 持续跟进微软补丁）。
 #[cfg(windows)]
 fn use_portable_webview2() -> bool {
-    if std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some() {
-        return true; // 外部显式指定优先（运维覆盖口），视同已就绪
+    let env_set = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some();
+    let detected = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent().and_then(|dir| detect_portable_runtime(dir, env_set))
+    });
+    match detected {
+        Some(dir) => {
+            std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", dir);
+            true
+        }
+        // 外部已显式指定时视同已就绪（运维覆盖口）——不覆盖、不引导下载。
+        None => env_set,
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
-    let Some(dir) = exe.parent().map(|d| d.join("WebView2Runtime")) else { return false };
-    if dir.join("msedgewebview2.exe").is_file() {
-        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &dir);
-        true
-    } else {
-        false
+}
+
+/// 纯函数（tests 钉住三态）：判别 exe 旁的固定版运行时。
+/// `env_already_set` = 外部已显式指定环境变量 → None（不覆盖）。
+#[cfg(windows)]
+fn detect_portable_runtime(
+    exe_dir: &std::path::Path,
+    env_already_set: bool,
+) -> Option<std::path::PathBuf> {
+    if env_already_set {
+        return None;
     }
+    let dir = exe_dir.join("WebView2Runtime");
+    (dir.join("msedgewebview2.exe").is_file()).then_some(dir)
 }
 
 /// 原生 MessageBoxW（是/否）。true = 用户选择「是」。
@@ -202,4 +215,45 @@ fn message_box(text: &str, caption: &str) -> bool {
         )
     };
     r == IDYES
+}
+
+#[cfg(all(test, windows))]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn portable_detected_when_marker_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("WebView2Runtime")).unwrap();
+        std::fs::write(dir.path().join("WebView2Runtime").join("msedgewebview2.exe"), b"").unwrap();
+        assert_eq!(
+            detect_portable_runtime(dir.path(), false).as_deref(),
+            Some(dir.path().join("WebView2Runtime").as_path()),
+            "标记文件在 → 判定为固定版运行时"
+        );
+    }
+
+    #[test]
+    fn absent_or_incomplete_marker_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_portable_runtime(dir.path(), false), None, "无文件夹 ≠ 便携版");
+        std::fs::create_dir_all(dir.path().join("WebView2Runtime")).unwrap();
+        assert_eq!(
+            detect_portable_runtime(dir.path(), false),
+            None,
+            "空文件夹不算（判别标记 = msedgewebview2.exe）"
+        );
+    }
+
+    #[test]
+    fn explicit_env_wins_over_portable_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("WebView2Runtime")).unwrap();
+        std::fs::write(dir.path().join("WebView2Runtime").join("msedgewebview2.exe"), b"").unwrap();
+        assert_eq!(
+            detect_portable_runtime(dir.path(), true),
+            None,
+            "外部显式指定时不覆盖（运维覆盖口）"
+        );
+    }
 }

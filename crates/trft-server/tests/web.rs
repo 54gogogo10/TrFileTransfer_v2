@@ -285,6 +285,39 @@ async fn upload_rejects_bad_name_and_oversize() {
     assert!(leftover.is_empty(), "上传失败路径不得残留: {:?}", leftover.iter().map(|e| e.file_name()).collect::<Vec<_>>());
 }
 
+/// 回归（GUI 实机测试发现）：在共享根目录上传后，303 跳转目标必须是 `/`。
+/// 修复前统一拼 `/view/{path}`，根源时得到 `/view/` —— axum 的 `{*path}`
+/// 通配要求至少一段，`/view/` 不匹配任何路由 → 浏览器落到 404 空白页。
+#[tokio::test]
+async fn root_upload_redirects_to_root_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
+    let boundary = "XyZZy";
+    let body = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"root.txt\"\r\n\r\nhello\r\n--{boundary}--\r\n"
+    );
+    let res = send(
+        app.clone(),
+        req_with(
+            "POST",
+            "/up/",
+            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            body.into_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        res.headers().get(header::LOCATION).unwrap(),
+        "/",
+        "根目录上传后必须回根列表（/view/ 会 404）"
+    );
+    assert_eq!(send(app, req("GET", "/")).await.status(), StatusCode::OK);
+    // 修复前的坏目标确实是 404（钉住问题形态，防再次引入）。
+    let app2 = trft_server::build_router(state_open(dir.path().to_path_buf()));
+    assert_eq!(send(app2, req("GET", "/view/")).await.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn upload_conflict_gets_suffixed_name() {
     let dir = tempfile::tempdir().unwrap();

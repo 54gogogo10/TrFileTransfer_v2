@@ -231,12 +231,12 @@ where
     let claimed: [u8; 32] = read_n(s, 32).await?.try_into().expect("32 字节哈希");
     if size == 0 || size > MAX_TRANSFER_SIZE {
         reply_nego(s, STATUS_REJECT, 0).await?;
-        return Err(proto(format!("0x03 拒绝空文件或超限声明（size={size}）")));
+        return Err(proto(format!("续传声明非法（大小 {size}）")));
     }
     let started = std::time::Instant::now();
     if declared > size {
         reply_nego(s, STATUS_REJECT, 0).await?;
-        return Err(proto(format!("0x03 声明偏移 {declared} 超出文件大小 {size}")));
+        return Err(proto(format!("续传偏移 {declared} 超出文件大小 {size}")));
     }
 
     // 进度：注册后任何失败路径经 Outcome 上报 failed；skip 是零传输成功。
@@ -256,7 +256,7 @@ where
                     reply_nego(s, NEGO_SKIP, 0).await?;
                     fill_cache_at(opts, &dest, size, claimed).await;
                     outcome.finish();
-                    record_recv(opts, peer, 0, 1, started, "0x03 skip", &name);
+                    record_recv(opts, peer, 0, 1, started, "已存在（跳过）", &name);
                     return Ok(());
                 }
             }
@@ -300,7 +300,7 @@ where
             .create_new(true)
             .open(&part)
             .await
-            .map_err(|e| proto(format!("创建续传半成品失败: {e}")))?;
+            .map_err(|e| proto(format!("创建续传临时文件失败: {e}")))?;
         write_meta(Path::new(&meta_path), size, &claimed)?;
         offset = 0;
     }
@@ -347,7 +347,7 @@ where
     if actual != claimed || actual != trailing {
         // 规格 §3.1：不一致删除文件；失配自愈由客户端作废缓存摘要后重试。
         remove_resume_files(&part);
-        return Err(proto("0x03 整文件 SHA-256 不一致，半成品已删除"));
+        return Err(proto("续传校验失败（SHA-256 不一致），未完成的文件已删除"));
     }
     // 收尾硬校验（轮 4 P0 纵深）：半成品长度必须 == 声明 size——
     // 短文件（如声明巨大只收到零星字节却哈希命中空内容）不得发布。
@@ -356,7 +356,7 @@ where
         if plen != size {
             remove_resume_files(&part);
             return Err(proto(format!(
-                "0x03 半成品长度 {plen} ≠ 声明 {size}，拒绝发布（fail-closed）"
+                "续传文件长度 {plen} 与声明 {size} 不一致，已拒绝"
             )));
         }
     }
@@ -368,7 +368,7 @@ where
     fill_cache_at(opts, &final_dest, size, claimed).await;
     eprintln!("[接收] 续传 {name}（自 {offset}）→ {}", dest.display());
     outcome.finish();
-    record_recv(opts, peer, size - offset, 1, started, "0x03 续传", &name);
+    record_recv(opts, peer, size - offset, 1, started, "续传传输", &name);
     Ok(())
 }
 
@@ -473,7 +473,7 @@ where
         outcome.finish();
         recv_bytes += size;
     }
-    record_recv(opts, peer, recv_bytes, to_receive as u32, started, "0x04 同步", &root_name);
+    record_recv(opts, peer, recv_bytes, to_receive as u32, started, "文件夹同步", &root_name);
     eprintln!("[接收] 文件夹同步 {root_name}（{to_receive}/{count} 个文件）→ {}", base.display());
     Ok(())
 }
@@ -520,7 +520,7 @@ where
     let actual = dig.finalize();
     let claimed: [u8; 32] = read_n(s, 32).await?.try_into().expect("32 字节哈希");
     if actual != claimed {
-        return Err(proto(format!("{file_name}: SHA-256 不一致，已丢弃半成品")));
+        return Err(proto(format!("{file_name}: 校验不一致，未完成的文件已删除")));
     }
     std::mem::forget(guard); // 守卫职责移交调用方
     Ok((part, actual))
@@ -559,7 +559,7 @@ where
             match st {
                 STATUS_OK => {
                     if off > size {
-                        return Err(proto(format!("0x10 应答偏移 {off} 超出文件大小 {size}")));
+                        return Err(proto(format!("续传协商偏移 {off} 超出文件大小 {size}")));
                     }
                     Ok(ResumeNego::Proceed(off))
                 }
@@ -568,7 +568,7 @@ where
             }
         }
         STATUS_REJECT => Ok(ResumeNego::Unsupported),
-        other => Err(proto(format!("0x03 应答异常: 0x{other:02X}"))),
+        _ => Err(proto("续传协商失败（对端应答无法识别）")),
     }
 }
 
@@ -588,7 +588,7 @@ async fn send_resume_once(
     // 能力探询先行：旧对端短路（不发 0x03 头），同时为压缩协商开路。
     let (mut s, caps) = connect_stack(addr, opts, StackPlan { probe_caps: true, compress: opts.compress }).await?;
     if caps & crate::protocol::frame::CAP_RESUME_FILE == 0 {
-        return Err(Error::Unsupported("对端不支持 0x03 续传".into()));
+        return Err(Error::Unsupported("对端不支持续传（请升级对端）".into()));
     }
     write_u8(&mut s, T_RESUME_FILE).await?;
     write_str_u16(&mut s, &name).await?;
@@ -605,7 +605,7 @@ async fn send_resume_once(
             let _ = s.shutdown().await;
             return Ok(0); // 零传输命中
         }
-        ResumeNego::Unsupported => return Err(Error::Unsupported("对端不支持 0x03 续传".into())),
+        ResumeNego::Unsupported => return Err(Error::Unsupported("对端不支持续传（请升级对端）".into())),
         ResumeNego::Rejected(m) => return Err(Error::Rejected(m)),
         ResumeNego::Proceed(offset) => {
             // 从服务端权威偏移起流式发送（完整哈希已在建连前算完——规格 §3.1）。
@@ -628,7 +628,7 @@ async fn send_resume_once(
             let st = read_u8(&mut s).await?;
             let _ = s.shutdown().await;
             if st != STATUS_OK {
-                return Err(Error::Rejected("接收端拒绝（状态 0x00）".into()));
+                return Err(Error::Rejected("接收端拒绝了本次传输".into()));
             }
             return Ok(size - offset);
         }
@@ -652,7 +652,7 @@ pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -
             .unwrap_or_default();
         let r = crate::transfer::sender::send_file(addr, path, opts).await;
         if r.is_ok() {
-            crate::transfer::sender::record_stats(opts, addr, 0, 1, started0, "0x00 空文件", &name0);
+            crate::transfer::sender::record_stats(opts, addr, 0, 1, started0, "空文件", &name0);
         }
         return r;
     }
@@ -675,7 +675,7 @@ pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -
                     r.finish();
                 }
                 let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                crate::transfer::sender::record_stats(opts, addr, sent_bytes, 1, started, "0x03 续传", &name);
+                crate::transfer::sender::record_stats(opts, addr, sent_bytes, 1, started, "续传传输", &name);
                 return Ok(());
             }
             Err(Error::Unsupported(_)) => {
@@ -683,7 +683,7 @@ pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -
                 let r = crate::transfer::sender::send_file(addr, path, opts).await;
                 if r.is_ok() {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    crate::transfer::sender::record_stats(opts, addr, size, 1, started, "0x03→0x00 降级", &name);
+                    crate::transfer::sender::record_stats(opts, addr, size, 1, started, "续传不可用，改为直接发送", &name);
                 }
                 return r;
             }
@@ -730,7 +730,7 @@ pub async fn send_folder_resume(
         // 轮 4 P3-6：客户端/服务端上限不一致（1,000,000 vs 100,000）——
         // 合法大目录整单被拒且无降级，预检给出可读错误。
         return Err(config_err(format!(
-            "文件夹含 {} 个文件，超过 0x04 清单上限 {MAX_MANIFEST_FILES}（可改用整夹发送 0x01）",
+            "文件夹含 {} 个文件，超过同步清单上限 {MAX_MANIFEST_FILES}（可改用整夹发送）",
             files.len()
         )));
     }
@@ -739,7 +739,7 @@ pub async fn send_folder_resume(
     let plan = StackPlan { probe_caps: true, compress: opts.compress };
     let (mut s, caps) = connect_stack(addr, opts, plan).await?;
     if caps & crate::protocol::frame::CAP_RESUME_FOLDER == 0 {
-        return Err(Error::Unsupported("对端不支持 0x04 文件夹续传/同步".into()));
+        return Err(Error::Unsupported("对端不支持文件夹同步（请升级对端）".into()));
     }
 
     // 清单：rel + size + (可选哈希)。哈希仅取自发送端缓存命中（免费）。
@@ -780,7 +780,8 @@ pub async fn send_folder_resume(
     // （冷缓存大库静默数分钟，规格 §6.1；轮 1 F4）。
     let first = read_u8_long(&mut s).await?;
     if first != R_MANIFEST {
-        return Err(proto(format!("0x11 应答异常: 0x{first:02X}")));
+        let _ = first;
+        return Err(proto("同步清单应答异常（对端数据无法识别）"));
     }
     let bitmap = read_n(&mut s, files.len().div_ceil(8)).await?;
 
@@ -837,12 +838,12 @@ pub async fn send_folder_resume(
         if let Some(r) = &opts.progress {
             r.fail();
         }
-        return Err(Error::Rejected("接收端拒绝文件夹同步（状态 0x00）".into()));
+        return Err(Error::Rejected("接收端拒绝了文件夹同步".into()));
     }
     if let Some(r) = &opts.progress {
         r.finish();
     }
-    crate::transfer::sender::record_stats(opts, addr, sent_bytes, sent, started, "0x04 同步", &root_name);
+    crate::transfer::sender::record_stats(opts, addr, sent_bytes, sent, started, "文件夹同步", &root_name);
     eprintln!("[发送] 同步 {root_name}：发送 {sent}/{} 个文件", metas.len());
     Ok(())
 }

@@ -185,7 +185,7 @@ pub struct SendRequest {
 }
 
 impl SendRequest {
-    fn display_name(&self) -> String {
+    pub fn display_name(&self) -> String {
         match (&self.path, &self.text) {
             (Some(p), _) => PathBuf::from(p)
                 .file_name()
@@ -274,6 +274,9 @@ fn register_task_checked(
 }
 
 /// 发送任务公共收尾：终态事件 + 已知设备记忆（规格 §3.3）+ 可选系统通知。
+/// `done`：队列等待用的结果通道（命令入口传 None）。**成败判定必须走它**——
+/// 任务句柄从 `tasks` 表消失只代表"结束了"，与"成功"无关（本轮 F1：
+/// 队列据此把失败当成功、重试永不触发、全失败仍执行完成后动作）。
 async fn settle_send(
     app: tauri::AppHandle,
     id: u64,
@@ -281,6 +284,7 @@ async fn settle_send(
     res: Result<(), trft_core::error::Error>,
     peer: Option<(String, u16, &'static str, bool)>,
     settled: Option<&std::sync::atomic::AtomicBool>,
+    done: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) {
     let notify = {
         let st = app.state::<AppState>();
@@ -295,8 +299,9 @@ async fn settle_send(
         cfg.notify_enabled
     };
     update_awake(&app);
-    let ok = res.is_ok();
-    update_awake(&app);
+    // 结果只在此处成型一次：事件/通知/队列回报共用同一判据。
+    let done_res: Result<(), String> = res.map_err(|e| e.to_string());
+    let ok = done_res.is_ok();
     if ok {
         if let Some((ip, port, proto, needs_pairing)) = peer {
             // 规格 §3.3：传输成功记入已知设备（core DeviceStore 写穿持久化）。
@@ -313,7 +318,7 @@ async fn settle_send(
     }
     let _ = app.emit(
         "trft://task",
-        serde_json::json!({ "id": id, "ok": ok, "error": res.as_ref().err().map(|e| e.to_string()) }),
+        serde_json::json!({ "id": id, "ok": ok, "error": done_res.as_ref().err() }),
     );
     if notify {
         use tauri_plugin_notification::NotificationExt;
@@ -321,13 +326,28 @@ async fn settle_send(
         let _ = if ok {
             n.body("传输完成").show()
         } else {
-            n.body(format!("失败: {}", res.err().map(|e| e.to_string()).unwrap_or_default())).show()
+            n.body(format!("失败: {}", done_res.as_ref().err().map(String::as_str).unwrap_or(""))).show()
         };
+    }
+    if let Some(tx) = done {
+        let _ = tx.send(done_res); // 接收端已丢弃（命令入口）时静默失败
     }
 }
 
 #[tauri::command]
 pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, String> {
+    // 命令入口不消费结果（前端靠 trft://task 事件）：接收端立即丢弃，
+    // settle_send 的 send 静默失败即可。
+    let (id, _done) = spawn_send(app, req).await?;
+    Ok(id)
+}
+
+/// 发送任务启动实体（send_start 的正文）：额外交出结果接收端——
+/// 队列必须凭真实结果判定成败（F1），不能凭"任务从表里消失"。
+async fn spawn_send(
+    app: tauri::AppHandle,
+    req: SendRequest,
+) -> Result<(u64, tokio::sync::oneshot::Receiver<Result<(), String>>), String> {
     let name = req.display_name();
     let (ptx, prx) = mpsc::unbounded_channel();
     forward_progress(app.clone(), prx);
@@ -355,6 +375,7 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
     let name2 = name.clone();
     let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled2 = settled.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let handle = tauri::async_runtime::spawn(async move {
         let res = match req.kind.as_str() {
             "file" => {
@@ -405,7 +426,7 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
         };
         let peer_proto = if req.proto == Proto::Udt { "udt" } else { "tcp" };
         let peer = Some((req.ip.clone(), req.port, peer_proto, req.code.is_some()));
-        settle_send(app2, id, name2, res, peer, Some(&settled2)).await;
+        settle_send(app2, id, name2, res, peer, Some(&settled2), Some(done_tx)).await;
     });
     // 子任务先于注册收尾的补偿摘除（轮 3 P1-1）；insert+读取同临界区（轮 3 F6）。
     if register_task_checked(&app, id, handle, Some(progress_id), &settled) {
@@ -413,7 +434,7 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
     }
     update_awake(&app);
     let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": progress_id }));
-    Ok(id)
+    Ok((id, done_rx))
 }
 
 /// 0x02 并行分块（Unsupported 自动回退 0x03 续传——规格 §3.6）。
@@ -469,7 +490,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
         };
         let peer_proto = if req.proto == Proto::Udt { "udt" } else { "tcp" };
         let peer = Some((req.ip.clone(), req.port, peer_proto, req.code.is_some()));
-        settle_send(app2, id, name2, res, peer, Some(&settled2)).await;
+        settle_send(app2, id, name2, res, peer, Some(&settled2), None).await;
     });
     if register_task_checked(&app, id, handle, Some(first_progress_id), &settled) {
         finish_task(&app, id, None);
@@ -560,6 +581,16 @@ pub async fn send_queue(
         // 自摘除（轮 3 P1-2：queue 任务此前永驻 tasks 表——防睡眠计数泄漏）。
         finish_task(&app2, id, Some(&settled2));
         // 完成后动作（确认弹窗已在队列启动前完成——规格 §3.2）。
+        // 全失败时不得执行：F1 修复前 ok_n 恒等于项数，"全部失败 → 关机" 会照常发生。
+        if ok_n == 0 {
+            if after_done.is_some() {
+                let _ = app2.emit(
+                    "trft://log",
+                    serde_json::json!({ "level": "warn", "message": "队列全部失败，已跳过完成后动作" }),
+                );
+            }
+            return;
+        }
         match after_done.as_deref() {
             Some("shutdown") => {
                 let mut c = std::process::Command::new("cmd");
@@ -589,22 +620,18 @@ pub async fn send_queue(
     Ok(id)
 }
 
+/// 队列单条执行：**等真实结果**（成功 / 失败 / 超时），不再轮询任务表。
+/// 旧实现以"任务从 tasks 表消失"当成功——而 settle_send 无论成败都会摘表，
+/// 于是重试恒不触发、失败恒被计成完成、全失败仍执行完成后动作（关机/休眠）。
+const QUEUE_ITEM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 async fn run_single_send(app: tauri::AppHandle, req: SendRequest) -> Result<(), String> {
-    let app2 = app.clone();
-    match send_start(app, req).await {
-        Ok(id) => {
-            // 等待该任务终态（轮询注册表足够——任务完成即自我移除）。
-            loop {
-                {
-                    let st = app2.state::<AppState>();
-                    if !st.tasks.lock().expect("任务锁").contains_key(&id) {
-                        return Ok(());
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            }
-        }
-        Err(e) => Err(e),
+    let (_id, done) = spawn_send(app, req).await?;
+    match tokio::time::timeout(QUEUE_ITEM_TIMEOUT, done).await {
+        Ok(Ok(res)) => res,
+        // 发送端被 abort/进程收尾：通道断开 = 结果未知，按失败处理（判错方向）。
+        Ok(Err(_)) => Err("传输任务未回报结果（被取消或异常结束）".into()),
+        Err(_) => Err("等待传输结果超时（24 小时）".into()),
     }
 }
 
@@ -678,7 +705,7 @@ pub async fn sync_start(
     let handle = tauri::async_runtime::spawn(async move {
         let res = send_folder_resume(addr, &path, &opts, session, cache.as_ref()).await;
         let peer = Some((ip.to_string(), port, if proto == Proto::Udt { "udt" } else { "tcp" }, code.is_some()));
-        settle_send(app2, id, name2, res, peer, Some(&settled2)).await;
+        settle_send(app2, id, name2, res, peer, Some(&settled2), None).await;
     });
     if register_task_checked(&app, id, handle, Some(progress_id), &settled) {
         finish_task(&app, id, None);
@@ -1334,7 +1361,7 @@ fn manifest_url(app: &tauri::AppHandle) -> Result<String, String> {
     app.state::<AppState>()
         .config()
         .update_url
-        .ok_or_else(|| "未配置更新源（设置 → UpdateUrl）".to_string())
+        .ok_or_else(|| "未配置更新源（设置 → 清单 URL）".to_string())
 }
 
 // ============ 桌面集成 ============
@@ -1830,7 +1857,9 @@ pub fn text_history_clear() -> Result<(), String> {
 // camelCase 与前端 persistQueue 的键对齐（fec_parity ↔ fecParity、src_port ↔ srcPort）。
 // 无此改名时 serde 对缺失的 Option 字段静默给 None——队列 UDP 三参数跨重启持久化
 // 实际在丢（轮 7 F2 只修了执行路径 SendRequest，持久化路径漏网；本轮对齐补齐）。
-#[derive(serde::Deserialize, Default)]
+// 两套对齐逻辑（serde 改名 ↔ 手工行解析的手写 JSON 键）由 tests/queue_format.rs
+// 的 round-trip 与键对齐测试互锁——历史两次事故（tab 分割、camelCase 静默 None）皆在此层。
+#[derive(serde::Deserialize, Default, PartialEq, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItem {
     pub kind: String,
@@ -1855,11 +1884,43 @@ fn queue_path() -> PathBuf {
     trft_core::config::app_data_dir().join("queue.txt")
 }
 
-#[tauri::command]
-pub fn queue_load() -> Vec<serde_json::Value> {
-    let Ok(text) = std::fs::read_to_string(queue_path()) else {
-        return Vec::new();
-    };
+/// 队列项 → 行格式文本（纯函数，`queue_save` 委托；`|` 分隔，含分隔符的字段整行跳过）。
+/// 行格式分档：`kind|path` ＋ ≥9 快照 ＋ ≥12 UDP 专属 ＋ ≥13 源端口（旧格式行兼容回读）。
+pub fn queue_items_to_text(items: &[QueueItem]) -> String {
+    let mut out = String::new();
+    for it in items {
+        if it.path.contains('|') {
+            continue; // `|` 为分隔符（Windows 文件名本身不含 |，防御性跳过）
+        }
+        let ip = it.ip.clone().unwrap_or_default();
+        let code = it.code.clone().unwrap_or_default();
+        if ip.contains('|') || code.contains('|') {
+            continue; // 快照字段同样不得含分隔符
+        }
+        out.push_str(&format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
+",
+            it.kind,
+            it.path,
+            ip,
+            it.port.map(|p| p.to_string()).unwrap_or_default(),
+            it.proto.clone().unwrap_or_default(),
+            code,
+            it.limit.map(|l| l.to_string()).unwrap_or_default(),
+            it.nocompress.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.noencrypt.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.passes.map(|n| n.to_string()).unwrap_or_default(),
+            it.fec_parity.map(|n| n.to_string()).unwrap_or_default(),
+            it.nofec.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.src_port.map(|n| n.to_string()).unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// 行格式文本 → 前端形状 JSON 数组（纯函数，`queue_load` 委托；camelCase 键与
+/// persistQueue/恢复逻辑对齐；分档 ≥9/≥12/≥13 兼容旧格式；非空行取前 500）。
+pub fn parse_queue_text(text: &str) -> Vec<serde_json::Value> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
         // 与 queue_save 同分隔符 `|`（轮 7 P1：此前按 tab 分割——保存的行
@@ -1898,39 +1959,18 @@ pub fn queue_load() -> Vec<serde_json::Value> {
 }
 
 #[tauri::command]
+pub fn queue_load() -> Vec<serde_json::Value> {
+    std::fs::read_to_string(queue_path())
+        .map(|t| parse_queue_text(&t))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
     if items.len() > 500 {
         return Err("队列上限 500 项（规格 §3.2）".into());
     }
-    let mut out = String::new();
-    for it in items {
-        if it.path.contains('|') {
-            continue; // `|` 为分隔符（Windows 文件名本身不含 |，防御性跳过）
-        }
-        let ip = it.ip.unwrap_or_default();
-        let code = it.code.unwrap_or_default();
-        if ip.contains('|') || code.contains('|') {
-            continue; // 快照字段同样不得含分隔符
-        }
-        out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
-",
-            it.kind,
-            it.path,
-            ip,
-            it.port.map(|p| p.to_string()).unwrap_or_default(),
-            it.proto.unwrap_or_default(),
-            code,
-            it.limit.map(|l| l.to_string()).unwrap_or_default(),
-            it.nocompress.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
-            it.noencrypt.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
-            it.passes.map(|n| n.to_string()).unwrap_or_default(),
-            it.fec_parity.map(|n| n.to_string()).unwrap_or_default(),
-            it.nofec.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
-            it.src_port.map(|n| n.to_string()).unwrap_or_default(),
-        ));
-    }
-    trft_core::config::atomic_write(&queue_path(), out.as_bytes()).map_err(err)
+    trft_core::config::atomic_write(&queue_path(), queue_items_to_text(&items).as_bytes()).map_err(err)
 }
 
 /// 供托盘/主窗口保存配置（关窗时调用）。

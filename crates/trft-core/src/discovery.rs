@@ -217,7 +217,9 @@ mod tests {
         assert_eq!(decode(&[0x77]), None, "未知帧");
         let mut truncated = resp.clone();
         truncated.pop();
-        assert!(decode(&truncated).is_none() || truncated.len() < resp.len(), "截断不得解码出完整应答");
+        // 恒真式（X || truncated.len() < resp.len()）此前等于没断言——本轮 F9 收紧为
+        // 真判别：尾部少一个字节必须解码失败。
+        assert!(decode(&truncated).is_none(), "截断不得解码出完整应答");
         // 超限整包忽略
         let big = vec![0u8; MAX_PACKET + 1];
         assert_eq!(decode(&big), None);

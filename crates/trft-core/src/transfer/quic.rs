@@ -248,7 +248,8 @@ async fn handle_incoming(
     // 顺带充当协议版本校验（fail-closed）。
     let v = crate::protocol::io::read_u8(&mut qs).await?;
     if v != crate::protocol::PROTO_VERSION {
-        return Err(proto(format!("协议版本不符: 0x{v:02X}")));
+        let _ = v;
+        return Err(proto("对端协议版本不兼容"));
     }
     // 关键：QUIC 的 Connection drop 会隐式 close 并重置流——若在客户端读完
     // 完成确认之前关连接，状态字节会被吞掉（TCP 无此问题）。收尾排水在

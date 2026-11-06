@@ -1012,11 +1012,12 @@ pub async fn serve_udp_on(socket: UdpSocket, opts: UdpRecvOptions, events: Optio
                     r.finish();
                 }
                 report_order.retain(|s| s != session);
-                eprintln!("[接收-UDP] 会话 {session:016x} → {}", path.display());
+                // 用户可见日志只报文件名，不暴露会话 ID（线协议内部标识）。
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                eprintln!("[接收-UDP] 收到 {name} → {}", path.display());
                 // 落盘即状态（规格 §4.2）：发布成功即记账；size/start 直接取自事件
                 // （轮 1：不再依赖 progress hub 注入——CLI 无 hub 也记全）。
                 if let Some(stats) = &opts.stats {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     stats.record(
                         crate::stats::Direction::Recv,
                         &peer.ip().to_string(),
