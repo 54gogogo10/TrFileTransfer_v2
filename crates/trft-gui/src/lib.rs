@@ -4,5 +4,6 @@
 //! `tests/` 集成测试可以触达命令层（队列持久化格式、SendRequest serde 契约）。
 
 pub mod commands;
+pub mod logging;
 pub mod state;
 pub mod tray;

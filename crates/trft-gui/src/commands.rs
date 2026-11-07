@@ -320,6 +320,15 @@ async fn settle_send(
         "trft://task",
         serde_json::json!({ "id": id, "ok": ok, "error": done_res.as_ref().err() }),
     );
+    // 传输终态落盘（规格 §3.7 文件日志——任务成败是最需要跨重启留痕的事件）。
+    emit_log(
+        &app,
+        if ok { "ok" } else { "err" },
+        &match done_res.as_ref() {
+            Ok(()) => format!("传输完成: {name}"),
+            Err(e) => format!("传输失败: {name}: {e}"),
+        },
+    );
     if notify {
         use tauri_plugin_notification::NotificationExt;
         let n = app.notification().builder().title(format!("TrFileTransfer — {name}"));
@@ -473,7 +482,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
         chunked_opts.progress = Some(first_reporter);
         let res = match send_file_chunked(addr, &path, &chunked_opts, connections).await {
             Err(trft_core::error::Error::Unsupported(m)) => {
-                let _ = app2.emit("trft://log", serde_json::json!({ "level": "warn", "message": m }));
+                emit_log(&app2, "warn", &m);
                 let mut auto_opts = base;
                 let fallback_reporter = hub.register("send", name3, 0);
                 let fallback_progress_id = fallback_reporter.id();
@@ -560,19 +569,13 @@ pub async fn send_queue(
             let mut attempt = 0u32;
             while sub.is_err() && attempt < retries {
                 attempt += 1;
-                let _ = app2.emit(
-                    "trft://log",
-                    serde_json::json!({ "level": "warn", "message": format!("{label} 失败，重试 {attempt}/{retries}") }),
-                );
+                emit_log(&app2, "warn", &format!("{label} 失败，重试 {attempt}/{retries}"));
                 sub = run_single_send(app2.clone(), item.clone()).await;
             }
             if sub.is_ok() {
                 ok_n += 1;
             }
-            let _ = app2.emit(
-                "trft://log",
-                serde_json::json!({ "level": if sub.is_ok() { "ok" } else { "err" }, "message": label }),
-            );
+            emit_log(&app2, if sub.is_ok() { "ok" } else { "err" }, &label);
         }
         let _ = app2.emit(
             "trft://task",
@@ -584,10 +587,7 @@ pub async fn send_queue(
         // 全失败时不得执行：F1 修复前 ok_n 恒等于项数，"全部失败 → 关机" 会照常发生。
         if ok_n == 0 {
             if after_done.is_some() {
-                let _ = app2.emit(
-                    "trft://log",
-                    serde_json::json!({ "level": "warn", "message": "队列全部失败，已跳过完成后动作" }),
-                );
+                emit_log(&app2, "warn", "队列全部失败，已跳过完成后动作");
             }
             return;
         }
@@ -596,7 +596,7 @@ pub async fn send_queue(
                 let mut c = std::process::Command::new("cmd");
                 c.args(["/C", "shutdown", "/s", "/t", "60"]);
                 spawn_hidden(c);
-                let _ = app2.emit("trft://log", serde_json::json!({ "level": "warn", "message": "系统将在 60 秒后关机（shutdown /a 可取消）" }));
+                emit_log(&app2, "warn", "系统将在 60 秒后关机（shutdown /a 可取消）");
             }
             Some("sleep") => {
                 let mut c = std::process::Command::new("rundll32.exe");
@@ -778,10 +778,7 @@ fn receiver_task_exit(
 ) {
     use tauri::Emitter;
     if let Err(e) = r {
-        let _ = app.emit(
-            "trft://log",
-            serde_json::json!({ "level": "err", "message": format!("{} 接收器退出: {e}", proto.label()) }),
-        );
+        emit_log(&app, "err", &format!("{} 接收器退出: {e}", proto.label()));
     }
     let remove = {
         let st = app.state::<AppState>();
@@ -802,10 +799,7 @@ fn receiver_task_exit(
     if remove {
         update_awake(&app);
         update_discovery_answer(&app);
-        let _ = app.emit(
-            "trft://log",
-            serde_json::json!({ "level": "warn", "message": format!("{} 接收器已全部退出", proto.label()) }),
-        );
+        emit_log(&app, "warn", &format!("{} 接收器已全部退出", proto.label()));
         // 轮 7 F7：前端复位接收卡/标签圆点（异步退出此前只发日志）。
         let _ = app.emit("trft://sync-state", ());
     }
@@ -1078,10 +1072,7 @@ pub async fn recv_start(
         st.cfg.lock().expect("配置锁").firewall_hinted = true;
         let _ = st.save_config();
     }
-    let _ = app.emit(
-        "trft://log",
-        serde_json::json!({ "level": "ok", "message": format!("{} 接收器启动 :{port} ← {}", proto.label(), bound.join(", ")) }),
-    );
+    emit_log(&app, "ok", &format!("{} 接收器启动 :{port} ← {}", proto.label(), bound.join(", ")));
     Ok(serde_json::json!({
         "proto": proto,
         "port": port,
@@ -1104,7 +1095,7 @@ pub fn recv_stop(app: tauri::AppHandle, proto: Proto) -> Result<(), String> {
         }
         update_awake(&app);
         update_discovery_answer(&app);
-        let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": format!("{} 接收器已停止", proto.label()) }));
+        emit_log(&app, "ok", &format!("{} 接收器已停止", proto.label()));
         Ok(())
     } else {
         Err(format!("{} 接收器未在运行", proto.label()))
@@ -1971,6 +1962,14 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
         return Err("队列上限 500 项（规格 §3.2）".into());
     }
     trft_core::config::atomic_write(&queue_path(), queue_items_to_text(&items).as_bytes()).map_err(err)
+}
+
+/// 日志双写（规格 §3.7 文件日志）：UI 事件（trft://log）+ 当天文件各一份。
+/// 全部后端日志出口统一走此辅助——文件侧不得有独立于 UI 事件之外的第二套来源。
+pub fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, level: &str, message: &str) {
+    use tauri::Emitter;
+    let _ = app.emit("trft://log", serde_json::json!({ "level": level, "message": message }));
+    crate::logging::log_line(level, message);
 }
 
 /// 供托盘/主窗口保存配置（关窗时调用）。

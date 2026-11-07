@@ -144,9 +144,10 @@ pub fn forward_progress(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::Unboun
             let _ = app.emit("trft://progress", &ev);
             if ev.kind == "recv" && (ev.state == "done" || ev.state == "failed") {
                 // 最近接收视图直接消费进度终态，这里补一条日志事件便于历史区展示。
-                let _ = app.emit(
-                    "trft://log",
-                    serde_json::json!({ "level": if ev.state == "done" { "ok" } else { "err" }, "message": ev.name }),
+                crate::commands::emit_log(
+                    &app,
+                    if ev.state == "done" { "ok" } else { "err" },
+                    &ev.name,
                 );
             }
         }

@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |------|------|
-| 文档性质 | 产品规格（行为与要求的权威描述；实现细节见 [AGENTS.md](../AGENTS.md)，字节级协议见 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md)） |
-| 规格基线 | v2 分支 @ PR #8 合并后（程序集版本 2.14，定版将随下一发布递增） |
-| 维护约定 | **随功能同步更新**——任何行为变化都必须落到本文对应条目（与 AGENTS.md 同纪律） |
-| 约定 | 「必须 / 不得 / 可以」按 RFC 2119 语气理解；`(vX.Y+)` 表示该行为自 vX.Y 版本引入 |
+| 文档性质 | 产品规格（行为与要求的权威描述；实现细节与选型见 [TECH-STACK.md](TECH-STACK.md)，字节级协议见 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md)） |
+| 规格基线 | 本规格承自 C# 版 v2.14 规格（PR #8 后全文继承）；**本仓库（TrFileTransfer_v2）为 Rust 重写实现**，实现基线与里程碑见 [TECH-STACK.md](TECH-STACK.md)（M1'–M6' 及后续轮次），版本单源为 `tauri.conf.json` / `Cargo.toml`。C# 专属内容已按 Rust 实现修订（§7.2/§8/§9/§10/§4.3），与实现的既有偏离在相应条目处就地标注 |
+| 维护约定 | **随功能同步更新**——任何行为变化都必须落到本文对应条目（与 TECH-STACK.md 同纪律） |
+| 约定 | 「必须 / 不得 / 可以」按 RFC 2119 语气理解；`(vX.Y+)` 表示该行为自原 C# 版 vX.Y 引入；`(Rust)` 表示本实现新增或修订 |
 
 ---
 
@@ -240,12 +240,14 @@
 
 ### 4.3 版本互通矩阵
 
-| 客户端 \ 服务器 | 新版 | ≤2.11 旧版 |
-|-----------------|------|------------|
-| **新版** | 全特性（0x09 加密 + 压缩 + 能力帧 + 完成确认） | `EncryptStrict=0`（默认）：降级 0x05 明文 + 关压缩，记日志；`EncryptStrict=1`：拒绝降级 |
-| **≤2.11 旧版** | 服务端接受 0x07 并记弱加密警告；客户端发明的 0x07 仍可通 | — |
+`(Rust)` 本实现**与原 C# 版不做互通承诺**（独立实现，线协议帧语义同源但字节布局以 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md) 为准，且不实现 C# 版的 0x07/0x17 旧版加密通道）。互通正确性由自互通矩阵 e2e 钉住（`tests/e2e_interop.rs`）：新旧特性组合 × 降级路径全矩阵覆盖。
 
-单向 UDP 的 PARITY 帧对新旧接收端都无需协商（旧端静默忽略，仅损失纠错能力）。
+| 客户端 \ 服务器 | 同版本 | 旧特性集（能力协商未宣告） |
+|-----------------|--------|---------------------------|
+| **新版** | 全特性（ECDH 加密 + 压缩 + 能力帧 + 完成确认 + 0x0C 判决） | 能力协商降级：0x02/0x03/0x04 Unsupported 或自动降级 0x00（各自显式定义，见 §3.6/§4.1）；压缩协商被拒 → 宽容降级明文；加密降级 fail-closed（`EncryptStrict` 语义保留，GUI 无放行开关） |
+| **旧特性集** | 服务端按能力帧判定，未知帧显式拒绝（fail-closed） | — |
+
+单向 UDP 的 PARITY 帧为自描述扩展，无需协商。
 
 ---
 
@@ -277,7 +279,7 @@
 |----|----|
 | 单文件声明大小上限 | 1 PiB（`MaxTransferSize`），负值拒绝 |
 | 磁盘预检余量 | 64 MB |
-| 文件夹文件数上限（0x01） | 1,000,000 |
+| 文件夹文件数上限（0x01） | 1,000,000；`(Rust)` 0x04 同步/续传清单上限 100,000（位图协商内存有界，[WIRE-PROTOCOL.md](WIRE-PROTOCOL.md) 已登记偏离） |
 | 分块合并区间上限（0x02/0x0B） | 8,192 |
 | 并发连接数（发送侧） | 1–8 |
 | 压缩段长上限 / 最小压缩段 | 64 MB / 64 B |
@@ -308,7 +310,7 @@
 
 | 风险 | 防护 |
 |------|------|
-| 接收方拒绝却报成功 | TCP 完成确认字节（0x00/0x01/0x06/0x04）；UDT ACK 严格化——EOF/错误/超时一律失败，结果未知 ≠ 成功 |
+| 接收方拒绝却报成功 | TCP 完成确认字节（0x00/0x01/0x03/0x06/0x04，与 §4.1 一致）；UDT/QUIC ACK 严格化——EOF/错误/超时一律失败，结果未知 ≠ 成功 |
 | 零填充文件被判完成 | 续传偏移服务端权威 + 覆盖判完成（非字节累加） |
 | 半截文件出门（监控模式） | 独占打开 + 大小稳定双重探测 |
 | 两个版本拼成一个文件 | 陈旧前缀不拼接（0x04）；源变化换新 groupId（0x02） |
@@ -320,33 +322,35 @@
 
 - `ObjectDisposedException` / `InvalidOperationException`（Stop/Cancel 期间的正常竞态）静默捕获；其余错误必须可见（日志 + 事件）。
 - 取消必须保持「已暂停」语义（OCE 路径与失败路径区分）。
-- C# 5 逻辑层禁止 catch 块内 await（CS1985）——用标志变量模式。
+- `(Rust)` 逻辑层（trft-core）零 UI 依赖且可脱离 GUI 编译；错误必须可见（日志 + 事件），不得静默吞错；取消保持「已暂停」语义（与失败路径区分）。原 C# 5 的 CS1985（catch 内 await）约束随重写废止，其意图（取消/失败路径区分、错误可见）由上两条继承。
 
 ---
 
 ## 8. 兼容性与数据规格
 
-### 8.1 数据文件清单（`%AppData%\TrFileTransfer\`）
+### 8.1 数据文件清单（`(Rust)` `%AppData%\TrFileTransfer\`，config 为 TOML）
 
 | 文件 | 内容 | 容量策略 |
 |------|------|----------|
-| `config.ini` (+`.bak`) | 全部配置键 | 原子换入自愈 |
+| `config.toml` (+`.bak`) | 全部配置（serde/toml） | `.tmp` 原子换入自愈；主文件不可读/解析为空回退 `.bak`；缺失视为用户重置 |
 | `stats.log` | 传输统计（`时间\|S/R\|IP\|字节\|文件数\|秒\|Detail\|Path`，旧 6 字段行照读） | >2MB 重写留 5000 |
-| `hash-cache-client.txt` / `hash-cache-server.txt` | 摘要缓存追加日志 | 8MB 重写 / 坏行丢弃 |
-| `folder-resume/*`、`server-resume/*` | 两侧续传会话 | 服务器侧 7 天孤儿清理 |
-| `queue.txt`、`text-history.log` | 发送队列 / 文本历史 | 500 项 / 200 条收敛 |
-| `logs/yyyy-MM-dd.txt`、`crash.log` | 运行与崩溃日志 | 保留 30 天 |
-| `updates/*` | 升级暂存（GUID `.part`） | 换入后清理 |
+| `<保存目录>/.trft-hash-cache.txt` | 摘要缓存追加日志（随保存目录走，`cache_file_for` 派生） | 8MB 重写 / 坏行丢弃 / TTL 过期 |
+| `folder-resume/*`、`server-resume/*` | 两侧续传会话（半成品/清单/位图） | 服务器侧 7 天孤儿清理 |
+| `queue.txt`、`text-history.txt` | 发送队列（13 字段行快照）/ 文本历史 | 500 项 / 200 条收敛（单条截 2KB） |
+| `devices.json` | 已知设备记忆 | 10 条按 IP 去重 |
+| `logs/yyyy-MM-dd.log`、`crash.log` | 运行日志（GUI 双写）/ 崩溃日志（panic + backtrace） | 日志保留 30 天 / crash 追加 |
+| `updates/*` | 升级暂存 | 换入后清理 |
+
+> 原版（C#）布局差异：`config.ini`（INI）、全局 `hash-cache-client/server.txt`、`text-history.log`——不迁移（与「不做 C# 互通」同口径），差异登记见 TECH-STACK.md。
 
 ### 8.2 运行时要求（当前 Windows 版）
 
-- Windows 7 SP1+；.NET Framework 4.8（Win10 1809+ 内置）；构建需 .NET SDK 8+。
-- UDT 原生库（MinGW-w64 编译）嵌入 exe，首运行提取；只读目录回退 `%TEMP%`。
+- `(Rust)` Windows 10/11 x64；Rust ≥ 1.85 构建；GUI 依赖 WebView2 运行时（Evergreen 自动更新为主，exe 旁 `WebView2Runtime\` 固定版为离线便携形态）；无原生库依赖（UDT 槽位由 QUIC/quinn 纯 Rust 实现，见 TECH-STACK.md §2）。
 
 ### 8.3 配置迁移政策
 
-- 新布局键（`ServerBindTCP/UDT/UDP`、`SaveDirTCP/UDT/UDP`……）首启幂等迁移；旧键保留为镜像，保证可降级安装。
-- 旧键读取兼容（≤2.13 的 V4/V6 家族键、单键 SaveDir）。
+- `(Rust)` 配置为单一 TOML 布局（无跨布局迁移负担）；字段增删由 serde 缺省值兜底，语义约束在 `Config::validate`（如配对码位数 4–12）。
+- 原版（C#）的多键迁移（V4/V6 家族键、单键 SaveDir 镜像）不适用于本实现——与 C# 版不做配置迁移承诺。
 
 ---
 
@@ -354,27 +358,29 @@
 
 ### 9.1 现状与地基
 
-当前为 Windows WPF 单体。**逻辑层 26 个文件零 UI 依赖**且经独立测试构建验证——这是所有跨平台路线的共同地基。已识别的平台绑定点共 6 处 Win32 调用（见 AGENTS.md），均可平台守卫或等价实现。
+`(Rust)` 当前为 **Rust workspace 四 crate**（trft-core 逻辑层 / trft-cli / trft-server / trft-gui）。**逻辑层（trft-core）零 UI 依赖**且被全部 e2e 测试直接驱动——这是跨平台路线的共同地基。平台绑定点集中于 trft-gui（Win32：注册表/MessageBox/防睡眠/托盘，Tauri/WebView2），均有平台守卫或等价实现路径。
 
 ### 9.2 路线决策记录
 
+> 本表承自 C# 时代决策；**「Rust / Go 整体重写」已由本仓库（TrFileTransfer_v2）实施落地**——保留原条目作为决策沿革。
+
 | 路线 | 结论 | 理由 |
 |------|------|------|
-| **A. .NET 8 多目标无头版** | **采纳（M2）** | 逻辑层原样复用 + 296 项测试护航；交付 Linux/macOS 的 send/recv/sync/verify，覆盖服务器/备份核心场景；量级数天 |
-| **C. Web 管理面（无头 daemon + 浏览器管理）** | **采纳（M3，随 A 之后）** | `HttpShare.cs` 已提供 HTTP 地基；一份 UI 覆盖全桌面 + 手机；远程管理接收服务器是真实需求 |
-| B. Avalonia 桌面 GUI | 评估后暂缓 | 可行（XAML 方言最近、内置托盘/主题），但 = 一次 WinForms→WPF 级重写；待 Linux GUI 需求明确再启动 |
-| MAUI | 否决 | 无官方 Linux 桌面 |
-| Rust / Go 整体重写 | 暂不采纳（记录在案） | 重写=重赚两年实战正确性（296 测试 + 双轮审计 + 十余轮实战修复）；单二进制/无运行时的诉求可由 .NET self-contained 满足大半；若未来下探 NAS/嵌入式再评估，届时以 WIRE-PROTOCOL.md 锁协议 + 跨实现互通测试启动 |
-| QUIC 替代 UDT（`System.Net.Quic`） | 长期观察项 | 消除原生库分发负担；但动线协议且 UDT 是产品签名特性——仅试验性评估，不阻塞任何里程碑 |
+| **Rust / Go 整体重写** | **已实施（本仓库）** | 2026-10 用户拍板从功能出发重新选型：单文件免安装、内存封顶、无 GC 抖动吞吐；选型与里程碑见 [TECH-STACK.md](TECH-STACK.md)（原 C# 时代「暂不采纳」条目的顾虑——重赚实战正确性——由 206 项 Rust 测试 + 九轮审查 + 判别纪律承接） |
+| **C. Web 管理面（无头 daemon + 浏览器管理）** | **已落地（trft-server + GUI 共享页）** | axum 复用 HTTP 安全基线；GUI 内嵌共享 + 二维码已交付手机浏览器闭环 |
+| A. 跨平台无头版（Linux/macOS CLI） | 规划中 | 逻辑层原样复用 + 全量测试护航；UDT 槽位 QUIC 天然跨平台；待发布阶段排期 |
+| B. 跨平台桌面 GUI（egui/AppImage） | 评估后暂缓 | Tauri 2 已覆盖桌面 + 便携形态；Linux GUI 待需求明确 |
+| QUIC 替代 UDT | **已落地（quinn）** | 原「长期观察项」随重写一并解决——无原生库分发负担，TLS 1.3 + 自签模型 |
 
 ### 9.3 里程碑
 
+`(Rust)` 里程碑体系（M1'–M6' 及后续轮次）见 [TECH-STACK.md](TECH-STACK.md) §6——已全部完结，本表保留原 C# 时代规划作沿革。
+
 | 里程碑 | 范围 | 验收标准 |
 |--------|------|----------|
-| **M1（当前）** | 本批功能定版：三协议独立保存目录、监控拷贝检测、RS-FEC、文档体系 | 全量测试绿 + GUI 冒烟绿 + 发布产物（exe + sha256 边车） |
-| **M2** | 跨平台无头：csproj 多目标、Win32 守卫、UDT 编 Linux .so、CI ubuntu job | Linux 上 4 个 CLI 动词全通过 + 与 Windows 端互通测试（0x09/压缩/FEC/续传） |
-| **M3** | Web 管理面：任务 API（发起/进度/取消）+ 静态前端，复用 HTTP 安全基线 | 浏览器完成 S1/S3/S8 核心闭环；安全审计过一遍 |
-| **M4（评估）** | Avalonia 桌面 / QUIC 试验 | 另立规格 |
+| **M1（原 C# 时代·已完成）** | 三协议独立保存目录、监控拷贝检测、RS-FEC、文档体系 | 全量测试绿 + GUI 冒烟绿 + 发布产物 |
+| **M2（原规划·被重写取代）** | 跨平台无头 | 由 Rust workspace 天然达成（trft-core/trft-cli 无平台绑定） |
+| M3 | Web 管理面增强 | 另立规格 |
 
 ---
 
@@ -382,16 +388,20 @@
 
 ### 10.1 测试体系
 
-- **296 项自动化测试**（随版本增长）：单元（L10N/Config/加密压缩往返/摘要缓存/QR/限速/绑定冲突…）+ 端到端集成（TCP/UDT/UDP 单文件/文件夹/空文件/中文名/多客户端/大文件/续传/限速/加密回退/配对码/同步/群发/HTTP 共享/IPv6 双栈/UDP 丢包收敛…），自定义轻量 TestRunner，零外部框架依赖。
-- UDT 集成测试带重试参数（握手抖动兜底）；端口经空闲探测且对 UDP 同样验证；UDT 并发用例容忍「瞬断+重试成功」。
+`(Rust)` 当前 **206 项自动化测试**（随版本增长，`cargo test --workspace`）：
+
+- 单元（L10N/Config/加密压缩往返/摘要缓存/QR/限速/绑定冲突/分块状态机/UDP 引擎丢包恢复/进度节流…）；
+- 端到端集成（TCP/QUIC/UDP 单文件/文件夹/空文件/中文名/并发/续传/分块 0x02 专项/限速时间下界判别/加密回退/配对码锁定/同步 bitmap/互通降级矩阵/HTTP 共享/IPv6/CLI 跨进程真传输…，`trft-core/tests/` + `trft-cli/tests/` + `trft-server/tests/web.rs`）；
+- GUI 命令层契约（queue.txt 格式互锁/SendRequest serde/便携探测/日志清理，`trft-gui/tests/`）；
+- GUI 实机：UIA 驱动真实窗口 + CLI/HTTP 联动（TECH-STACK §23 方法论），不入自动化套件。
 - **判别纪律**：行为修复必须有测试钉住，且验证过「去掉修复测试变红」。
-- GUI 冒烟：`Tests/gui_test/` UIA 脚本（真实双实例/CLI 联动，不入测试构建）。
+- 时序敏感用例统一 mock 时钟（`start_paused = true`），禁止真时钟 sleep 判定。
 
 ### 10.2 CI 与发布
 
-- CI（`on: push`）：windows-latest 双 build.bat + 全量测试；PR 合并后 master 再跑一轮。
-- 发布：版本单源 `AssemblyInfo.cs`；`build.bat` 产出 `release\TrFileTransfer-<版本>.exe` + `.sha256` 边车（小写哈希 + 两空格 + 文件名）+ CI 兼容副本。
-- **发布检查单**：① 版本号已递增；② 全量测试绿；③ GitHub Release 上传 exe + `.sha256`（升级器强依赖边车）；④ README/AGENTS/PRODUCT-SPEC/WIRE-PROTOCOL 四文档同步；⑤ config 迁移路径人工验证一遍（旧版 config → 新版首启）。
+- CI：当前仓库未配置（`.github/` 缺席）——发布前本地 `cargo test --workspace` + `build.bat` 全绿为准，CI 接入为待办项。
+- 发布：版本单源 `tauri.conf.json` / `Cargo.toml`；`build.bat` 产出 `release\TrFileTransfer-<版本>.exe`（CLI/GUI/server 三件）+ `.sha256` 边车（小写哈希 + ` *文件名`）+ 离线便携版 zip（`build\WebView2FixedRuntime\` 就绪时）。
+- **发布检查单**：① 版本号已递增；② 全量测试绿（0 告警）；③ GitHub Release 上传产物 + `.sha256`（升级器强依赖边车）；④ README/PRODUCT-SPEC/TECH-STACK/WIRE-PROTOCOL 文档同步；⑤ 便携版冷启动判别（子进程路径落在便携目录）。
 
 ---
 
@@ -411,6 +421,8 @@
 ## 12. 附录
 
 ### 12.1 配置键参考（按域分组）
+
+> `(Rust)` 下表为原 C# 键名（PascalCase）参考；本实现为 `config.toml` snake_case 字段，权威定义见 `trft-core/src/config.rs` 的 `Config` 结构（对应关系如 `ServerPortTCP→server_port_tcp`、`PairingLength→pairing_length`；`Mica`/`SoftwareRender`/`AutoUpdateCheck` 等未实现键不入库）。
 
 | 域 | 键 |
 |----|----|
@@ -438,7 +450,7 @@
 | 文档 | 读者 | 内容 |
 |------|------|------|
 | 本文（PRODUCT-SPEC.md） | 产品/测试/新成员 | 行为与要求权威描述 |
-| AGENTS.md | 编码代理/开发者 | 实现逐文件详解、约定与坑点（唯一权威开发者指引） |
+| TECH-STACK.md | 编码代理/开发者 | 技术选型、里程碑与审查登记（唯一权威开发者指引；对应原版 AGENTS.md 职能） |
 | WIRE-PROTOCOL.md | 协议实现/互通 | 字节级帧布局 |
 | README.md | 最终用户 | 功能介绍与快速开始 |
 | docs/superpowers/ | 考古 | 按日期归档的历史设计文档（不随现状更新） |

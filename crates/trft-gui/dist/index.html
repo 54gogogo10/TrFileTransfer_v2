@@ -13,6 +13,7 @@
       <span>TrFileTransfer</span>
     </div>
     <div class="head-actions">
+      <button id="btn-help" class="seg-btn" title="Help">?</button>
       <div class="seg" id="lang-seg">
         <button id="lang-zh" class="seg-btn">中文</button>
         <button id="lang-en" class="seg-btn">EN</button>
@@ -96,6 +97,7 @@
           <button id="btn-send" class="btn primary" data-i18n="send">发送</button>
           <button id="btn-send-chunked" class="btn hidden" data-i18n="send_chunked">并行分块发送</button>
           <button id="btn-queue-add" class="btn" data-i18n="queue_add">加入队列</button>
+          <button id="btn-queue-batch" class="btn" data-i18n="batch_add">批量入队</button>
           <span class="hint" data-i18n="drop_hint">可直接拖入文件/文件夹</span>
         </div>
         <div class="row">
@@ -428,6 +430,15 @@
   </footer>
 
   <div id="toast-layer"></div>
+
+  <!-- 使用说明（原版 HelpDialog 对齐）：双语正文存 L10N help_body -->
+  <div id="help-overlay" class="hidden">
+    <div class="modal" style="width:min(600px,92vw)">
+      <div class="modal-title" data-i18n="help_title">使用说明</div>
+      <div id="help-body" class="modal-msg" style="max-height:55vh;overflow-y:auto;white-space:pre-wrap;line-height:1.7"></div>
+      <div class="modal-btns"><button id="btn-help-close" class="btn primary" data-i18n="help_close">关闭</button></div>
+    </div>
+  </div>
 
   <!-- 接收前确认弹窗（规格 §3.3：30 秒无应答视为拒绝；fail-closed） -->
   <div id="confirm-overlay" class="hidden">

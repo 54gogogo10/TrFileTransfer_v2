@@ -214,6 +214,13 @@
    - **CLI 帮助**：`--chunks/--noencrypt/--nocompress/--allow-legacy-pair/--count/--pin/update` 的说明去掉 `0x0N` 与「规格 §x」，改为功能描述；
    - **日志噪声**：防火墙提示日志由「netsh: <原始命令>」改为中文说明（命令仍留在可复制的 toast）；UDP 接收日志不再打印会话 ID（只报文件名）；
    - **验证**：core 115 项单测（新增 `legacy_protocol_labels_are_normalized_on_load`）；GUI 实机历史/日志逐行确认无 `0x`；`trft send --help`/`update --help` 无帧码。
+25. **与原 C# 版功能对齐**（2026-11-08，206 → 209 项）：
+   - **对齐方法**：逐节对比 E:\zcode\TrFileTransfer（原版）规格与实现 vs 本仓库——两份 PRODUCT-SPEC 95% 逐字同源，功能面差距极小；缺口矩阵经用户拍板分三批（A1/A2–A5/B），C 批（同步会话对话框、Mica）维持登记不做；
+   - **A1 文件日志 + crash.log**（规格 §3.7 硬缺口闭环）：`trft-gui/src/logging.rs`——`logs/yyyy-MM-dd.log` 按天追加（civil 日历换算零依赖）、启动清理 >30 天、`crash.log` 记 panic + `Backtrace::force_capture` + 原生友好弹窗（挂默认钩子前）；全部后端日志出口（state/commands/main 共 11 处）统一收敛到 `emit_log` 双写辅助（UI 事件 + 文件各一份，文件侧无第二套来源）；传输终态在 `settle_send` 落盘（任务成败最需跨重启留痕）；写失败静默（文件日志不可用不得影响功能）；
+   - **A2–A5 GUI 小 UX**（对齐原版交互）：A2 协议↔端口跟随（切协议时端口框自动填对应接收页端口——原版 v2.14，防 UDP 发错端口的零反馈黑洞）；A3 批量入队（多选文件对话框，补拖放之外的批量入口，快照纪律 + 500 钳制同口径）；A4 帮助对话框（标题栏「?」→ 双语可滚动说明，正文存 L10N `help_body`）；A5 进度卡设备名徽标（task-start 后按 IP 命中已知设备补「→ 设备名」，对齐原版 v2.15 DeviceDisplay.NameFor——**接收侧因 core 进度事件不携带 peer 登记**为后续项，本轮不扩 core API）；
+   - **B PRODUCT-SPEC 文档对齐**（清除重写版规格中的 C# 遗留自相矛盾）：头部基线声明（承自 C# v2.14 规格 + Rust 实现基线指向 TECH-STACK）；§7.2 CS1985 → Rust 等价纪律；§8.1 数据文件布局改写为 Rust 实际（config.toml/每目录哈希缓存/devices.json/logs+crash）；§8.2 运行时改 Win10/11 + Rust + WebView2 双形态；§9 平台策略重写（「Rust/Go 重写暂不采纳」条目标注已由本仓库实施，消除否决自己的悖论）；§10 质量规格改 206 项 Rust 测试 + tauri.conf 版本单源 + CI 缺席如实登记；§4.3 C# ≤2.11 互通矩阵 → 不做互通承诺 + 自互通 e2e；§6.1 补 0x04 清单 100,000 偏离注；§7.1 完成确认集合统一（补 0x03）；§12.1 标注 C# 键名参考 + config.rs 权威；AGENTS.md 断链 → TECH-STACK 承接其职能；
+   - **验证**：cargo test -p trft-gui 15 项全绿（logging 3 项新增：ISO 日期文件名/30 天清理仅删 .log/非日志文件不动）；mock 浏览器测试床实测 A2（8081/8082 跟随）/A3（双文件入队）/A4（双语帮助开合）/A5（已知设备徽标 + 未知 IP 负例）；全量回归 209/0、0 告警；
+   - **提交前自审修复**：crash.log 与日常日志**分锁**——panic 若正发生在 `log_line` 持锁期间，钩子内 `write_crash_log` 再抢同一把非重入 Mutex 会死锁（崩溃路径反而卡死）；改独立 `CRASH_LOCK` + `try_lock`，争用（双线程同时 panic）时无锁直写——append 交错风险可接受，宁留痕不丢失。
 
 ## 8. 记录在案的否决项
 

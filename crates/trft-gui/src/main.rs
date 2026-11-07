@@ -11,6 +11,11 @@ use state::AppState;
 use tauri::Manager;
 
 fn main() {
+    // 文件日志 + 崩溃日志（规格 §3.7：logs/ 按天保留 30 天；panic → crash.log +
+    // 友好提示——对齐原 C# 版，此前后端只有 UI 日志事件、进程崩溃零痕迹）。
+    trft_gui::logging::init_file_logging();
+    install_panic_hook();
+
     // 离线便携版（TECH-STACK §7.20）：exe 旁存在 WebView2Runtime\ 固定版运行时
     // 则优先加载（须在 WebView2 检测/窗口创建前设置——loader 读环境变量定加载路径），
     // 并跳过 Evergreen 检测——离线机器无 Evergreen，不该被引导去下载。
@@ -125,7 +130,7 @@ fn stop_http_share<R: tauri::Runtime>(window: &tauri::Window<R>) {
             .map(|h| h.shutdown.send(()).is_ok())
             .unwrap_or(false);
         if stopped {
-            let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": "窗口已隐藏，HTTP 共享已停止" }));
+            trft_gui::commands::emit_log(&app, "ok", "窗口已隐藏，HTTP 共享已停止");
             let _ = app.emit("trft://sync-state", ());
         }
     }
@@ -196,6 +201,22 @@ fn detect_portable_runtime(
     }
     let dir = exe_dir.join("WebView2Runtime");
     (dir.join("msedgewebview2.exe").is_file()).then_some(dir)
+}
+
+/// panic 钩子（规格 §3.7：崩溃写 crash.log + 弹友好提示）——写盘后再交默认钩子
+/// （保持原有控制台/调试行为）。弹窗仅在 windows 主环境可用，失败静默。
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        trft_gui::logging::write_crash_log(&info.to_string(), &bt);
+        #[cfg(windows)]
+        message_box(
+            "程序遇到内部错误即将退出。\r\n详细信息已写入 crash.log（%APPDATA%\\TrFileTransfer\\）。\r\n\r\nAn internal error occurred and the app must exit.\r\nDetails were written to crash.log.",
+            "TrFileTransfer",
+        );
+        default(info);
+    }));
 }
 
 /// 原生 MessageBoxW（是/否）。true = 用户选择「是」。
