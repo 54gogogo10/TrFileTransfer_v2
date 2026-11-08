@@ -240,7 +240,11 @@ where
     }
 
     // 进度：注册后任何失败路径经 Outcome 上报 failed；skip 是零传输成功。
-    let report = opts.progress.as_ref().map(|h| h.register("recv", name.clone(), size));
+    let report = opts.progress.as_ref().map(|h| {
+        let r = h.register("recv", name.clone(), size);
+        r.set_peer(&peer.ip().to_string());
+        r
+    });
     let outcome = crate::progress::Outcome::new(report.clone());
 
     // 目录解析在会话建立时固定（PerDeviceFolder/AutoArchive，规格 §3.3）；
@@ -462,7 +466,11 @@ where
         let report = opts
             .progress
             .as_ref()
-            .map(|h| h.register("recv", rel_raw.clone(), size));
+            .map(|h| {
+                let r = h.register("recv", rel_raw.clone(), size);
+                r.set_peer(&peer.ip().to_string());
+                r
+            });
         let outcome = crate::progress::Outcome::new(report.clone());
         let (part, hash) =
             recv_file_payload(s, &parent, &file_name, size, opts, report.as_ref()).await?;

@@ -993,6 +993,7 @@ pub async fn serve_udp_on(socket: UdpSocket, opts: UdpRecvOptions, events: Optio
                         }
                     }
                     let r = hub.register("recv", name.clone(), *size);
+                    r.set_peer(&peer.ip().to_string());
                     report_order.push_back(*session);
                     reports.insert(*session, (r, *chunk_len as u64, *size, 0, std::time::Instant::now()));
                 }

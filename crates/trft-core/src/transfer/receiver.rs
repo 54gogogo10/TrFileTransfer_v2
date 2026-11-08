@@ -985,7 +985,11 @@ where
     let part = unique_part(&dir, &name);
     let _guard = PartGuard(part.clone());
     // 进度：注册后任何失败路径经 Outcome 上报 failed（skip 丢弃也是成功收尾）。
-    let report = opts.progress.as_ref().map(|h| h.register("recv", name.clone(), size));
+    let report = opts.progress.as_ref().map(|h| {
+        let r = h.register("recv", name.clone(), size);
+        r.set_peer(&peer.ip().to_string());
+        r
+    });
     let outcome = crate::progress::Outcome::new(report.clone());
     let mut out = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&part).await?;
     let mut dig = FileDigester::new();

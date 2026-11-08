@@ -474,6 +474,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
     let settled2 = settled.clone();
     // 首卡（0x02）Reporter 在 spawn 前注册：任务↔进度卡绑定需要它的 ID。
     let first_reporter = hub.register("send", &name, 0);
+    first_reporter.set_peer(&addr.ip().to_string());
     let first_progress_id = first_reporter.id();
     let app3 = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
@@ -485,6 +486,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
                 emit_log(&app2, "warn", &m);
                 let mut auto_opts = base;
                 let fallback_reporter = hub.register("send", name3, 0);
+                fallback_reporter.set_peer(&addr.ip().to_string());
                 let fallback_progress_id = fallback_reporter.id();
                 auto_opts.progress = Some(fallback_reporter);
                 // 回退卡补发 task-start（轮 7 F3）：否则 progressId 绑定链断裂——
@@ -670,6 +672,7 @@ pub async fn sync_start(
         trft_core::progress::ProgressHub::with_id_base(ptx, base)
     };
     let reporter = hub.register("send", name.clone(), 0);
+    reporter.set_peer(&addr.ip().to_string());
     let progress_id = reporter.id();
 
     let opts = SendOptions {

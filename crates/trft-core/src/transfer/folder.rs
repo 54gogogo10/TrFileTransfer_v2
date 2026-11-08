@@ -267,7 +267,11 @@ where
         let report = opts
             .progress
             .as_ref()
-            .map(|h| h.register("recv", rel.clone(), size));
+            .map(|h| {
+                let r = h.register("recv", rel.clone(), size);
+                r.set_peer(&peer.ip().to_string());
+                r
+            });
         let (part, actual) =
             resume::recv_file_payload(s, &parent, &file_name, size, opts, report.as_ref()).await?;
         if let Some(r) = &report {

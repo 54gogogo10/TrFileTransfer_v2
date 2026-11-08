@@ -141,6 +141,7 @@ impl ChunkTracker {
         name: &str,
         total: u64,
         save_dir: &Path,
+        peer_ip: &str,
     ) -> Result<std::sync::Arc<GroupSession>> {
         let mut map = self.sessions.lock().await;
         let now = now_ms();
@@ -217,7 +218,11 @@ impl ChunkTracker {
             }),
             last_seen_ms: AtomicU64::new(now),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-            report: self.progress.as_ref().map(|h| h.register("recv", name, total)),
+            report: self.progress.as_ref().map(|h| {
+                let r = h.register("recv", name, total);
+                r.set_peer(peer_ip);
+                r
+            }),
         });
         map.insert(gid, s.clone());
         Ok(s)
@@ -233,6 +238,7 @@ impl ChunkTracker {
         offset: u64,
         payload: &[u8],
         save_dir: &Path,
+        peer_ip: &str,
     ) -> Result<bool> {
         if total == 0 {
             return Err(proto("分块传输不支持空文件"));
@@ -240,7 +246,7 @@ impl ChunkTracker {
         if total > MAX_TRANSFER_SIZE {
             return Err(proto(format!("声明大小 {total} 超过 1 PiB 上限")));
         }
-        let sess = self.ensure(gid, name, total, save_dir).await?;
+        let sess = self.ensure(gid, name, total, save_dir, peer_ip).await?;
         let end = offset + payload.len() as u64;
         let mut completed = false;
         {
@@ -407,7 +413,7 @@ where
         read_exact_long(s, &mut buf[..want]).await?;
         if opts
             .chunk_sessions
-            .receive(gid, &name, total, pos, &buf[..want], &dir)
+            .receive(gid, &name, total, pos, &buf[..want], &dir, &peer.ip().to_string())
             .await?
         {
             completed = true;
@@ -764,9 +770,9 @@ mod tests {
         let gid = [0xABu8; 16];
         let payload = vec![7u8; 3000];
         // 三个块覆盖 [0,3000)：最后一块返回 completed=true（组装开始）。
-        let c0 = tracker.receive(gid, "a.bin", 3000, 0, &payload[..1000], &out).await.unwrap();
-        let c1 = tracker.receive(gid, "a.bin", 3000, 1000, &payload[1000..2000], &out).await.unwrap();
-        let c2 = tracker.receive(gid, "a.bin", 3000, 2000, &payload[2000..], &out).await.unwrap();
+        let c0 = tracker.receive(gid, "a.bin", 3000, 0, &payload[..1000], &out, "203.0.113.9").await.unwrap();
+        let c1 = tracker.receive(gid, "a.bin", 3000, 1000, &payload[1000..2000], &out, "203.0.113.9").await.unwrap();
+        let c2 = tracker.receive(gid, "a.bin", 3000, 2000, &payload[2000..], &out, "203.0.113.9").await.unwrap();
         assert!((c0, c1, c2) == (false, false, true));
         // 组装尚未完成（finish 未被调用）：0x0C 必须不是 0x01。
         // 暂停时钟下等待窗口立即到期——修复前此处直接回 STATUS_OK（红）。
@@ -787,8 +793,8 @@ mod tests {
         // 成功路径。
         let g1 = [0x11u8; 16];
         let payload = vec![1u8; 2000];
-        tracker.receive(g1, "ok.bin", 2000, 0, &payload[..1000], &out).await.unwrap();
-        tracker.receive(g1, "ok.bin", 2000, 1000, &payload[1000..], &out).await.unwrap();
+        tracker.receive(g1, "ok.bin", 2000, 0, &payload[..1000], &out, "203.0.113.9").await.unwrap();
+        tracker.receive(g1, "ok.bin", 2000, 1000, &payload[1000..], &out, "203.0.113.9").await.unwrap();
         tracker.finish(g1, &opts).await.unwrap();
         assert_eq!(tracker.end_status(g1).await, STATUS_OK, "组装成功后 0x0C 判 0x01");
         // 组装成功后会话保留完成态：0x0B 回满覆盖（迟到查询稳定收敛）。
@@ -796,8 +802,8 @@ mod tests {
 
         // 失败路径：删除半成品令组装（哈希）失败 → 会话移除 → 0x00。
         let g2 = [0x22u8; 16];
-        tracker.receive(g2, "bad.bin", 2000, 0, &payload[..1000], &out).await.unwrap();
-        tracker.receive(g2, "bad.bin", 2000, 1000, &payload[1000..], &out).await.unwrap();
+        tracker.receive(g2, "bad.bin", 2000, 0, &payload[..1000], &out, "203.0.113.9").await.unwrap();
+        tracker.receive(g2, "bad.bin", 2000, 1000, &payload[1000..], &out, "203.0.113.9").await.unwrap();
         std::fs::remove_file(group_part_path(&out, "bad.bin", &g2)).unwrap();
         tracker.finish(g2, &opts).await.unwrap_err();
         assert_eq!(tracker.end_status(g2).await, STATUS_REJECT, "组装失败必须判 0x00（无假成功）");
@@ -818,12 +824,12 @@ mod tests {
 
         // victim：部分覆盖（未完成）。
         let victim = [0x99u8; 16];
-        tracker.receive(victim, "victim.bin", 10_000, 0, &payload, &out).await.unwrap();
+        tracker.receive(victim, "victim.bin", 10_000, 0, &payload, &out, "203.0.113.9").await.unwrap();
         // 填充到 64 组挤占 LRU（victim 最旧 → 被逐出）。
         for i in 0..MAX_CHUNK_SESSIONS {
             let mut gid = [0u8; 16];
             gid[0] = i as u8;
-            tracker.receive(gid, "f.bin", 10_000, 0, &payload, &out).await.unwrap();
+            tracker.receive(gid, "f.bin", 10_000, 0, &payload, &out, "203.0.113.9").await.unwrap();
         }
         // 排空事件流，找到 victim 的 Reporter 是否收到 failed。
         let mut victim_failed = false;
@@ -838,13 +844,13 @@ mod tests {
         let done = [0xAAu8; 16];
         let opts = RecvOptions { save_dir: out.clone(), ..Default::default() };
         let full = vec![2u8; 200];
-        tracker.receive(done, "done.bin", 200, 0, &full, &out).await.unwrap();
-        tracker.receive(done, "done.bin", 200, 100, &full[100..], &out).await.unwrap();
+        tracker.receive(done, "done.bin", 200, 0, &full, &out, "203.0.113.9").await.unwrap();
+        tracker.receive(done, "done.bin", 200, 100, &full[100..], &out, "203.0.113.9").await.unwrap();
         tracker.finish(done, &opts).await.unwrap();
         for i in 0..MAX_CHUNK_SESSIONS {
             let mut gid = [1u8; 16];
             gid[0] = i as u8;
-            tracker.receive(gid, "g.bin", 10_000, 0, &payload, &out).await.unwrap();
+            tracker.receive(gid, "g.bin", 10_000, 0, &payload, &out, "203.0.113.9").await.unwrap();
         }
         let mut done_flipped = false;
         while let Ok(ev) = rx.try_recv() {

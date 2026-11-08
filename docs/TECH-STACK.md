@@ -93,7 +93,7 @@
 ## 7. 已知风险与偏离声明
 
 1. ~~**WebView2 缺失的老系统**（Win10 LTSC 等）：首次启动需检测并引导安装运行时——记入 M4'~~ ✅ M4' 落地：注册表三处检测（HKLM/HKCU/WOW6432Node）+ 原生 MessageBox 引导官方 Bootstrapper 下载。
-2. **reed-solomon-erasure 为纯 Rust 参考实现**：FEC 吞吐基准 ⬜ 发布阶段，不达标再换 C 绑定实现。
+2. ~~**reed-solomon-erasure 为纯 Rust 参考实现**：FEC 吞吐基准 ⬜ 发布阶段，不达标再换 C 绑定实现~~ ✅ 已基准化（`tests/fec_bench.rs`，`--ignored` 手动跑）：4+2×1400B 组 **编码 1160 MB/s / 重建 891 MB/s**（release，20k 组 112MB 数据）——1 Gbps 链路需求（125 MB/s）的 ~9× 余量，纯 Rust 实现保留，C 绑定评估关闭。
 3. **quinn 0.11 → 后续大版本**：锁版本升级。
 4. **CLI 参数面有意偏离规格 §3.6**：`--proto <tcp|udt|udp>` 取代 `[--tcp|--udt|--udp]` 开关；新增 `--text`、`--pin`、`--noencrypt`；`--nocompress` 已随 0x08 落地（send/sync）；新增 `--chunks 1-8`（0x02 并行分块）与 `update` 动词。差量同步 0x04 已落地（稳定会话 ID + 位图差分）。
 5. ~~**进度事件机制**（规格 §3.1 节流 100ms）⬜ M4'~~ ✅ M4' 落地：`trft-core::progress`（惰性节流、终态必达、Outcome Drop 即失败）；0x00/0x01/0x02/0x03/0x04/UDP 双侧全接线；UI 只消费事件（§1.4 分层纪律）。
@@ -221,6 +221,12 @@
    - **B PRODUCT-SPEC 文档对齐**（清除重写版规格中的 C# 遗留自相矛盾）：头部基线声明（承自 C# v2.14 规格 + Rust 实现基线指向 TECH-STACK）；§7.2 CS1985 → Rust 等价纪律；§8.1 数据文件布局改写为 Rust 实际（config.toml/每目录哈希缓存/devices.json/logs+crash）；§8.2 运行时改 Win10/11 + Rust + WebView2 双形态；§9 平台策略重写（「Rust/Go 重写暂不采纳」条目标注已由本仓库实施，消除否决自己的悖论）；§10 质量规格改 206 项 Rust 测试 + tauri.conf 版本单源 + CI 缺席如实登记；§4.3 C# ≤2.11 互通矩阵 → 不做互通承诺 + 自互通 e2e；§6.1 补 0x04 清单 100,000 偏离注；§7.1 完成确认集合统一（补 0x03）；§12.1 标注 C# 键名参考 + config.rs 权威；AGENTS.md 断链 → TECH-STACK 承接其职能；
    - **验证**：cargo test -p trft-gui 15 项全绿（logging 3 项新增：ISO 日期文件名/30 天清理仅删 .log/非日志文件不动）；mock 浏览器测试床实测 A2（8081/8082 跟随）/A3（双文件入队）/A4（双语帮助开合）/A5（已知设备徽标 + 未知 IP 负例）；全量回归 209/0、0 告警；
    - **提交前自审修复**：crash.log 与日常日志**分锁**——panic 若正发生在 `log_line` 持锁期间，钩子内 `write_crash_log` 再抢同一把非重入 Mutex 会死锁（崩溃路径反而卡死）；改独立 `CRASH_LOCK` + `try_lock`，争用（双线程同时 panic）时无锁直写——append 交错风险可接受，宁留痕不丢失。
+26. **五项收尾批**（2026-11-08，209 → 210 项）：
+   - **A5 接收侧设备名徽标**（补齐对齐批登记的后续项）：`ProgressEvent` 增 `peer: Option<String>` + `Reporter::set_peer`（首值锁定——分块多连接共享 Reporter 时迟到连接不得改写归属）；接收侧 6 个 register 站点全接线（0x00/0x03/0x04/0x01/0x02/UDP），GUI 发送侧 3 个 register 补目标 IP；前端徽标改 **ev.peer 单源**（发送/接收同一逻辑，命中已知设备显示记忆名、未知回落 IP），task-start 依赖 reqByTask 的旧路径删除；判别：progress 单测（首值锁定 + set_peer 不产生事件）+ e2e_tcp 进度测试断言 `peer == 127.0.0.1` 全事件成立；
+   - **CI 接入**（§10.2 登记的缺席项闭环）：`.github/workflows/ci.yml`——Windows 全量测试 + release 编译门；Linux/macOS 逻辑层三 crate（trft-gui 依赖 WebView2/Tauri 系统栈，跨平台 GUI 仍为发布阶段项）；CLI `--version` 冒烟；
+   - **FEC 吞吐基准**（§7.2 发布阶段项闭环）：`tests/fec_bench.rs`（`--ignored` 手动跑）——4+2×1400B 组 **编码 1160 MB/s / 重建 891 MB/s**（release，20k 组 112MB）：1 Gbps 链路需求 125 MB/s 的 ~9× 余量，纯 Rust 保留、C 绑定评估关闭；
+   - **core 错误串国际化（shim 批次）**：前端 `te()` 子串模式映射（20 条高频 core 错误 → 英文），只挂在 toast/log 两个显示咽喉点，zh 透传、未命中回落原文；**登记**：错误码架构（ErrorKind → 前端模板）为后续独立批次，shim 覆盖不了参数化长尾（如「需要 ≥ N 字节」中的数字随原文保留）；
+   - **验证**：全量 210/0、0 告警；mock 测试床实测接收卡徽标（ev.peer → 设备名）与 EN 错误 shim。
 
 ## 8. 记录在案的否决项
 

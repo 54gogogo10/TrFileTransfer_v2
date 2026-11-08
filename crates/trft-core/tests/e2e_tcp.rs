@@ -377,6 +377,13 @@ async fn progress_events_wired_on_send_and_recv() {
     assert_eq!(last.state, "done", "接收侧终态必为 done: {revs:?}");
     assert_eq!(last.done, total, "接收侧终态字节数必须等于文件大小");
     assert_eq!(last.kind, "recv");
+    // A5 对齐（原版 v2.15 DeviceDisplay.NameFor 接收侧）：接收事件必须携带对端 IP
+    //（回环测试即 127.0.0.1）——UI 据此显示已知设备名徽标。
+    assert!(
+        revs.iter().all(|e| e.peer.as_deref() == Some("127.0.0.1")),
+        "接收事件 peer 必须全为对端 IP: {:?}",
+        revs.iter().map(|e| e.peer.clone()).collect::<Vec<_>>()
+    );
 }
 
 /// SyncVerifyContent strict 判别（规格 §3.3）：二次同步默认位图全跳过（进度总量 0）；

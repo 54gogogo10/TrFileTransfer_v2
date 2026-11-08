@@ -1,0 +1,48 @@
+# CI（规格 §10.2 / TECH-STACK：此前登记缺席，本文件闭环）。
+# 矩阵：Windows 全量（含 GUI 编译）；Linux / macOS 覆盖逻辑层三 crate
+# （trft-gui 依赖 WebView2/Tauri 系统栈，跨平台 GUI 矩阵为发布阶段项）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-full:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 全量测试
+        run: cargo test --workspace
+      - name: release 编译门（含 GUI/链接栈修复验证）
+        run: cargo build --release --workspace
+
+  linux-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 逻辑层三 crate 测试
+        run: cargo test -p trft-core -p trft-cli -p trft-server
+      - name: CLI/server release 编译
+        run: cargo build --release -p trft-cli -p trft-server
+      - name: CLI 冒烟（Linux 二进制可执行）
+        run: ./target/release/trft --version
+
+  macos-core:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 逻辑层三 crate 测试
+        run: cargo test -p trft-core -p trft-cli -p trft-server
+      - name: CLI/server release 编译
+        run: cargo build --release -p trft-cli -p trft-server
+      - name: CLI 冒烟（macOS 二进制可执行）
+        run: ./target/release/trft --version

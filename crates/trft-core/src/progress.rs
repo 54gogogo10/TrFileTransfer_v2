@@ -33,6 +33,9 @@ pub struct ProgressEvent {
     pub total: u64,
     /// `"running"` / `"done"` / `"failed"`。
     pub state: &'static str,
+    /// 对端 IP（接收端 = 来源，发送端 = 目标；None = 未上报）。UI 据此显示
+    /// 已知设备名徽标（对齐原版 v2.15 DeviceDisplay.NameFor 的接收侧）。
+    pub peer: Option<String>,
 }
 
 const STATE_RUNNING: u8 = 0;
@@ -74,6 +77,8 @@ struct Shared {
     id: u64,
     kind: &'static str,
     name: String,
+    /// 对端 IP（set_peer 一次写入；连接建立后紧随 register，无热路径竞争）。
+    peer: Mutex<Option<String>>,
     total: AtomicU64,
     done: AtomicU64,
     state: AtomicU8,
@@ -97,6 +102,7 @@ impl Reporter {
             done: sh.done.load(Ordering::Relaxed),
             total: sh.total.load(Ordering::Relaxed),
             state,
+            peer: sh.peer.lock().expect("进度对端锁").clone(),
         }
     }
 
@@ -115,6 +121,15 @@ impl Reporter {
             *last = Some(Instant::now());
             drop(last);
             let _ = self.tx.send(Self::snapshot(&self.sh, "running"));
+        }
+    }
+
+    /// 上报对端 IP（register 后紧随调用一次；重复调用以首值为准——
+    /// 分块多连接共享 Reporter 时，迟到连接不得改写初始归属）。
+    pub fn set_peer(&self, ip: &str) {
+        let mut p = self.sh.peer.lock().expect("进度对端锁");
+        if p.is_none() {
+            *p = Some(ip.to_string());
         }
     }
 
@@ -175,6 +190,7 @@ impl ProgressHub {
                 id,
                 kind,
                 name: name.into(),
+                peer: Mutex::new(None),
                 total: AtomicU64::new(total),
                 done: AtomicU64::new(0),
                 state: AtomicU8::new(STATE_RUNNING),
@@ -252,5 +268,21 @@ mod tests {
         assert_eq!(ev.total, 0);
         assert_eq!(ev.done, 4096);
         assert_eq!(ev.name, "流式");
+    }
+
+    #[tokio::test]
+    async fn peer_set_once_flows_into_events() {
+        let (tx, mut rx) = unbounded_channel();
+        let hub = ProgressHub::new(tx);
+        let r = hub.register("recv", "p.bin", 100);
+        r.set_peer("192.168.1.20");
+        r.set_peer("10.0.0.1"); // 首值锁定：分块多连接迟到者不得改写归属
+        r.add(1);
+        let ev = rx.try_recv().expect("运行态事件");
+        assert_eq!(ev.peer.as_deref(), Some("192.168.1.20"), "对端 IP 必须进事件且取首值");
+        r.finish();
+        let fin = rx.try_recv().expect("终态事件");
+        assert_eq!(fin.peer.as_deref(), Some("192.168.1.20"));
+        assert!(rx.try_recv().is_err(), "set_peer 本身不得产生事件");
     }
 }

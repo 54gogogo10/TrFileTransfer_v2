@@ -170,6 +170,39 @@ const L10N = {
 let lang = "zh";
 const t = (k) => L10N[lang][k] !== undefined ? L10N[lang][k] : k;
 
+/* ============ 后端错误串英译 shim（TECH-STACK §26 登记）============
+   core 错误是中文 Display（错误码架构为后续独立批次）——EN 界面下按子串模式
+   改写展示文案，未命中回落原文。只在 toast/log 出口应用（全 UI 显示的单咽喉点），
+   zh 界面原样透传；模式为中文子串 → 对英文原文天然 no-op，无双改写风险。 */
+const ERR_EN = [
+  [/磁盘可用空间不足/, "Not enough free disk space on the receiver"],
+  [/对端拒绝[:：]\s*/, "Rejected by peer: "],
+  [/配对码错误|配对码不匹配/, "Wrong pairing code"],
+  [/尝试过多|已锁定|已计错锁定/, "Too many failed attempts - temporarily locked"],
+  [/对端不支持[:：]?\s*/, "Not supported by peer: "],
+  [/路径不是目录/, "Path is not a directory"],
+  [/文件不存在|找不到指定的|系统找不到/, "File or path not found"],
+  [/连接被拒绝/, "Connection refused"],
+  [/远程主机强迫关闭|中止了一个已建立的连接/, "Connection reset by peer"],
+  [/连接超时|请求超时/, "Connection timed out"],
+  [/无法识别|协议版本/, "Unrecognized peer data (protocol version mismatch?)"],
+  [/已中断|被掐断/, "Transfer interrupted"],
+  [/续传协商失败/, "Resume negotiation failed"],
+  [/越界|分块.*不符/, "Chunk framing error"],
+  [/单向 UDP/, "One-way UDP: "],
+  [/指纹钉扎/, "Certificate pinning: "],
+  [/加密|降级/, "Encryption negotiation failed"],
+  [/占用/, "File is locked or in use"],
+  [/非法文件名|非法路径|非法文件/, "Illegal file name or path"],
+  [/拒绝[:：]\s*/, "Denied: "],
+];
+function te(s) {
+  if (lang !== "en" || typeof s !== "string") return s;
+  let out = s;
+  for (const [re, rep] of ERR_EN) out = out.replace(re, rep);
+  return out;
+}
+
 /* ============ 状态 ============ */
 let appState = null;            // get_app_state 返回
 const tasks = new Map();        // progressId -> { el, bar, meta, state }
@@ -228,7 +261,7 @@ function toast(msg, cls, actionText, onAction, extraActions) {
   el.className = "toast " + (cls || "");
   const span = document.createElement("span");
   span.className = "tmsg";
-  span.textContent = msg;
+  span.textContent = te(msg);
   el.appendChild(span);
   const actions = [];
   if (actionText) actions.push({ text: actionText, fn: onAction });
@@ -271,7 +304,7 @@ function log(level, msg) {
   if (empty) empty.remove();
   const li = document.createElement("li");
   li.className = level || "";
-  li.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  li.textContent = new Date().toLocaleTimeString() + "  " + te(msg);
   list.prepend(li);
   while (list.children.length > 500) list.lastChild.remove(); // 规格 §3.7：UI 日志上限 500 条
 }
@@ -867,6 +900,14 @@ function onProgress(ev) {
     return; // 轮 7 P3：取消后迟到的终态事件不得重建幽灵卡
   }
   const card = ensureCard(ev);
+  // 对端徽标（对齐原版 v2.15 DeviceDisplay.NameFor，A5 收发全量）：core 事件
+  // 携带 peer（发送=目标 IP，接收=来源 IP）——命中已知设备显示记忆名，未知回落 IP。
+  if (ev.peer) {
+    const dev = knownDevices.find((d) => d.ip === ev.peer);
+    const label = dev && dev.name ? dev.name : ev.peer;
+    const want = (ev.kind === "send" ? "↑ " : "↓ ") + card.base + " → " + label;
+    if (card.name.textContent !== want) card.name.textContent = want;
+  }
   const frac = ev.total > 0 ? Math.min(1, ev.done / ev.total) : 0;
   card.bar.value = frac;
   // 速度（指数滑动）+ ETA（客户端按事件增量估算，core 只报字节）。
@@ -1571,17 +1612,7 @@ async function wireEvents() {
     const p = ev.payload;
     taskByProgress.set(p.progressId, p.id);
     const card = tasks.get(p.progressId);
-    if (card) {
-      attachCardButtons(p.progressId, card);
-      // 对齐原版 v2.15（DeviceDisplay.NameFor）：发送卡标题补已知设备名——
-      // IP 无记忆名时不加徽标（避免把裸 IP 从 meta 区重复到标题）。
-      if (card.kind === "send") {
-        const entry = reqByTask.get(p.id);
-        const ip = entry && entry.req && entry.req.ip;
-        const dev = ip && knownDevices.find((d) => d.ip === ip);
-        if (dev && dev.name) card.name.textContent = "↑ " + card.base + " → " + dev.name;
-      }
-    }
+    if (card) attachCardButtons(p.progressId, card);
   });
   await listen("trft://task", (ev) => {
     const p = ev.payload;
