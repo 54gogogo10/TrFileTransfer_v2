@@ -61,6 +61,7 @@ const L10N = {
     st_today: "今日次数", st_today_bytes: "今日流量", st_week_bytes: "7 天流量", st_total: "累计次数", st_total_bytes: "累计流量",
     by_device: "按设备明细", stats_history: "传输历史", dir_all: "全部", dir_s: "发送", dir_r: "接收",
     stats_clear_confirm: "确定清除全部传输统计？（不可恢复）",
+    locate: "在资源管理器中定位", dir_apply_hint: "目录类选项将在对应接收器下次启动时生效",
     monitor: "监控模式", monitor_start: "启动监控", monitor_stop: "停止监控", monitor_dir: "监控目录",
     monitor_hint: "目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。",
     mon_queued: "入队", mon_not_ready: "未就绪（等待）", mon_dropped: "已消失（丢弃）", mon_sending: "发送中", mon_sent: "已发送", mon_failed: "失败",
@@ -140,6 +141,7 @@ const L10N = {
     st_today: "Today", st_today_bytes: "Today bytes", st_week_bytes: "7-day bytes", st_total: "Total count", st_total_bytes: "Total bytes",
     by_device: "Per device", stats_history: "Transfer history", dir_all: "All", dir_s: "Sent", dir_r: "Received",
     stats_clear_confirm: "Clear all transfer statistics? (irreversible)",
+    locate: "Locate in Explorer", dir_apply_hint: "Directory options take effect when the receiver next starts",
     monitor: "Monitor", monitor_start: "Start monitor", monitor_stop: "Stop monitor", monitor_dir: "Watch dir",
     monitor_hint: "Ready files are sent automatically (exclusive open + stable window); moved to \"Sent files\" on success.",
     mon_queued: "queued", mon_not_ready: "not ready (waiting)", mon_dropped: "vanished (dropped)", mon_sending: "sending", mon_sent: "sent", mon_failed: "failed",
@@ -1267,6 +1269,8 @@ async function saveSettings() {
     await invoke("save_config", { config: c });
     appState.config = c;
     toast(t("saved"), "ok");
+    // 规格 §3.3「目录类选项下次服务器启动生效（有提示）」：接收器运行中才提示。
+    if (appState.receivers && appState.receivers.length) toast(t("dir_apply_hint"), "warn");
   } catch (e) {
     toast(t("save_fail") + ": " + e, "err");
   }
@@ -1419,6 +1423,15 @@ async function refreshStatsRecords() {
       body.textContent = (r.dir === "S" ? "↑ " : "↓ ") + r.path + "  " + fmtBytes(r.bytes) + "  " + r.detail + "  → " + r.peer;
       li.appendChild(time);
       li.appendChild(body);
+      // 对齐原版 HistoryDialog：资源管理器定位（旧 6 字段行无路径时不提供）。
+      if (r.path) {
+        const loc = document.createElement("button");
+        loc.className = "x";
+        loc.title = t("locate");
+        loc.textContent = "📂";
+        loc.addEventListener("click", () => invoke("open_locate", { path: r.path }).catch((e) => toast(String(e), "err")));
+        li.appendChild(loc);
+      }
       list.appendChild(li);
     });
   } catch (e) { /* 静默 */ }

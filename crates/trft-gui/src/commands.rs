@@ -1360,6 +1360,26 @@ fn manifest_url(app: &tauri::AppHandle) -> Result<String, String> {
 
 // ============ 桌面集成 ============
 
+/// 资源管理器定位（对齐原版 HistoryDialog：传输历史行定位到文件）。
+#[tauri::command]
+pub fn open_locate(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .map_err(err)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let p = std::path::Path::new(&path);
+        let dir = p.parent().unwrap_or(p);
+        std::process::Command::new("xdg-open").arg(dir).spawn().map_err(err)?;
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub fn open_path(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]

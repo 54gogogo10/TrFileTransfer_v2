@@ -62,6 +62,7 @@ fn main() {
             commands::verify_stop,
             commands::update_check,
             commands::update_install,
+            commands::open_locate,
             commands::open_path,
             commands::autostart_set,
             commands::autostart_get,
