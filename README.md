@@ -27,10 +27,10 @@
 
 | 文件 | 用途 |
 |---|---|
-| `TrFileTransfer-GUI-0.1.0.exe` | 桌面图形界面（单文件） |
-| `TrFileTransfer-GUI-0.1.0-portable.zip` | 离线便携版（GUI + 内置 WebView2 运行时，解压即用） |
-| `TrFileTransfer-0.1.0.exe` | 命令行工具（无界面环境 / 脚本） |
-| `TrFileTransfer-server-0.1.0.exe` | Web 管理面 |
+| `TrFileTransfer-GUI-0.2.0.exe` | 桌面图形界面（单文件） |
+| `TrFileTransfer-GUI-0.2.0-portable.zip` | 离线便携版（GUI + 内置 WebView2 运行时，解压即用） |
+| `TrFileTransfer-0.2.0.exe` | 命令行工具（无界面环境 / 脚本） |
+| `TrFileTransfer-server-0.2.0.exe` | Web 管理面 |
 
 **系统要求**：Windows 10/11 x64。GUI 依赖 WebView2 运行时（多数 Win10/11 已内置；缺失时程序会引导安装，便携版无需联网）。CLI / server 无此依赖。
 
@@ -40,7 +40,7 @@
 
 ### 图形界面
 
-1. 两台电脑都运行 `TrFileTransfer-GUI-0.1.0.exe`；
+1. 两台电脑都运行 `TrFileTransfer-GUI-0.2.0.exe`；
 2. 接收方在「接收」页启动监听（TCP / UDT / UDP 三协议可同时运行），首次启动按提示放行防火墙；
 3. 发送方在「发送」页拖入文件 / 文件夹，填对方 IP 与端口，点「发送」；
 4. 对方若启用了配对码，发送时填入相同配对码即可（可在设置页生成 4–12 位强配对码）；

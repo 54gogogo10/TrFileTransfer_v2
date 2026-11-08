@@ -12,7 +12,7 @@ rem NOTE: this file must stay CRLF + ANSI(GBK) for cmd; edit via an encoding-awa
 
 setlocal
 cd /d "%~dp0"
-set VERSION=0.1.0
+set VERSION=0.2.0
 
 echo [1/3] cargo build --release --workspace
 cargo build --release --workspace

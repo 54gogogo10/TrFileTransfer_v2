@@ -8,7 +8,7 @@ description = "TrFileTransfer Web 共享骨架（axum）"
 axum = { version = "0.8", features = ["multipart"] }
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
-trft-core = { version = "0.1.0", path = "../trft-core" }
+trft-core = { version = "0.2.0", path = "../trft-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # 规格 §6.1「头读超时 15s」：axum::serve 不暴露 hyper 的 header_read_timeout，
 # 手动 serve 连接（轮 2 P1）；tokio-util 供流式下载 ReaderStream。
