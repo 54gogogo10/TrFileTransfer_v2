@@ -51,7 +51,10 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn new(rep: Option<Reporter>) -> Self {
-        Self { rep, settled: false }
+        Self {
+            rep,
+            settled: false,
+        }
     }
 
     pub fn finish(mut self) {
@@ -173,13 +176,19 @@ pub struct ProgressHub {
 
 impl ProgressHub {
     pub fn new(tx: UnboundedSender<ProgressEvent>) -> Self {
-        Self { next: Arc::new(AtomicU64::new(1)), tx }
+        Self {
+            next: Arc::new(AtomicU64::new(1)),
+            tx,
+        }
     }
 
     /// 带 ID 基址的 Hub（GUI 专用：每个 Hub 一个全局唯一基址——
     /// 前端以 progressId 为全局键，Hub 内从 1 递增会让并发 Hub 互相串台）。
     pub fn with_id_base(tx: UnboundedSender<ProgressEvent>, base: u64) -> Self {
-        Self { next: Arc::new(AtomicU64::new(base)), tx }
+        Self {
+            next: Arc::new(AtomicU64::new(base)),
+            tx,
+        }
     }
 
     /// 注册一个传输：分配 ID 并返回 Reporter。`total` 传 0 表示未知。
@@ -279,7 +288,11 @@ mod tests {
         r.set_peer("10.0.0.1"); // 首值锁定：分块多连接迟到者不得改写归属
         r.add(1);
         let ev = rx.try_recv().expect("运行态事件");
-        assert_eq!(ev.peer.as_deref(), Some("192.168.1.20"), "对端 IP 必须进事件且取首值");
+        assert_eq!(
+            ev.peer.as_deref(),
+            Some("192.168.1.20"),
+            "对端 IP 必须进事件且取首值"
+        );
         r.finish();
         let fin = rx.try_recv().expect("终态事件");
         assert_eq!(fin.peer.as_deref(), Some("192.168.1.20"));

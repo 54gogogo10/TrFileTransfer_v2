@@ -6,12 +6,12 @@
 //! `Cache-Control: no-store` + `X-Frame-Options: DENY` + CSP；仅图片/音视频/pdf/txt 内联，
 //! HTML/SVG 一律 attachment。
 
-use axum::Router;
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxPath, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use axum::Router;
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -62,7 +62,11 @@ impl WebState {
     }
 
     /// 测试/外部注入派生密钥。
-    pub fn with_token_secret(dir: PathBuf, auth: Option<AuthConfig>, token_secret: [u8; 32]) -> Self {
+    pub fn with_token_secret(
+        dir: PathBuf,
+        auth: Option<AuthConfig>,
+        token_secret: [u8; 32],
+    ) -> Self {
         Self {
             dir,
             auth,
@@ -89,14 +93,17 @@ impl WebState {
     /// ——扫码直连整链失效且判别测试绕过了 token_for 掩盖失配；现统一 32 hex）。
     fn token_digest(&self) -> Option<[u8; 32]> {
         let code = &self.auth.as_ref()?.pairing_code;
-        let full = trft_core::crypto::kdf::hmac_sha256(&self.token_secret, &token_domain_input(code));
+        let full =
+            trft_core::crypto::kdf::hmac_sha256(&self.token_secret, &token_domain_input(code));
         let mut out = [0u8; 32];
         out[..16].copy_from_slice(&full[..16]);
         Some(out)
     }
 
     fn check_token(&self, t: &str) -> bool {
-        let Some(expect) = self.token_digest() else { return false };
+        let Some(expect) = self.token_digest() else {
+            return false;
+        };
         let mut got = [0u8; 16];
         if t.len() != 32 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
             return false;
@@ -129,9 +136,15 @@ pub fn build_router(state: Arc<WebState>) -> Router {
                 .post(delete_submit)
                 .layer(DefaultBodyLimit::max(8192)),
         )
-        .layer(middleware::from_fn_with_state(state.clone(), security_headers_mw))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers_mw,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
-        .layer(middleware::from_fn_with_state(state.clone(), concurrency_mw))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            concurrency_mw,
+        ))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
 }
@@ -177,13 +190,23 @@ async fn concurrency_mw(
     }
 }
 
-async fn security_headers_mw(_state: State<Arc<WebState>>, req: axum::extract::Request, next: Next) -> Response {
+async fn security_headers_mw(
+    _state: State<Arc<WebState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
@@ -235,7 +258,9 @@ fn cookie_of(headers: &HeaderMap, name: &str) -> Option<String> {
         // 无 '=' 的段（代理/扩展塞进来的裸标记）必须**跳过**而不是整体放弃——
         // 旧实现用 `? ` 提前返回 None，前面任一坏段都会让后面的会话 Cookie
         // 找不到 → 已登录用户被踢回登录页（本轮 F6）。
-        let Some((k, v)) = part.trim().split_once('=') else { continue };
+        let Some((k, v)) = part.trim().split_once('=') else {
+            continue;
+        };
         if k == name {
             return Some(v.to_string());
         }
@@ -316,13 +341,17 @@ async fn login_submit(
     let h = res.headers_mut();
     h.append(
         header::SET_COOKIE,
-        HeaderValue::from_str(&format!("{SID_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/"))
-            .unwrap_or(HeaderValue::from_static("")),
+        HeaderValue::from_str(&format!(
+            "{SID_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/"
+        ))
+        .unwrap_or(HeaderValue::from_static("")),
     );
     h.append(
         header::SET_COOKIE,
-        HeaderValue::from_str(&format!("{CSRF_COOKIE}={csrf}; HttpOnly; SameSite=Strict; Path=/"))
-            .unwrap_or(HeaderValue::from_static("")),
+        HeaderValue::from_str(&format!(
+            "{CSRF_COOKIE}={csrf}; HttpOnly; SameSite=Strict; Path=/"
+        ))
+        .unwrap_or(HeaderValue::from_static("")),
     );
     res
 }
@@ -373,8 +402,14 @@ fn url_decode(s: &str) -> String {
 fn resolve_under(base: &Path, rel: &str) -> Result<PathBuf, (StatusCode, &'static str)> {
     let p = PathBuf::from(rel);
     if rel.contains('\0')
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+        || p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
     {
         return Err((StatusCode::BAD_REQUEST, "非法路径"));
     }
@@ -385,10 +420,7 @@ async fn view_root(State(st): State<Arc<WebState>>) -> Response {
     view(&st, "").await
 }
 
-async fn view_dir(
-    State(st): State<Arc<WebState>>,
-    AxPath(path): AxPath<String>,
-) -> Response {
+async fn view_dir(State(st): State<Arc<WebState>>, AxPath(path): AxPath<String>) -> Response {
     view(&st, &path).await
 }
 
@@ -406,7 +438,10 @@ async fn view(st: &WebState, rel: &str) -> Response {
     entries.sort_by_key(|e| (!e.path().is_dir(), e.file_name()));
     let mut rows = String::new();
     if !rel.is_empty() {
-        let parent = Path::new(rel).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let parent = Path::new(rel)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         rows.push_str(&format!(
             "<tr><td><a href=\"{}\">[..]</a></td><td></td><td></td></tr>",
             view_url(&parent)
@@ -416,8 +451,16 @@ async fn view(st: &WebState, rel: &str) -> Response {
         let name = e.file_name().to_string_lossy().to_string();
         let is_dir = e.path().is_dir();
         let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-        let sub = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-        let size_txt = if is_dir { "目录".into() } else { format_bytes(size) };
+        let sub = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        let size_txt = if is_dir {
+            "目录".into()
+        } else {
+            format_bytes(size)
+        };
         let dl = if is_dir {
             String::new()
         } else {
@@ -454,10 +497,15 @@ async fn view(st: &WebState, rel: &str) -> Response {
 }
 
 fn format_bytes(n: u64) -> String {
-    if n >= 1 << 30 { format!("{:.1} GiB", n as f64 / (1 << 30) as f64) }
-    else if n >= 1 << 20 { format!("{:.1} MiB", n as f64 / (1 << 20) as f64) }
-    else if n >= 1 << 10 { format!("{:.1} KiB", n as f64 / (1 << 10) as f64) }
-    else { format!("{n} B") }
+    if n >= 1 << 30 {
+        format!("{:.1} GiB", n as f64 / (1 << 30) as f64)
+    } else if n >= 1 << 20 {
+        format!("{:.1} MiB", n as f64 / (1 << 20) as f64)
+    } else if n >= 1 << 10 {
+        format!("{:.1} KiB", n as f64 / (1 << 10) as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 // ============ 下载（Range 断点续传） ============
@@ -502,7 +550,13 @@ fn content_disposition(name: &str, ext: &str) -> String {
     let disp = if inline { "inline" } else { "attachment" };
     let ascii: String = name
         .chars()
-        .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let mut pct = String::from("UTF-8''");
     for b in name.as_bytes() {
@@ -523,7 +577,9 @@ struct RangeSpec {
 
 /// 解析单区间 Range（多区间按 RFC 容忍降级为 200 全量——由调用方处理）。
 fn parse_range(h: &str, size: u64) -> Result<Option<RangeSpec>, ()> {
-    let Some(spec) = h.strip_prefix("bytes=") else { return Err(()) };
+    let Some(spec) = h.strip_prefix("bytes=") else {
+        return Err(());
+    };
     if spec.contains(',') {
         return Err(()); // 多区间：调用方回 200 全量
     }
@@ -539,10 +595,17 @@ fn parse_range(h: &str, size: u64) -> Result<Option<RangeSpec>, ()> {
         if n >= size {
             return Ok(None); // 调用方按无 Range 处理（200 全量）
         }
-        Ok(Some(RangeSpec { start: size - n, end: size - 1 }))
+        Ok(Some(RangeSpec {
+            start: size - n,
+            end: size - 1,
+        }))
     } else {
         let start: u64 = a.parse().map_err(|_| ())?;
-        let end = if b.is_empty() { size - 1 } else { b.parse::<u64>().map_err(|_| ())?.min(size - 1) };
+        let end = if b.is_empty() {
+            size - 1
+        } else {
+            b.parse::<u64>().map_err(|_| ())?.min(size - 1)
+        };
         if start > end || start >= size {
             return Err(());
         }
@@ -569,10 +632,8 @@ async fn download(
     if size == 0 {
         // 空文件无可服务区间（轮 2 P3：避免 size-1 回绕/debug panic）。
         let mut res = (StatusCode::RANGE_NOT_SATISFIABLE, "bytes */0").into_response();
-        res.headers_mut().insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("bytes */0"),
-        );
+        res.headers_mut()
+            .insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes */0"));
         return res;
     }
     let name = full
@@ -593,7 +654,10 @@ async fn download(
         HeaderValue::from_str(&content_disposition(&name, &ext))
             .unwrap_or(HeaderValue::from_static("attachment")),
     );
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type_of(&ext)));
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type_of(&ext)),
+    );
 
     let range = headers
         .get(header::RANGE)
@@ -608,7 +672,11 @@ async fn download(
             };
             use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
             let mut file = file;
-            if file.seek(std::io::SeekFrom::Start(spec.start)).await.is_err() {
+            if file
+                .seek(std::io::SeekFrom::Start(spec.start))
+                .await
+                .is_err()
+            {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "定位失败").into_response();
             }
             // 流式响应（轮 2 P2：内存 O(块)——此前整段驻留内存可被放大到 OOM）。
@@ -645,11 +713,8 @@ async fn download(
         }
         Some(Err(())) => {
             // 不可满足/非法 → 416（规格 §3.4：206/416）。
-            let mut res = (
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                format!("bytes */{size}"),
-            )
-                .into_response();
+            let mut res =
+                (StatusCode::RANGE_NOT_SATISFIABLE, format!("bytes */{size}")).into_response();
             res.headers_mut().insert(
                 header::CONTENT_RANGE,
                 HeaderValue::from_str(&format!("bytes */{size}"))
@@ -714,8 +779,15 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
         OsRng.fill_bytes(&mut rnd);
         let p = Path::new(&name);
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-        let ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
-        let part = dest_dir.join(format!("{stem}.up{:08x}{ext}.part", u32::from_le_bytes(rnd)));
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        let part = dest_dir.join(format!(
+            "{stem}.up{:08x}{ext}.part",
+            u32::from_le_bytes(rnd)
+        ));
         let mut out = match tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -723,7 +795,9 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
             .await
         {
             Ok(f) => f,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "无法写入目标目录").into_response(),
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "无法写入目标目录").into_response()
+            }
         };
         // Drop 守卫（轮 3 P3-11）：handler 被取消/abort 时清理分支不执行——
         // 半成品 .part 不在任何清扫器覆盖内，必须由守卫兜底。
@@ -831,12 +905,21 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
             }
         };
         let _ = tokio::fs::remove_file(&part).await;
-        saved.push(final_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        saved.push(
+            final_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        );
     }
     if saved.is_empty() {
         return (StatusCode::BAD_REQUEST, "没有收到文件字段").into_response();
     }
-    (StatusCode::SEE_OTHER, [("Location", view_url(path))], format!("已接收 {} 个文件", saved.len()))
+    (
+        StatusCode::SEE_OTHER,
+        [("Location", view_url(path))],
+        format!("已接收 {} 个文件", saved.len()),
+    )
         .into_response()
 }
 
@@ -864,7 +947,12 @@ async fn delete_confirm(
         Some(c) => (c, None),
         None => {
             let c = rand_hex32();
-            (c.clone(), Some(format!("{CSRF_COOKIE}={c}; HttpOnly; SameSite=Strict; Path=/")))
+            (
+                c.clone(),
+                Some(format!(
+                    "{CSRF_COOKIE}={c}; HttpOnly; SameSite=Strict; Path=/"
+                )),
+            )
         }
     };
     let mut page = Html(format!(
@@ -879,7 +967,12 @@ async fn delete_confirm(
         html_escape(&path),
         url_escape(&path),
         html_escape(&csrf),
-        view_url(&Path::new(&path).parent().map(|p| p.to_string_lossy()).unwrap_or_default()),
+        view_url(
+            &Path::new(&path)
+                .parent()
+                .map(|p| p.to_string_lossy())
+                .unwrap_or_default()
+        ),
     ))
     .into_response();
     if let Some(sc) = set_cookie {
@@ -975,15 +1068,18 @@ fn url_escape(s: &str) -> String {
 /// 上传半成品文件名判定（轮 8 P3-2）：`{stem}.up{8hex}{ext}.part`——
 /// 与 upload_impl 的自产名严格同形。
 fn is_upload_part_name(name: &str) -> bool {
-    let Some(dot) = name.rfind(".up") else { return false };
+    let Some(dot) = name.rfind(".up") else {
+        return false;
+    };
     let after = &name[dot + 3..];
     // 自产形：".up" + 8 位 hex + ext（空或 ".xxx" 单段）+ ".part" 结尾。
     if after.len() < 8 || !after[..8].chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
-    let Some(stripped) = after[8..].strip_suffix(".part") else { return false };
-    stripped.is_empty()
-        || (stripped.starts_with('.') && !stripped[1..].contains('.'))
+    let Some(stripped) = after[8..].strip_suffix(".part") else {
+        return false;
+    };
+    stripped.is_empty() || (stripped.starts_with('.') && !stripped[1..].contains('.'))
 }
 
 pub fn cleanup_upload_orphans(dir: &std::path::Path) {
@@ -991,7 +1087,9 @@ pub fn cleanup_upload_orphans(dir: &std::path::Path) {
         if depth > 6 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         let now = std::time::SystemTime::now();
         for e in rd.flatten() {
             let p = e.path();
@@ -1009,7 +1107,11 @@ pub fn cleanup_upload_orphans(dir: &std::path::Path) {
             if let Ok(md) = e.metadata() {
                 if md
                     .modified()
-                    .map(|t| now.duration_since(t).map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600)).unwrap_or(false))
+                    .map(|t| {
+                        now.duration_since(t)
+                            .map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600))
+                            .unwrap_or(false)
+                    })
                     .unwrap_or(false)
                 {
                     let _ = std::fs::remove_file(&p);
@@ -1042,21 +1144,24 @@ pub async fn serve_with_header_timeout(
         tokio::spawn(async move {
             let service = hyper_util::service::TowerToHyperService::new(tower::service_fn(
                 move |req: hyper::Request<hyper::body::Incoming>| {
-                let app = app.clone();
-                async move {
-                    let mut req = req.map(axum::body::Body::new);
-                    req.extensions_mut()
-                        .insert(axum::extract::ConnectInfo(remote_addr));
-                    app.oneshot(req).await.map_err(|e| {
-                        std::io::Error::other(format!("router 调用失败: {e}"))
-                    })
-                }
-            }));
+                    let app = app.clone();
+                    async move {
+                        let mut req = req.map(axum::body::Body::new);
+                        req.extensions_mut()
+                            .insert(axum::extract::ConnectInfo(remote_addr));
+                        app.oneshot(req)
+                            .await
+                            .map_err(|e| std::io::Error::other(format!("router 调用失败: {e}")))
+                    }
+                },
+            ));
             let mut builder = http1::Builder::new();
             builder
                 .timer(TokioTimer::new())
                 .header_read_timeout(std::time::Duration::from_secs(15));
-            let _ = builder.serve_connection(TokioIo::new(socket), service).await;
+            let _ = builder
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
         });
     }
 }
@@ -1076,9 +1181,15 @@ mod tests {
         // 用户文件不误伤。
         assert!(!is_upload_part_name("my.uploader.part"));
         assert!(!is_upload_part_name("up.part"));
-        assert!(!is_upload_part_name("a.up123.txt.part"), "hex 段长度/边界不符");
+        assert!(
+            !is_upload_part_name("a.up123.txt.part"),
+            "hex 段长度/边界不符"
+        );
         assert!(!is_upload_part_name("a.upzzzzzzzz.txt.part"), "非 hex");
-        assert!(!is_upload_part_name("a.up1a2b3c4d.t.x.part"), "扩展名含点非自产形");
+        assert!(
+            !is_upload_part_name("a.up1a2b3c4d.t.x.part"),
+            "扩展名含点非自产形"
+        );
     }
 
     /// 本轮 F6 判别：Cookie 头里出现无 `=` 的段（代理/扩展常见）时，后面的

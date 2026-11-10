@@ -12,18 +12,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use trft_core::config::DuplicatePolicy;
-use trft_core::hashcache::{HashCache, cache_file_for};
-use trft_core::transfer::Transport;
+use trft_core::hashcache::{cache_file_for, HashCache};
+use trft_core::transfer::chunked::send_file_chunked;
 use trft_core::transfer::folder::send_folder_auto;
 use trft_core::transfer::quic::serve_quic;
 use trft_core::transfer::receiver::{self, RecvOptions};
 use trft_core::transfer::resume::{send_file_auto, send_folder_resume, stable_session_id};
-use trft_core::transfer::chunked::send_file_chunked;
-use trft_core::transfer::sender::{SendOptions, send_text};
-use trft_core::transfer::udp::{UdpRecvOptions, UdpSendOptions, send_file_udp, serve_udp};
+use trft_core::transfer::sender::{send_text, SendOptions};
+use trft_core::transfer::udp::{send_file_udp, serve_udp, UdpRecvOptions, UdpSendOptions};
+use trft_core::transfer::udt::serve_udt;
+use trft_core::transfer::Transport;
 
 #[derive(Parser)]
-#[command(name = "trft", version, about = "局域网点对点文件传输（TrFileTransfer v2）")]
+#[command(
+    name = "trft",
+    version,
+    about = "局域网点对点文件传输（TrFileTransfer v2）"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,7 +38,9 @@ struct Cli {
 enum Proto {
     /// 通用、防火墙友好
     Tcp,
-    /// 可靠 UDP 流（QUIC 槽位）
+    /// QUIC（quinn：TLS 1.3 + 自签证书 + 0x0D 通道绑定）
+    Quic,
+    /// UDT（原生可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议）
     Udt,
     /// 单向 UDP + FEC（仅单文件，无配对码/加密）
     Udp,
@@ -81,7 +88,7 @@ enum Cmd {
         #[arg(long)]
         nocompress: bool,
         /// QUIC 证书 SHA-256 指纹钉扎（64 位 hex；手动指定，不自动记录；
-        /// 无 --pin 时 --udt 不防主动中间人）
+        /// 无 --pin 时 --proto quic 不防主动中间人）
         #[arg(long = "pin")]
         quic_pin: Option<String>,
         /// 显式放行旧版对端的明文配对（默认拒绝——
@@ -99,7 +106,7 @@ enum Cmd {
         proto: Proto,
         #[arg(long)]
         code: Option<String>,
-        /// 收满 N 个文件（次传输）后退出（仅 tcp/udt）
+        /// 收满 N 个文件（次传输）后退出（仅 tcp/quic/udt）
         #[arg(long)]
         count: Option<u64>,
         /// 拒绝接收端的传输加密升级（默认接受）
@@ -149,9 +156,13 @@ enum Cmd {
 
 fn addr_of(ip: &str, port: u16) -> Result<SocketAddr, String> {
     if ip.contains(':') {
-        format!("[{ip}]:{port}").parse::<SocketAddr>().map_err(|e| e.to_string())
+        format!("[{ip}]:{port}")
+            .parse::<SocketAddr>()
+            .map_err(|e| e.to_string())
     } else {
-        format!("{ip}:{port}").parse::<SocketAddr>().map_err(|e| e.to_string())
+        format!("{ip}:{port}")
+            .parse::<SocketAddr>()
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -184,7 +195,8 @@ fn parse_pin(pin: &Option<String>) -> Result<Option<[u8; 32]>, String> {
 fn transport_of(p: Proto) -> Transport {
     match p {
         Proto::Tcp => Transport::Tcp,
-        Proto::Udt => Transport::Quic,
+        Proto::Quic => Transport::Quic,
+        Proto::Udt => Transport::Udt,
         Proto::Udp => Transport::Tcp, // 不会走到：UDP 分支单独处理
     }
 }
@@ -210,18 +222,27 @@ fn stream_opts(
         allow_legacy_pair,
         progress: None,
         // 规格 §3.3 stats.log：CLI 与 GUI 共享同一统计（TECH-STACK §7.10）。
-        stats: Some(std::sync::Arc::new(trft_core::stats::StatsLog::default_log())),
+        stats: Some(std::sync::Arc::new(
+            trft_core::stats::StatsLog::default_log(),
+        )),
     }
 }
 
-fn udp_opts(passes: Option<u32>, fec_parity: Option<u8>, nofec: bool, limit: Option<u64>) -> UdpSendOptions {
+fn udp_opts(
+    passes: Option<u32>,
+    fec_parity: Option<u8>,
+    nofec: bool,
+    limit: Option<u64>,
+) -> UdpSendOptions {
     UdpSendOptions {
         passes: passes.unwrap_or(2).clamp(1, 5),
         fec: !nofec,
         fec_parity: fec_parity.unwrap_or(2).clamp(1, 8),
         speed_limit_bps: limit.unwrap_or(0).min(10_000_000) * 1024,
         progress: None,
-        stats: Some(std::sync::Arc::new(trft_core::stats::StatsLog::default_log())),
+        stats: Some(std::sync::Arc::new(
+            trft_core::stats::StatsLog::default_log(),
+        )),
     }
 }
 
@@ -263,12 +284,30 @@ fn run_main() -> i32 {
 async fn run() -> i32 {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Send { ip, port, file, folder, text, proto, code, limit, srcport, chunks, passes, fec_parity, nofec, noencrypt, nocompress, quic_pin, allow_legacy_pair } => {
+        Cmd::Send {
+            ip,
+            port,
+            file,
+            folder,
+            text,
+            proto,
+            code,
+            limit,
+            srcport,
+            chunks,
+            passes,
+            fec_parity,
+            nofec,
+            noencrypt,
+            nocompress,
+            quic_pin,
+            allow_legacy_pair,
+        } => {
             if let Err(e) = validate_code(&code) {
                 return usage_fail(&e);
             }
-            if proto != Proto::Udt && quic_pin.is_some() {
-                return usage_fail("--pin 仅用于 --proto udt");
+            if proto != Proto::Quic && quic_pin.is_some() {
+                return usage_fail("--pin 仅用于 --proto quic");
             }
             if let Some(n) = chunks {
                 if !(1..=8).contains(&n) {
@@ -310,7 +349,9 @@ async fn run() -> i32 {
             };
             if proto == Proto::Udp {
                 if code.is_some() {
-                    return usage_fail("单向 UDP 无握手通道，不支持配对码/加密（规格 §3.1，帮助须明示）");
+                    return usage_fail(
+                        "单向 UDP 无握手通道，不支持配对码/加密（规格 §3.1，帮助须明示）",
+                    );
                 }
                 if folder.is_some() {
                     return usage_fail("单向 UDP 仅支持单文件（规格 §3.6）");
@@ -330,7 +371,16 @@ async fn run() -> i32 {
                     Err(e) => fail(&format!("发送失败: {e}")),
                 };
             }
-            let opts = stream_opts(code, limit, srcport, proto, !noencrypt, !nocompress, pin, allow_legacy_pair);
+            let opts = stream_opts(
+                code,
+                limit,
+                srcport,
+                proto,
+                !noencrypt,
+                !nocompress,
+                pin,
+                allow_legacy_pair,
+            );
             let r = match (folder, file, text) {
                 // 规格 §3.2 AutoRetry：文件夹 0x01 失败转 0x04 差量续传（轮 6 P2-5）。
                 (Some(f), _, _) => send_folder_auto(addr, &f, &opts).await,
@@ -358,15 +408,25 @@ async fn run() -> i32 {
                 Err(e) => fail(&format!("发送失败: {e}")),
             }
         }
-        Cmd::Recv { port, out, proto, code, count, noencrypt } => {
+        Cmd::Recv {
+            port,
+            out,
+            proto,
+            code,
+            count,
+            noencrypt,
+        } => {
             if let Err(e) = validate_code(&code) {
                 return usage_fail(&e);
             }
             if count == Some(0) {
                 return usage_fail("--count 至少为 1");
             }
-            let save =
-                out.unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("trft-received"));
+            let save = out.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("trft-received")
+            });
             let addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
             match proto {
                 Proto::Udp => {
@@ -374,9 +434,14 @@ async fn run() -> i32 {
                         return usage_fail("单向 UDP 无握手通道，不支持配对码/加密（规格 §3.1）");
                     }
                     if count.is_some() {
-                        return usage_fail("--count 不适用于 --proto udp（落盘即状态，无回传计数）");
+                        return usage_fail(
+                            "--count 不适用于 --proto udp（落盘即状态，无回传计数）",
+                        );
                     }
-                    eprintln!("单向 UDP 接收中: 0.0.0.0:{port} → {}（Ctrl+C 退出）", save.display());
+                    eprintln!(
+                        "单向 UDP 接收中: 0.0.0.0:{port} → {}（Ctrl+C 退出）",
+                        save.display()
+                    );
                     let o = UdpRecvOptions {
                         save_dir: save,
                         stats: Some(Arc::new(trft_core::stats::StatsLog::default_log())),
@@ -411,10 +476,18 @@ async fn run() -> i32 {
                         stats: Some(Arc::new(trft_core::stats::StatsLog::default_log())),
                         ..Default::default()
                     };
-                    let label = if proto == Proto::Udt { "QUIC(udt)" } else { "TCP" };
-                    eprintln!("接收中[{label}]: 0.0.0.0:{port} → {}（Ctrl+C 退出）", o.save_dir.display());
+                    let label = match proto {
+                        Proto::Tcp => "TCP",
+                        Proto::Quic => "QUIC",
+                        _ => "UDT",
+                    };
+                    eprintln!(
+                        "接收中[{label}]: 0.0.0.0:{port} → {}（Ctrl+C 退出）",
+                        o.save_dir.display()
+                    );
                     let server = match proto {
-                        Proto::Udt => tokio::spawn(serve_quic(addr, o)),
+                        Proto::Quic => tokio::spawn(serve_quic(addr, o)),
+                        Proto::Udt => tokio::spawn(serve_udt(addr, o)),
                         _ => tokio::spawn(receiver::serve(addr, o)),
                     };
                     tokio::select! {
@@ -431,7 +504,16 @@ async fn run() -> i32 {
                 }
             }
         }
-        Cmd::Sync { folder, ip, port, proto, code, limit, nocompress, allow_legacy_pair } => {
+        Cmd::Sync {
+            folder,
+            ip,
+            port,
+            proto,
+            code,
+            limit,
+            nocompress,
+            allow_legacy_pair,
+        } => {
             if proto == Proto::Udp {
                 return usage_fail("单向 UDP 不支持文件夹传输（仅单文件，规格 §3.6）");
             }
@@ -449,7 +531,9 @@ async fn run() -> i32 {
                 compress: !nocompress,
                 allow_legacy_pair,
                 // CLI 与 GUI 同享 stats.log（TECH-STACK §7.10；轮 5 P2：sync 此前漏注）。
-                stats: Some(std::sync::Arc::new(trft_core::stats::StatsLog::default_log())),
+                stats: Some(std::sync::Arc::new(
+                    trft_core::stats::StatsLog::default_log(),
+                )),
                 ..Default::default()
             };
             // 稳定会话 ID：由 (源路径, 目标地址) 确定性派生（大小写/尾斜杠不敏感）。
@@ -475,9 +559,9 @@ async fn run() -> i32 {
                     println!("同步完成");
                     0
                 }
-                Err(trft_core::error::Error::Unsupported(m)) => {
-                    fail(&format!("同步失败: {m}（对端需支持文件夹同步；旧对端请改用 send --folder）"))
-                }
+                Err(trft_core::error::Error::Unsupported(m)) => fail(&format!(
+                    "同步失败: {m}（对端需支持文件夹同步；旧对端请改用 send --folder）"
+                )),
                 Err(e) => fail(&format!("同步失败: {e}")),
             }
         }
@@ -507,15 +591,21 @@ async fn run() -> i32 {
             }
             0
         }
-        Cmd::Update { url, check, restart } => {
+        Cmd::Update {
+            url,
+            check,
+            restart,
+        } => {
             if restart {
                 // 轮 5 P3：CLI 重启 spawn 无参 exe → clap 报用法错误——组合不成立。
                 return usage_fail("--restart 仅对图形界面更新有意义（CLI 重启后无动词可执行）");
             }
             let manifest_url = match url.or_else(|| {
-                trft_core::config::Config::load(&trft_core::config::app_data_dir().join("config.toml"))
-                    .ok()
-                    .and_then(|c| c.update_url)
+                trft_core::config::Config::load(
+                    &trft_core::config::app_data_dir().join("config.toml"),
+                )
+                .ok()
+                .and_then(|c| c.update_url)
             }) {
                 Some(u) => u,
                 None => return usage_fail("update 需要 --url 或配置 UpdateUrl"),
@@ -540,7 +630,14 @@ async fn run() -> i32 {
                 };
             }
             let work = trft_core::config::app_data_dir().join("updates");
-            match trft_core::update::run_update(&manifest_url, &pubkey, env!("CARGO_PKG_VERSION"), &work).await {
+            match trft_core::update::run_update(
+                &manifest_url,
+                &pubkey,
+                env!("CARGO_PKG_VERSION"),
+                &work,
+            )
+            .await
+            {
                 Ok(Some(bak)) => {
                     // 备份只用于失败回滚：CLI 换入成功即清理，文案不得再宣称它还在
                     // （本轮 F9——旧文案先删后打印，用户照提示去回滚会扑空）。

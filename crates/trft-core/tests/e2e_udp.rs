@@ -5,8 +5,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use trft_core::hash::sha256_file;
-use trft_core::transfer::udp::{UdpRecvOptions, UdpSendOptions, send_file_udp, serve_udp_on};
 use trft_core::transfer::udp::UdpEvent;
+use trft_core::transfer::udp::{send_file_udp, serve_udp_on, UdpRecvOptions, UdpSendOptions};
 
 #[tokio::test]
 async fn udp_single_file_end_to_end() {
@@ -20,18 +20,39 @@ async fn udp_single_file_end_to_end() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let server = tokio::spawn(serve_udp_on(socket, UdpRecvOptions { save_dir: out.clone(), ..Default::default() }, Some(tx)));
+    let server = tokio::spawn(serve_udp_on(
+        socket,
+        UdpRecvOptions {
+            save_dir: out.clone(),
+            ..Default::default()
+        },
+        Some(tx),
+    ));
 
     // 发送在后台：接收器先完成（落盘即状态），发送器才退出。
     let send_path = src.clone();
     let sender = tokio::spawn(async move {
-        send_file_udp(addr, &send_path, &UdpSendOptions { passes: 2, fec: true, fec_parity: 2, speed_limit_bps: 0, ..Default::default() }).await
+        send_file_udp(
+            addr,
+            &send_path,
+            &UdpSendOptions {
+                passes: 2,
+                fec: true,
+                fec_parity: 2,
+                speed_limit_bps: 0,
+                ..Default::default()
+            },
+        )
+        .await
     });
 
     // 事件流里先有 Started/Progress，循环等到 Completed 为止。
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let ev = tokio::time::timeout_at(deadline, rx.recv()).await.unwrap().unwrap();
+        let ev = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         if matches!(ev, UdpEvent::Completed { .. }) {
             break;
         }
@@ -64,7 +85,11 @@ async fn udp_progress_throttled_and_final_exact() {
     let hub = trft_core::progress::ProgressHub::new(ptx);
     let server = tokio::spawn(serve_udp_on(
         socket,
-        UdpRecvOptions { save_dir: out.clone(), progress: Some(hub), ..Default::default() },
+        UdpRecvOptions {
+            save_dir: out.clone(),
+            progress: Some(hub),
+            ..Default::default()
+        },
         Some(tx),
     ));
 
@@ -73,14 +98,23 @@ async fn udp_progress_throttled_and_final_exact() {
         send_file_udp(
             addr,
             &send_path,
-            &UdpSendOptions { passes: 2, fec: true, fec_parity: 2, speed_limit_bps: 0, ..Default::default() },
+            &UdpSendOptions {
+                passes: 2,
+                fec: true,
+                fec_parity: 2,
+                speed_limit_bps: 0,
+                ..Default::default()
+            },
         )
         .await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let ev = tokio::time::timeout_at(deadline, rx.recv()).await.unwrap().unwrap();
+        let ev = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         if matches!(ev, UdpEvent::Completed { .. }) {
             break;
         }
@@ -99,9 +133,18 @@ async fn udp_progress_throttled_and_final_exact() {
         evs.len()
     );
     let last = evs.last().unwrap();
-    assert_eq!(last.state, "done", "终态必为 done: {:?}", &evs[evs.len().saturating_sub(5)..]);
+    assert_eq!(
+        last.state,
+        "done",
+        "终态必为 done: {:?}",
+        &evs[evs.len().saturating_sub(5)..]
+    );
     assert_eq!(last.done, data.len() as u64, "终态字节数必须等于文件大小");
-    assert_eq!(last.total, data.len() as u64, "收侧总量 = 文件大小（按轮加权是发侧口径）");
+    assert_eq!(
+        last.total,
+        data.len() as u64,
+        "收侧总量 = 文件大小（按轮加权是发侧口径）"
+    );
 }
 
 /// 轮 4 P1 判别：一个超长数据报（Windows WSAEMSGSIZE）不得杀死整个接收器。
@@ -120,7 +163,10 @@ async fn oversized_datagram_does_not_kill_receiver() {
     let addr = sock.local_addr().unwrap();
     let server = tokio::spawn(serve_udp_on(
         sock,
-        UdpRecvOptions { save_dir: out.clone(), ..Default::default() },
+        UdpRecvOptions {
+            save_dir: out.clone(),
+            ..Default::default()
+        },
         None,
     ));
 

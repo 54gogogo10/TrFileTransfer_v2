@@ -5,16 +5,18 @@
 //! 哈希不一致一律拒绝，半成品一律清理。
 
 use crate::config::{ConfirmMode, DuplicatePolicy};
-use crate::crypto::kdf::{ct_eq, derive_pairing_key, pairing_proof, pairing_proof_bound, pairing_proof_s2c};
-use crate::error::{Error, Result, proto};
-use crate::hash::{FileDigester, sha256_file};
+use crate::crypto::kdf::{
+    ct_eq, derive_pairing_key, pairing_proof, pairing_proof_bound, pairing_proof_s2c,
+};
+use crate::error::{proto, Error, Result};
+use crate::hash::{sha256_file, FileDigester};
 use crate::hashcache::HashCache;
 use crate::limiter::TokenBucket;
 use crate::protocol::frame::{
-    CAP_CHUNKED, CAP_COMPRESS, CAP_COVERAGE, CAP_RESUME_FILE, CAP_RESUME_FOLDER, MAX_TRANSFER_SIZE,
-    R_CAPABILITY, R_PAIRING_SALT, STATUS_OK, STATUS_REJECT, T_CAPABILITY, T_CHUNKED, T_CHUNK_END,
-    T_COMPRESS, T_COMPRESS_OK, T_COVERAGE_QUERY, T_FOLDER, T_PAIRING, T_PAIRING_BOUND,
-    T_RESUME_FILE, T_RESUME_FOLDER, T_SINGLE_FILE, T_TEXT, sanitize_name,
+    sanitize_name, CAP_CHUNKED, CAP_COMPRESS, CAP_COVERAGE, CAP_RESUME_FILE, CAP_RESUME_FOLDER,
+    MAX_TRANSFER_SIZE, R_CAPABILITY, R_PAIRING_SALT, STATUS_OK, STATUS_REJECT, T_CAPABILITY,
+    T_CHUNKED, T_CHUNK_END, T_COMPRESS, T_COMPRESS_OK, T_COVERAGE_QUERY, T_FOLDER, T_PAIRING,
+    T_PAIRING_BOUND, T_RESUME_FILE, T_RESUME_FOLDER, T_SINGLE_FILE, T_TEXT,
 };
 use crate::protocol::io::{read_n, read_str_u16, read_u32, read_u64, read_u8, write_all, write_u8};
 use crate::transfer::chunked::{self, ChunkTracker};
@@ -27,12 +29,12 @@ use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 /// 规格 §4.1/§6.1：按来源 IP 计数锁定——10 次失败锁 10 分钟，成功清零。
@@ -78,7 +80,9 @@ pub struct PairingGate {
 impl PairingGate {
     pub fn locked(&self, ip: &IpAddr) -> bool {
         let k = gate_key(ip);
-        self.locked_until.get(&k).is_some_and(|t| *t > Instant::now())
+        self.locked_until
+            .get(&k)
+            .is_some_and(|t| *t > Instant::now())
     }
 
     pub fn fail(&mut self, ip: &IpAddr) {
@@ -95,7 +99,8 @@ impl PairingGate {
         let f = self.fails.entry(k).or_default();
         *f += 1;
         if *f >= LOCKOUT_THRESHOLD {
-            self.locked_until.insert(k, Instant::now() + LOCKOUT_DURATION);
+            self.locked_until
+                .insert(k, Instant::now() + LOCKOUT_DURATION);
             self.fails.remove(&k);
         }
     }
@@ -132,8 +137,12 @@ pub fn ip_match(ip: IpAddr, pattern: &str) -> bool {
     }
     // CIDR：a.b.c.d/nn 或 x::/nn
     if let Some((addr_part, len_part)) = pat.split_once('/') {
-        let Ok(net) = addr_part.parse::<IpAddr>() else { return false };
-        let Ok(len) = len_part.parse::<u8>() else { return false };
+        let Ok(net) = addr_part.parse::<IpAddr>() else {
+            return false;
+        };
+        let Ok(len) = len_part.parse::<u8>() else {
+            return false;
+        };
         match (net, ip) {
             (IpAddr::V4(n), IpAddr::V4(i)) => {
                 if len > 32 {
@@ -216,7 +225,10 @@ pub(crate) fn unique_part(dir: &Path, name: &str) -> PathBuf {
         .unwrap_or_default();
     let mut rnd = [0u8; 4];
     OsRng.fill_bytes(&mut rnd);
-    dir.join(format!("{stem}.{:08x}{ext}.trft-part", u32::from_le_bytes(rnd)))
+    dir.join(format!(
+        "{stem}.{:08x}{ext}.trft-part",
+        u32::from_le_bytes(rnd)
+    ))
 }
 
 #[derive(Clone)]
@@ -363,16 +375,17 @@ pub(crate) fn ip_dir_component(peer: IpAddr) -> String {
 /// 归档桶错位（次日/同日边界），不影响完整性语义。
 pub fn today_component() -> String {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    format!("{:04}-{:02}-{:02}", now.year(), u8::from(now.month()), now.day())
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
 }
 
 /// 每连接确认一次（规格 §3.3）：首个文件帧前判定；通过后连接内不再重复。
 /// off / 窗口内 / unknown 且已知 → 直接过；其余走确认框，30s 超时或拒绝即失败。
-async fn confirm_once(
-    peer: SocketAddr,
-    opts: &RecvOptions,
-    confirmed: &mut bool,
-) -> Result<()> {
+async fn confirm_once(peer: SocketAddr, opts: &RecvOptions, confirmed: &mut bool) -> Result<()> {
     if *confirmed || opts.confirm_mode == ConfirmMode::Off {
         return Ok(());
     }
@@ -394,10 +407,7 @@ async fn confirm_once(
         }
     }
     if opts.confirm_mode == ConfirmMode::Unknown
-        && opts
-            .devices
-            .as_ref()
-            .is_some_and(|d| d.is_known(peer.ip()))
+        && opts.devices.as_ref().is_some_and(|d| d.is_known(peer.ip()))
     {
         *confirmed = true;
         return Ok(());
@@ -415,7 +425,11 @@ async fn confirm_once(
         .unwrap_or_else(|| peer.ip().to_string());
     let (rtx, rrx) = tokio::sync::oneshot::channel();
     if tx
-        .send(ConfirmRequest { peer: peer.ip(), device, reply: rtx })
+        .send(ConfirmRequest {
+            peer: peer.ip(),
+            device,
+            reply: rtx,
+        })
         .is_err()
     {
         return Err(Error::Rejected(format!("{peer}: 确认通道已关闭，已拒绝")));
@@ -447,7 +461,9 @@ pub fn cleanup_part_orphans(dir: &Path) {
         if depth > 6 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         let now = std::time::SystemTime::now();
         for e in rd.flatten() {
             let p = e.path();
@@ -462,7 +478,11 @@ pub fn cleanup_part_orphans(dir: &Path) {
             if let Ok(md) = e.metadata() {
                 if md
                     .modified()
-                    .map(|t| now.duration_since(t).map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600)).unwrap_or(false))
+                    .map(|t| {
+                        now.duration_since(t)
+                            .map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600))
+                            .unwrap_or(false)
+                    })
                     .unwrap_or(false)
                 {
                     let _ = std::fs::remove_file(&p);
@@ -524,16 +544,21 @@ pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
 /// 并发闸许可（QUIC 在 TLS 握手前也要先拿闸）。获取 30s 上限（轮 2 F3：
 /// 无上限时满闸下合法连接会**无限静默等待**——与 Web 面闸获取 30s 同纪律）。
 pub(crate) async fn conn_permit(opts: &RecvOptions) -> Result<tokio::sync::OwnedSemaphorePermit> {
-    tokio::time::timeout(Duration::from_secs(30), opts.permits.clone().acquire_owned())
-        .await
-        .map_err(|_| proto("并发闸获取超时（30s，接收器连接过载）"))?
-        .map_err(|e| proto(e.to_string()))
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        opts.permits.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| proto("并发闸获取超时（30s，接收器连接过载）"))?
+    .map_err(|e| proto(e.to_string()))
 }
 
 /// 锁定门（需真实 peer IP）。
 pub(crate) async fn gate_check(peer: SocketAddr, opts: &RecvOptions) -> Result<()> {
     if opts.pairing_code.is_some() && opts.gate.lock().await.locked(&peer.ip()) {
-        return Err(Error::AuthRejected(format!("{peer}: 配对失败次数过多，已临时锁定")));
+        return Err(Error::AuthRejected(format!(
+            "{peer}: 配对失败次数过多，已临时锁定"
+        )));
     }
     Ok(())
 }
@@ -544,11 +569,16 @@ pub(crate) async fn conn_precheck(
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     // IP 过滤先行（规格 §3.3）：被拒连接不得消耗并发闸额度。
     if !ip_allowed(peer.ip(), opts.ip_filter_mode, &opts.ip_filter_list) {
-        return Err(Error::Rejected(format!("{}: 被 IP 过滤规则拒绝", peer.ip())));
+        return Err(Error::Rejected(format!(
+            "{}: 被 IP 过滤规则拒绝",
+            peer.ip()
+        )));
     }
     let permit = conn_permit(opts).await?;
     if opts.pairing_code.is_some() && opts.gate.lock().await.locked(&peer.ip()) {
-        return Err(Error::AuthRejected(format!("{peer}: 配对失败次数过多，已临时锁定")));
+        return Err(Error::AuthRejected(format!(
+            "{peer}: 配对失败次数过多，已临时锁定"
+        )));
     }
     Ok(permit)
 }
@@ -589,12 +619,34 @@ where
     let r = if first == encrypted::T_ENCRYPT && opts.encrypt {
         match encrypted::server_wrap(s, opts.pairing_code.as_deref()).await {
             Ok((enc, authed)) => {
-                conn_loop_inner(enc, peer, opts, &mut handled, None, authed, &served, false, None).await
+                conn_loop_inner(
+                    enc,
+                    peer,
+                    opts,
+                    &mut handled,
+                    None,
+                    authed,
+                    &served,
+                    false,
+                    None,
+                )
+                .await
             }
             Err(e) => Err(e),
         }
     } else {
-        conn_loop_inner(s, peer, opts, &mut handled, Some(first), false, &served, false, None).await
+        conn_loop_inner(
+            s,
+            peer,
+            opts,
+            &mut handled,
+            Some(first),
+            false,
+            &served,
+            false,
+            None,
+        )
+        .await
     };
     conn_settle(&r, handled, peer, opts, &served).await;
     r
@@ -618,7 +670,18 @@ where
     let mut handled = 0u64;
     // QUIC：Connection drop 会隐式重置流、吞掉客户端的状态字节读取——
     // 收尾排水必须在帧循环内部（栈还活着时）执行。
-    let r = conn_loop_inner(s, peer, opts, &mut handled, None, false, &served, true, binding).await;
+    let r = conn_loop_inner(
+        s,
+        peer,
+        opts,
+        &mut handled,
+        None,
+        false,
+        &served,
+        true,
+        binding,
+    )
+    .await;
     conn_settle(&r, handled, peer, opts, &served).await;
     r
 }
@@ -872,7 +935,15 @@ where
                 }
                 eprintln!("[文本] 来自 {peer}: {text}");
                 write_u8(&mut s, STATUS_OK).await?;
-                record_recv(opts, peer, text.as_bytes().len() as u64, 0, t0, "文本消息", "<文本>");
+                record_recv(
+                    opts,
+                    peer,
+                    text.as_bytes().len() as u64,
+                    0,
+                    t0,
+                    "文本消息",
+                    "<文本>",
+                );
                 *handled += 1;
             }
             T_CHUNKED if opts.enable_chunked => {
@@ -991,7 +1062,11 @@ where
         r
     });
     let outcome = crate::progress::Outcome::new(report.clone());
-    let mut out = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&part).await?;
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .await?;
     let mut dig = FileDigester::new();
     let mut lim = TokenBucket::new(opts.recv_limit_bps);
     let mut remaining = size;
@@ -1022,21 +1097,23 @@ where
     let dest = dir.join(&name);
     if opts.duplicate == DuplicatePolicy::Skip && tokio::fs::metadata(&dest).await.is_ok() {
         let meta_before = tokio::fs::metadata(&dest).await.ok();
-        let same_size = meta_before.as_ref().map(|m| m.len() == size).unwrap_or(false);
+        let same_size = meta_before
+            .as_ref()
+            .map(|m| m.len() == size)
+            .unwrap_or(false);
         let d2 = dest.clone();
         let same = same_size
-            && tokio::task::spawn_blocking(move || sha256_file(&d2).map(|h| h == actual).unwrap_or(false))
-                .await
-                .unwrap_or(false);
+            && tokio::task::spawn_blocking(move || {
+                sha256_file(&d2).map(|h| h == actual).unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
         // 规格 §1.4 判错方向不对称：比对后若 dest 已被并发改写（mtime 变化），
         // 宁可按改名多留一份，不得静默丢新副本。
         let meta_after = tokio::fs::metadata(&dest).await.ok();
         let unchanged = meta_before
             .zip(meta_after)
-            .map(|(a, b)| {
-                a.len() == b.len()
-                    && a.modified().ok() == b.modified().ok()
-            })
+            .map(|(a, b)| a.len() == b.len() && a.modified().ok() == b.modified().ok())
             .unwrap_or(false);
         if same && unchanged {
             outcome.finish();
@@ -1076,7 +1153,11 @@ pub(crate) async fn resolve_conflict(dir: &Path, name: &str) -> PathBuf {
         return candidate;
     }
     let p = Path::new(name);
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
     let ext = p
         .extension()
         .and_then(|s| s.to_str())
@@ -1153,7 +1234,11 @@ pub(crate) async fn publish_part(part: &Path, dir: &Path, name: &str) -> Result<
 pub(crate) async fn resolve_root(dir: &Path, name: &str) -> PathBuf {
     let _ = std::fs::create_dir_all(dir);
     for i in 0..10000u32 {
-        let cand = if i == 0 { dir.join(name) } else { dir.join(format!("{name}_{i}")) };
+        let cand = if i == 0 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{name}_{i}"))
+        };
         match std::fs::create_dir(&cand) {
             Ok(()) => return cand,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1210,11 +1295,28 @@ mod tests {
     fn ip_filter_normalizes_ipv4_mapped() {
         use crate::config::FilterMode;
         let mapped: IpAddr = "::ffff:192.168.1.5".parse().unwrap();
-        assert!(ip_match(mapped, "192.168.1.5"), "精确规则必须命中 mapped 对端");
-        assert!(ip_match(mapped, "192.168.1.0/24"), "CIDR 规则必须命中 mapped 对端");
-        assert!(ip_match(mapped, "192.168.1.*"), "通配规则必须命中 mapped 对端");
-        assert!(ip_allowed(mapped, FilterMode::Allow, &["192.168.1.0/24".to_string()]));
-        assert!(!ip_allowed(mapped, FilterMode::Deny, &["192.168.1.0/24".to_string()]));
+        assert!(
+            ip_match(mapped, "192.168.1.5"),
+            "精确规则必须命中 mapped 对端"
+        );
+        assert!(
+            ip_match(mapped, "192.168.1.0/24"),
+            "CIDR 规则必须命中 mapped 对端"
+        );
+        assert!(
+            ip_match(mapped, "192.168.1.*"),
+            "通配规则必须命中 mapped 对端"
+        );
+        assert!(ip_allowed(
+            mapped,
+            FilterMode::Allow,
+            &["192.168.1.0/24".to_string()]
+        ));
+        assert!(!ip_allowed(
+            mapped,
+            FilterMode::Deny,
+            &["192.168.1.0/24".to_string()]
+        ));
         // 真 IPv6 不受影响。
         let v6: IpAddr = "fe80::1".parse().unwrap();
         assert!(ip_match(v6, "fe80::/16"));
@@ -1262,8 +1364,14 @@ mod tests {
         for _ in 0..LOCKOUT_THRESHOLD {
             g4.fail(&"10.0.0.1".parse::<IpAddr>().unwrap());
         }
-        assert!(!g4.locked(&"10.0.0.2".parse().unwrap()), "IPv4 不同地址不得连带");
-        assert!(g4.locked(&"10.0.0.1".parse().unwrap()), "IPv4 达阈值必须锁定");
+        assert!(
+            !g4.locked(&"10.0.0.2".parse().unwrap()),
+            "IPv4 不同地址不得连带"
+        );
+        assert!(
+            g4.locked(&"10.0.0.1".parse().unwrap()),
+            "IPv4 达阈值必须锁定"
+        );
     }
 
     #[test]
@@ -1289,7 +1397,11 @@ mod tests {
         let b: IpAddr = "::ffff:1.2.3.5".parse().unwrap();
         let lo: IpAddr = "::1".parse().unwrap();
         let native: IpAddr = "1.2.3.4".parse().unwrap();
-        assert_eq!(gate_key(&a), gate_key(&native), "mapped 与原生 IPv4 同源同键");
+        assert_eq!(
+            gate_key(&a),
+            gate_key(&native),
+            "mapped 与原生 IPv4 同源同键"
+        );
         assert_ne!(gate_key(&a), gate_key(&b), "不同 mapped 地址不得共享键");
         assert_ne!(gate_key(&a), gate_key(&lo), "mapped 不得与回环共享键");
         // 行为判别：mapped 来源达阈值只锁它自己，不连带 ::1。

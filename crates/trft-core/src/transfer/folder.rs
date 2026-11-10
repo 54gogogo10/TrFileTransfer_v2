@@ -2,21 +2,19 @@
 //! 整夹一个完成确认字节。规格 §6.1：文件数上限 1,000,000。
 
 use crate::config::DuplicatePolicy;
-use crate::error::{Error, Result, config_err, proto};
-use crate::hash::{FileDigester, sha256_file};
+use crate::error::{config_err, proto, Error, Result};
+use crate::hash::{sha256_file, FileDigester};
 use crate::limiter::TokenBucket;
 use crate::protocol::frame::{
-    MAX_FOLDER_FILES, MAX_TRANSFER_SIZE, STATUS_OK, sanitize_name, sanitize_rel,
+    sanitize_name, sanitize_rel, MAX_FOLDER_FILES, MAX_TRANSFER_SIZE, STATUS_OK,
 };
 use crate::protocol::io::{
     read_str_u16, read_u32, read_u64, read_u8, write_str_u16, write_u32, write_u64, write_u8,
 };
-use crate::transfer::receiver::{
-    PartGuard, RecvOptions, publish_part, resolve_root, space_ok,
-};
+use crate::transfer::receiver::{publish_part, resolve_root, space_ok, PartGuard, RecvOptions};
 use crate::transfer::resume;
-use crate::transfer::sender::{SendOptions, StackPlan, connect_quic_auth, connect_stack};
-use crate::transfer::{CHUNK, Transport};
+use crate::transfer::sender::{connect_quic_auth, connect_stack, SendOptions, StackPlan};
+use crate::transfer::{Transport, CHUNK};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -33,7 +31,11 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             if crate::hashcache::is_cache_artifact(&name) {
                 continue;
             }
-            let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
             let md = e.metadata()?; // DirEntry::metadata 不追踪符号链接
             if md.file_type().is_symlink() {
                 continue; // 防环：符号链接不入清单（规格 §11 非目标）
@@ -75,10 +77,11 @@ pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> R
 /// 用法/配置/认证/不支持类错误重试无意义，直接上抛。
 pub async fn send_folder_auto(addr: SocketAddr, root: &Path, opts: &SendOptions) -> Result<()> {
     // 纯内存缓存（不可写路径 → degraded；TTL 0 = 永不过期——只活本次调用）。
-    let ephemeral = std::env::temp_dir().join("trft-no-such-ephemeral-dir").join("c.txt");
+    let ephemeral = std::env::temp_dir()
+        .join("trft-no-such-ephemeral-dir")
+        .join("c.txt");
     let cache = std::sync::Arc::new(tokio::sync::Mutex::new(crate::hashcache::HashCache::load(
-        &ephemeral,
-        0,
+        &ephemeral, 0,
     )));
     match send_folder_inner(addr, root, opts, Some(&cache)).await {
         Ok(()) => Ok(()),
@@ -134,12 +137,26 @@ async fn send_folder_inner(
             let mut s = connect_quic_auth(addr, opts).await?;
             send_folder_over(&mut s, &root_name, &files, opts, cache).await
         }
+        Transport::Udt => {
+            // 与 TCP 同口径：0x05 配对 + 可选 0x09 加密在 connect_stack 内接线
+            // （UDT 无证书体系，无 0x0D 通道绑定）。
+            let (mut s, _) = connect_stack(addr, opts, StackPlan::default()).await?;
+            send_folder_over(&mut s, &root_name, &files, opts, cache).await
+        }
     };
     match &res {
         Ok((bytes, count)) => {
             outcome.finish();
             // 发送侧统计（轮 1：0x01 此前漏记——接收侧有记而发送侧缺席）。
-            crate::transfer::sender::record_stats(opts, addr, *bytes, *count, started, "整夹发送", &root_name);
+            crate::transfer::sender::record_stats(
+                opts,
+                addr,
+                *bytes,
+                *count,
+                started,
+                "整夹发送",
+                &root_name,
+            );
         }
         Err(_) => {}
     }
@@ -212,7 +229,11 @@ where
     Ok((sent_bytes, files.len() as u32))
 }
 
-pub(crate) async fn recv_folder_over<S>(s: &mut S, peer: SocketAddr, opts: &RecvOptions) -> Result<()>
+pub(crate) async fn recv_folder_over<S>(
+    s: &mut S,
+    peer: SocketAddr,
+    opts: &RecvOptions,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -264,14 +285,11 @@ where
             .to_string();
 
         // 唯一半成品 + 流式接收 + 声明哈希比对（与单文件路径同纪律）。
-        let report = opts
-            .progress
-            .as_ref()
-            .map(|h| {
-                let r = h.register("recv", rel.clone(), size);
-                r.set_peer(&peer.ip().to_string());
-                r
-            });
+        let report = opts.progress.as_ref().map(|h| {
+            let r = h.register("recv", rel.clone(), size);
+            r.set_peer(&peer.ip().to_string());
+            r
+        });
         let (part, actual) =
             resume::recv_file_payload(s, &parent, &file_name, size, opts, report.as_ref()).await?;
         if let Some(r) = &report {
@@ -284,8 +302,10 @@ where
         let skip_same = match opts.duplicate {
             DuplicatePolicy::Skip if tokio::fs::metadata(&dest).await.is_ok() => {
                 let meta_before = tokio::fs::metadata(&dest).await.ok();
-                let same_size =
-                    meta_before.as_ref().map(|m| m.len() == size).unwrap_or(false);
+                let same_size = meta_before
+                    .as_ref()
+                    .map(|m| m.len() == size)
+                    .unwrap_or(false);
                 let d2 = dest.clone();
                 let same = same_size
                     && tokio::task::spawn_blocking(move || {
@@ -295,11 +315,10 @@ where
                     .unwrap_or(false);
                 // 规格 §1.4 判错方向不对称：比对后 dest 被并发改写 → 宁可改名多留一份。
                 let meta_after = tokio::fs::metadata(&dest).await.ok();
-                same
-                    && meta_before
-                        .zip(meta_after)
-                        .map(|(a, b)| a.len() == b.len() && a.modified().ok() == b.modified().ok())
-                        .unwrap_or(false)
+                same && meta_before
+                    .zip(meta_after)
+                    .map(|(a, b)| a.len() == b.len() && a.modified().ok() == b.modified().ok())
+                    .unwrap_or(false)
             }
             _ => false,
         };
@@ -311,7 +330,18 @@ where
             recv_files += 1;
         }
     }
-    crate::transfer::receiver::record_recv(opts, peer, recv_bytes, recv_files, started, "整夹发送", &root_name);
-    eprintln!("[接收] 文件夹 {root_name}（{count} 个文件）→ {}", base.display());
+    crate::transfer::receiver::record_recv(
+        opts,
+        peer,
+        recv_bytes,
+        recv_files,
+        started,
+        "整夹发送",
+        &root_name,
+    );
+    eprintln!(
+        "[接收] 文件夹 {root_name}（{count} 个文件）→ {}",
+        base.display()
+    );
     Ok(())
 }

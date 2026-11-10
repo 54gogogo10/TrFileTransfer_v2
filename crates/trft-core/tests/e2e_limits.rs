@@ -12,7 +12,7 @@ use std::time::Instant;
 use trft_core::hash::sha256_file;
 use trft_core::transfer::chunked::send_file_chunked;
 use trft_core::transfer::receiver::serve_on;
-use trft_core::transfer::sender::{SendOptions, send_file};
+use trft_core::transfer::sender::{send_file, SendOptions};
 
 const RATE: u64 = 96 * 1024; // 96 KB/s
 const SIZE: usize = 384 * 1024; // 桶初始满 96KB + 3s 排空 = 时间下界的来源
@@ -28,15 +28,24 @@ async fn send_side_limit_wired_every_chunk() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, opts(out.clone(), None, 1)));
 
-    let o = SendOptions { speed_limit_bps: RATE, ..Default::default() };
+    let o = SendOptions {
+        speed_limit_bps: RATE,
+        ..Default::default()
+    };
     let t0 = Instant::now();
     send_file(addr, &src, &o).await.unwrap();
     let el = t0.elapsed();
     wait_server(server).await;
 
-    assert!(el >= LOWER, "发送限速未接线或被绕过: {el:?}（下界 {LOWER:?}）");
+    assert!(
+        el >= LOWER,
+        "发送限速未接线或被绕过: {el:?}（下界 {LOWER:?}）"
+    );
     assert!(el < UPPER, "发送限速过慢: {el:?}");
-    assert_eq!(sha256_file(&out.join("lim.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("lim.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
     let _ = data;
 }
@@ -53,13 +62,21 @@ async fn recv_side_limit_wired_every_chunk() {
     let server = tokio::spawn(serve_on(listener, o));
 
     let t0 = Instant::now();
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     let el = t0.elapsed();
     wait_server(server).await;
 
-    assert!(el >= LOWER, "接收限速未接线或被绕过: {el:?}（下界 {LOWER:?}）");
+    assert!(
+        el >= LOWER,
+        "接收限速未接线或被绕过: {el:?}（下界 {LOWER:?}）"
+    );
     assert!(el < UPPER, "接收限速过慢: {el:?}");
-    assert_eq!(sha256_file(&out.join("rlim.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("rlim.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
 }
 
@@ -77,7 +94,10 @@ async fn chunked_path_limit_wired() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, opts_resident(out.clone(), None)));
 
-    let o = SendOptions { speed_limit_bps: RATE, ..Default::default() };
+    let o = SendOptions {
+        speed_limit_bps: RATE,
+        ..Default::default()
+    };
     let t0 = Instant::now();
     send_file_chunked(addr, &src, &o, 2).await.unwrap();
     let el = t0.elapsed();
@@ -85,6 +105,9 @@ async fn chunked_path_limit_wired() {
 
     assert!(el >= CHUNKED_LOWER, "0x02 分块路径限速未接线: {el:?}");
     assert!(el < UPPER, "0x02 分块路径限速过慢: {el:?}");
-    assert_eq!(sha256_file(&out.join("chunk.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("chunk.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
 }

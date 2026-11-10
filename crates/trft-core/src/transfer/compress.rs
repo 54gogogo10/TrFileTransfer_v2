@@ -160,12 +160,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Compressed<S> {
             }
             // 3) 段体：跨 poll 补齐。
             if this.body.is_empty() {
-                let raw_len = u32::from_le_bytes(
-                    this.header[..4].try_into().expect("4 字节长度头"),
-                ) as usize;
-                let wire_len = u32::from_le_bytes(
-                    this.header[4..8].try_into().expect("4 字节载荷长度头"),
-                ) as usize;
+                let raw_len =
+                    u32::from_le_bytes(this.header[..4].try_into().expect("4 字节长度头")) as usize;
+                let wire_len =
+                    u32::from_le_bytes(this.header[4..8].try_into().expect("4 字节载荷长度头"))
+                        as usize;
                 if raw_len > MAX_SEGMENT || wire_len > MAX_SEGMENT {
                     return Poll::Ready(Err(io_err(format!(
                         "压缩段长度超限（raw={raw_len}, wire={wire_len}）"
@@ -354,9 +353,15 @@ mod tests {
         }
         let mut enc = Compressed::new(std::io::Cursor::new(Vec::new()));
         enc.write_all(&data).await.unwrap();
-        let bytes = std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
+        let bytes =
+            std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
         // 可压缩内容必须真的被压（线上显著小于明文）。
-        assert!(bytes.len() < data.len() / 2, "deflate 未生效: {} vs {}", bytes.len(), data.len());
+        assert!(
+            bytes.len() < data.len() / 2,
+            "deflate 未生效: {} vs {}",
+            bytes.len(),
+            data.len()
+        );
         let mut dec = Compressed::new(std::io::Cursor::new(bytes));
         let mut out = Vec::new();
         dec.read_to_end(&mut out).await.unwrap();
@@ -369,7 +374,8 @@ mod tests {
         OsRng.fill_bytes(&mut data);
         let mut enc = Compressed::new(std::io::Cursor::new(Vec::new()));
         enc.write_all(&data).await.unwrap();
-        let bytes = std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
+        let bytes =
+            std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
         // 零膨胀直传：线上 = 明文 + 每段 9B 头。
         assert_eq!(bytes.len(), data.len() + 9, "不可压缩数据必须零膨胀直传");
         let mut dec = Compressed::new(std::io::Cursor::new(bytes));
@@ -385,7 +391,8 @@ mod tests {
         assert!(data.len() < MIN_SEGMENT);
         let mut enc = Compressed::new(std::io::Cursor::new(Vec::new()));
         enc.write_all(&data).await.unwrap();
-        let bytes = std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
+        let bytes =
+            std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
         assert_eq!(bytes.len(), data.len() + 9, "小段必须零膨胀直传（9B 段头）");
     }
 
@@ -398,7 +405,8 @@ mod tests {
         OsRng.fill_bytes(&mut data);
         let mut enc = Compressed::new(std::io::Cursor::new(Vec::new()));
         enc.write_all(&data).await.unwrap();
-        let bytes = std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
+        let bytes =
+            std::mem::replace(&mut enc.inner, std::io::Cursor::new(Vec::new())).into_inner();
         // 两段全 raw：明文 + 2×9B 头。
         assert_eq!(bytes.len(), data.len() + 18);
         let mut dec = Compressed::new(std::io::Cursor::new(bytes));
@@ -433,6 +441,9 @@ mod tests {
         bytes.truncate(bytes.len() - 10);
         let mut dec = Compressed::new(std::io::Cursor::new(bytes));
         let mut out = Vec::new();
-        assert!(dec.read_to_end(&mut out).await.is_err(), "截断段必须报错而非静默短读");
+        assert!(
+            dec.read_to_end(&mut out).await.is_err(),
+            "截断段必须报错而非静默短读"
+        );
     }
 }

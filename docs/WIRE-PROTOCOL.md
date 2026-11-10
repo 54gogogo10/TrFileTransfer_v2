@@ -19,12 +19,14 @@ Compressed（可选，0x08 协商后）        ← 压缩装饰器在帧层之�
   ▲
 Encrypted（可选，0x09）或 QUIC TLS     ← 机密性/认证
   ▲
-TCP
+TCP / UDT（可靠 UDP 流，§7）
 ```
 
 - 装饰器包裹顺序固定为 `encrypt(compress(plain))`——压缩内层、加密外层（规格 §4.1）。
 - QUIC 槽位：TLS 1.3 承担机密性，流上**先发 1 字节协议版本号 `0x02`** 再进帧层；
   TCP 槽位无版本前缀（未知帧 fail-closed 兜底）。
+- UDT 槽位（§7）：机密性由可选 0x09 承担（与 TCP 同口径），版本协商在 HS 包内完成
+  （公共头 ver 字节），流上无版本前缀。
 - 前导组合顺序：认证在前（`0x09` 首选 → `0x05` 明文门）、`0x0A` 能力协商、`0x08` 压缩协商次之，
   之后才允许业务帧。`0x0A`/`0x08` 各**至多一次**，顺序不限（本实现客户端固定先 `0x0A` 后 `0x08`）。
 
@@ -240,15 +242,70 @@ PARITY 对旧接收端无需协商（静默忽略）。
 | frame | 1 B | `0xD2` |
 | name_len | 2 B | 应答方本机名字节数 |
 | name | name_len | UTF-8（≤ 64 B） |
-| flags | 1 B | bit0 = TCP 监听中；bit1 = UDT 监听中；bit2 = 需配对码 |
+| flags | 1 B | bit0 = TCP 监听中；bit1 = QUIC 监听中；bit2 = 需配对码；bit3 = UDT 监听中 |
 | tcp_port | 2 B | TCP 监听端口（flags bit0=0 时为 0） |
-| udt_port | 2 B | UDT(QUIC) 监听端口（flags bit1=0 时为 0） |
+| quic_port | 2 B | QUIC 监听端口（flags bit1=0 时为 0） |
+| udt_port | 2 B | UDT 监听端口（**可选字段**——仅 flags bit3=1 时存在） |
 
 - 守卫：整包 > 512 B、name > 64 B、截断/坏帧 → **整包忽略**（fail-closed）。
-- 应答方仅在有 TCP/UDT 监听器时运行，flags 实时读取；请求方按应答源 IP 去重。
+- 应答方仅在有流式监听器（TCP/QUIC/UDT）时运行，flags 实时读取；请求方按应答源 IP 去重。
+- 向后兼容（UDT/QUIC 拆分，TECH-STACK §7.28）：拆分前 bit1 = 「UDT 监听中」、
+  该端口字段名为 `udt_port`——其实现一直是 QUIC 槽位，本次拆分改名 `quic_port` 并新增
+  bit3 + 尾部可选 `udt_port`。旧版解码器读新帧：多出的尾部字节不影响其定长读取，
+  其读到的 "udt_port" 实为 quic_port——语义与其一致，天然向后兼容；新版解码器对
+  无尾字段的旧帧回 `udt_port = None`。
 - 语义锚点：`trft-core::discovery`（编码/解码/发现/应答由单元与回环 e2e 互锁）。
 
-## 7. 常量汇总
+## 7. UDT 传输（可靠 UDP 流；拆分新增）
+
+UDT 槽位 = UDP 之上的**可靠有序双向字节流**，帧协议与 TCP 完全一致（§3 全部帧、
+0x05 配对、可选 0x09 加密、0x0A/0x08 协商全部适用）。**与 UDT4/C# 版不做包级互通**
+（规格 §4.3）——本节为线格式权威；实现锚点 `trft-core::transfer::udt` +
+`trft-core::protocol::udt`（判别测试互锁）。
+
+### 7.1 包头与包类型
+
+12 字节公共头 + 2 字节载荷长度 + 载荷（全部 LE）：
+
+```
+magic "TU"(2B) | ver(1B) = 0x02 | type(1B) | conn_id(u32) | seq(u32) | payload_len(u16)
+```
+
+| type | 名称 | 方向 | 载荷 |
+|---|---|---|---|
+| 0x01 | HS | C→S | 16B nonce（版本不符整包忽略） |
+| 0x02 | HS_ACK | S→C | 16B nonce（回显） |
+| 0x03 | DATA | 双向 | 应用字节（≤1200B） |
+| 0x04 | ACK | 双向 | 累积确认 u32 + 区间数 u8 + n×(起点 u32 + 长度 u8)（≤64 区间 SACK） |
+| 0x05 | FIN | 发→收 | DATA 总数 u32（收满即回执） |
+| 0x06 | FIN_ACK | 收→发 | 空 |
+| 0x07 | RST | 双向 | UTF-8 原因（≤200B；空 = 通用中止） |
+
+- 单包上限 1200B 载荷（+ 头 <1280B——规避 IPv4/IPv6 分片与隧道黑洞）；
+  `magic/ver` 不符或 `payload_len` 与实际不符 → **整包忽略**（fail-closed）。
+- 连接标识：conn_id 由客户端随机生成（服务端 demux 键 + 对端地址共同校验，防串线）；
+  HS/HS_ACK 的 nonce 回显防 off-path 伪造。
+- 服务端拒绝（IP 过滤/锁定门/表满/闸超时）以 RST 附原因，客户端 fail-fast 呈现。
+
+### 7.2 可靠性与流控参数
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| 发送窗口 | 256 包（≈300KB 在途） | 固定窗口，无拥塞控制（**与 UDT4 语义差异**，局域网工具定位） |
+| 重传 | RTO 按采样 EWMA（RFC 6298 简化），钳位 200ms–3s；单包重传 >12 次判链路过差断连 | 重传包 RTT 采样偏大 → RTO 偏保守（方向安全） |
+| 确认 | 立即逐包 ACK + SACK（乱序重排缓冲上限 1024 包，超出丢弃待重传） | 重复 DATA（ACK 丢失）重发当前 ACK，不得重复投递 |
+| 空闲超时 | 30s（对齐原版 C# UDT_RCVTIMEO/UDT_SNDTIMEO） | 握手超时同 30s，HS 定时重发（300ms） |
+| 收尾 | FIN(总数) → FIN_ACK；应用 `shutdown()` 等 FIN_ACK ≤5s 兜底放行（尽力收尾，与 TCP `let _ = shutdown()` 同口径） | 未收尾即 drop → RST 通知对端立即收场（免 30s 空闲互等） |
+| 出错语义 | RST/超时/重传超限 → 读侧 `ConnectionReset`，**结果未知 ≠ 成功** | 与 TCP/QUIC 同红线 |
+
+### 7.3 服务端
+
+单 UDP socket，按 `conn_id` 多路分解（peer 地址共同校验）；HS 先过 IP 过滤 + 配对
+锁定门（RST 附原因，对齐 QUIC「被拒源不进状态机」），连接表上限 256；并发闸在
+`handle_conn`（TCP 入口）内获取——0x05/0x09/0x0A/0x08 与 TCP 同一条代码路径。
+限量模式（`--count`）串行受理，收满即停。
+
+## 8. 常量汇总
 
 | 常量 | 值 | 出处 |
 |---|---|---|

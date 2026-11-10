@@ -4,16 +4,16 @@
 //! 双臂中继两腿证书必然不同 → 证明必败；新版服务端对 QUIC + 配对启用强制绑定
 //! （明文 0x05 拒绝，客户端遇旧服务端自动回退并记警告——TECH-STACK §7.11）。
 
-use crate::error::{Error, Result, proto};
-use crate::transfer::receiver::{RecvOptions, handle_conn_quic};
+use crate::error::{proto, Error, Result};
+use crate::transfer::receiver::{handle_conn_quic, RecvOptions};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::Duration;
 use std::result::Result as SResult;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// 自签证书的 SNI/SAN（客户端跳过校验，此名仅作握手标识）。
@@ -42,7 +42,10 @@ struct SkipServerVerify {
 
 impl SkipServerVerify {
     fn new(pin: Option<[u8; 32]>) -> Arc<Self> {
-        Arc::new(Self { provider: Arc::new(rustls::crypto::ring::default_provider()), pin })
+        Arc::new(Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            pin,
+        })
     }
 }
 
@@ -58,7 +61,9 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
         if let Some(pin) = &self.pin {
             let fp = crate::hash::sha256(end_entity.as_ref());
             if !crate::crypto::kdf::ct_eq(&fp, pin) {
-                return Err(rustls::Error::General("服务器证书指纹不匹配（钉扎校验失败）".into()));
+                return Err(rustls::Error::General(
+                    "服务器证书指纹不匹配（钉扎校验失败）".into(),
+                ));
             }
         }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
@@ -70,7 +75,12 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> SResult<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -79,11 +89,18 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> SResult<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -129,8 +146,7 @@ pub async fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, [u8; 
         .map_err(|e| proto(format!("自签证书生成失败: {e}")))?;
     let cert: rustls::pki_types::CertificateDer<'static> = ck.cert.into();
     let fp = crate::hash::sha256(cert.as_ref());
-    let key =
-        rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
     let server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key.into())
@@ -148,11 +164,20 @@ pub async fn connect_quic(addr: SocketAddr, pin: Option<[u8; 32]>) -> Result<Qui
 /// 建连并返回 (流, 客户端所见服务器证书指纹)。
 /// `--pin` 时 SkipServerVerify 已强制指纹匹配，此处提取值 = pin；
 /// 无 pin 时指纹供 0x0D 通道绑定证明使用（M6'）。
-pub async fn connect_quic_full(addr: SocketAddr, pin: Option<[u8; 32]>) -> Result<(QuicStream, [u8; 32])> {
+pub async fn connect_quic_full(
+    addr: SocketAddr,
+    pin: Option<[u8; 32]>,
+) -> Result<(QuicStream, [u8; 32])> {
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls_config(pin))
         .map_err(|e| proto(format!("QUIC 客户端配置失败: {e}")))?;
     // 按目标地址族选择本地绑定（IPv6 不可达修复）。
-    let local: SocketAddr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
+    let local: SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()
+    .unwrap();
     let mut endpoint = quinn::Endpoint::client(local).map_err(io_err)?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
     let conn = endpoint
@@ -161,7 +186,10 @@ pub async fn connect_quic_full(addr: SocketAddr, pin: Option<[u8; 32]>) -> Resul
         .await
         .map_err(io_err)?;
     // 提取对端（服务器）证书链的端实体指纹（quinn 对 rustls 以 Vec<CertificateDer> 承载）。
-    let fp = match conn.peer_identity().and_then(|id| id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok()) {
+    let fp = match conn.peer_identity().and_then(|id| {
+        id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()
+    }) {
         Some(certs) if !certs.is_empty() => crate::hash::sha256(certs[0].as_ref()),
         _ => return Err(proto("QUIC 握手未返回对端证书（通道绑定不可用）")),
     };
@@ -176,7 +204,11 @@ pub async fn serve_quic(addr: SocketAddr, opts: RecvOptions) -> Result<()> {
     serve_quic_on(endpoint, fp, opts).await
 }
 
-pub async fn serve_quic_on(endpoint: quinn::Endpoint, cert_fp: [u8; 32], opts: RecvOptions) -> Result<()> {
+pub async fn serve_quic_on(
+    endpoint: quinn::Endpoint,
+    cert_fp: [u8; 32],
+    opts: RecvOptions,
+) -> Result<()> {
     // 孤儿半成品清扫（轮 1：QUIC 此前缺席——与 TCP/UDP 同策略 7 天）。
     crate::transfer::receiver::cleanup_part_orphans(&opts.save_dir);
     crate::transfer::resume::cleanup_resume_orphans(&opts.save_dir);

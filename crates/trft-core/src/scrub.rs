@@ -81,7 +81,12 @@ fn collect(
         }
         if ft.is_dir() {
             collect(&p, depth + 1, visited, out, unreadable);
-        } else if !e.file_name().to_str().map(crate::hashcache::is_cache_artifact).unwrap_or(false) {
+        } else if !e
+            .file_name()
+            .to_str()
+            .map(crate::hashcache::is_cache_artifact)
+            .unwrap_or(false)
+        {
             out.push(p);
         }
     }

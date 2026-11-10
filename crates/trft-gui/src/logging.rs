@@ -55,7 +55,11 @@ pub fn log_line(level: &str, msg: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let stamp = format!(
             "{:02}:{:02}:{:02}",
             secs / 3600,
@@ -74,7 +78,9 @@ pub fn log_line(level: &str, msg: &str) {
 /// 删除 `dir` 内修改时间早于 `cutoff_days` 天的 `.log` 文件（规格 §3.7 保留 30 天）。
 /// 纯目录操作，`crash.log`（在上级目录）不受影响；测试经 base 参数注入。
 fn prune_old_logs_in(dir: &Path, cutoff_days: u64) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let now = std::time::SystemTime::now();
     for e in rd.flatten() {
         let p = e.path();
@@ -116,7 +122,11 @@ pub fn write_crash_log(info: &str, backtrace: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();

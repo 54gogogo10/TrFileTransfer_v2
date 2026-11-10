@@ -70,7 +70,16 @@ impl StatsLog {
         Self::new(stats_path())
     }
 
-    pub fn record(&self, dir: Direction, peer: &str, bytes: u64, files: u32, secs: u64, detail: &str, path: &str) {
+    pub fn record(
+        &self,
+        dir: Direction,
+        peer: &str,
+        bytes: u64,
+        files: u32,
+        secs: u64,
+        detail: &str,
+        path: &str,
+    ) {
         let time = crate::devices::now_secs();
         let line = format!(
             "{time}|{}|{peer}|{bytes}|{files}|{secs}|{}|{}\n",
@@ -78,7 +87,11 @@ impl StatsLog {
             detail.replace('|', " "),
             path.replace('|', " "),
         );
-        let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) else {
+        let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        else {
             return; // 统计不可写 = 静默退化（不阻断传输）
         };
         let _ = f.write_all(line.as_bytes());
@@ -89,11 +102,15 @@ impl StatsLog {
     /// 阈值重写：>2MB 保留末 5000 行（原子换入；并发重写串行化无害，
     /// 最坏「丢一行并发期新增统计」——统计口径非账务，可接受，轮 3 P3 修正注释）。
     fn maybe_rewrite(&self) {
-        let Ok(md) = std::fs::metadata(&self.path) else { return };
+        let Ok(md) = std::fs::metadata(&self.path) else {
+            return;
+        };
         if md.len() <= REWRITE_THRESHOLD {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(&self.path) else { return };
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return;
+        };
         let keep: Vec<&str> = text.lines().collect::<Vec<_>>();
         let start = keep.len().saturating_sub(REWRITE_KEEP);
         let mut out = String::new();
@@ -132,7 +149,16 @@ pub fn parse_line(line: &str) -> Option<StatRecord> {
         6 => (String::new(), String::new()),
         _ => (normalize_detail(parts[6]), parts[7..].join("|")),
     };
-    Some(StatRecord { time, dir, peer, bytes, files, secs, detail, path })
+    Some(StatRecord {
+        time,
+        dir,
+        peer,
+        bytes,
+        files,
+        secs,
+        detail,
+        path,
+    })
 }
 
 /// 历史记录里的传输方式文案归一：
@@ -195,7 +221,9 @@ fn parse_time_col(s: &str) -> Option<u64> {
     let t = time::Time::from_hms(h, mi, se).ok()?;
     let dt = date.with_time(t);
     // 按本地偏移转 Unix；获取失败回退 UTC（仅影响旧行聚合桶划分）。
-    let off = time::OffsetDateTime::now_local().map(|n| n.offset()).unwrap_or(time::UtcOffset::UTC);
+    let off = time::OffsetDateTime::now_local()
+        .map(|n| n.offset())
+        .unwrap_or(time::UtcOffset::UTC);
     Some(dt.assume_offset(off).unix_timestamp().max(0) as u64)
 }
 
@@ -279,11 +307,12 @@ pub fn export_csv(records: &[StatRecord]) -> String {
     /// 文件名，以 `= + - @`（及制表/回车）开头时 Excel/LibreOffice 会当公式求值
     /// ——前置单引号强制按文本解析（DDE/外链公式的经典入口）。
     fn esc(s: &str) -> String {
-        let formula_trigger = matches!(
-            s.chars().next(),
-            Some('=' | '+' | '-' | '@' | '\t' | '\r')
-        );
-        let body = if formula_trigger { format!("'{s}") } else { s.to_string() };
+        let formula_trigger = matches!(s.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'));
+        let body = if formula_trigger {
+            format!("'{s}")
+        } else {
+            s.to_string()
+        };
         if body.contains(',') || body.contains('"') || body.contains('\n') || body.contains('\r') {
             format!("\"{}\"", body.replace('"', "\"\""))
         } else {
@@ -332,10 +361,7 @@ mod tests {
     fn line_roundtrip_and_legacy_six_fields() {
         let r = rec(1700000000, Direction::Send, "192.168.1.5", 12345);
         // 旧格式行里的帧码在解析时归一成用户文案（见 normalize_detail）。
-        let line = format!(
-            "{}|S|192.168.1.5|12345|1|1|0x00|a.bin",
-            r.time
-        );
+        let line = format!("{}|S|192.168.1.5|12345|1|1|0x00|a.bin", r.time);
         let p = parse_line(&line).unwrap();
         assert_eq!(p.bytes, 12345);
         assert_eq!(p.detail, "直接发送", "旧帧码必须归一（历史里不显示 0xNN）");
@@ -407,13 +433,36 @@ mod tests {
     #[test]
     fn legacy_protocol_labels_are_normalized_on_load() {
         let d = |line: &str| parse_line(line).unwrap().detail;
-        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x03 续传|a.bin"), "续传传输");
-        assert_eq!(d("1700000000|R|127.0.0.1|1|1|1|0x00 skip|a.bin"), "已存在（跳过）");
-        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x02 分块×4|a.bin"), "分块传输×4");
-        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x04 同步|a.bin"), "文件夹同步");
-        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|0x06 文本|<文本>"), "文本消息");
-        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|续传传输|a.bin"), "续传传输", "幂等");
-        assert_eq!(d("1700000000|S|127.0.0.1|1|1|1|UDP×2轮|a.bin"), "UDP×2轮", "不篡改未知文案");
+        assert_eq!(
+            d("1700000000|S|127.0.0.1|1|1|1|0x03 续传|a.bin"),
+            "续传传输"
+        );
+        assert_eq!(
+            d("1700000000|R|127.0.0.1|1|1|1|0x00 skip|a.bin"),
+            "已存在（跳过）"
+        );
+        assert_eq!(
+            d("1700000000|S|127.0.0.1|1|1|1|0x02 分块×4|a.bin"),
+            "分块传输×4"
+        );
+        assert_eq!(
+            d("1700000000|S|127.0.0.1|1|1|1|0x04 同步|a.bin"),
+            "文件夹同步"
+        );
+        assert_eq!(
+            d("1700000000|S|127.0.0.1|1|1|1|0x06 文本|<文本>"),
+            "文本消息"
+        );
+        assert_eq!(
+            d("1700000000|S|127.0.0.1|1|1|1|续传传输|a.bin"),
+            "续传传输",
+            "幂等"
+        );
+        assert_eq!(
+            d("1700000000|S|127.0.0.1|1|1|1|UDP×2轮|a.bin"),
+            "UDP×2轮",
+            "不篡改未知文案"
+        );
     }
 
     #[test]

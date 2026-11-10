@@ -13,7 +13,7 @@
 //! ④ **换入前重校验**（TOCTOU 封口，规格 §7.1）；
 //! ⑤ 原子换入（旧 exe 改名 + 失败回滚）。
 
-use crate::error::{Error, Result, config_err, proto};
+use crate::error::{config_err, proto, Error, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::RngCore;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 发布签名公钥（32 字节 hex；随发布流程替换，测试注入自己的密钥）。
-pub const UPDATE_PUBKEY_HEX: &str = "ab6d87ec35a8995b88a98b1a51600740d06a80d6cf2bd8a7e7cad639431b2c23";
+pub const UPDATE_PUBKEY_HEX: &str =
+    "ab6d87ec35a8995b88a98b1a51600740d06a80d6cf2bd8a7e7cad639431b2c23";
 /// 清单大小上限（清单是小文件；防响应放大）。
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// 更新包下载上限。
@@ -45,14 +46,17 @@ pub fn parse_manifest(bytes: &[u8], pubkey: &VerifyingKey) -> Result<Manifest> {
     };
     // 签名对象 = sig 行之前的全部字节（**含其结尾换行**）——与签名侧约定一致。
     let (signed, sig_line) = trimmed.split_at(sig_pos + 1);
-    let sig_hex = sig_line.strip_prefix("sig=").ok_or_else(|| proto("sig 行格式非法"))?;
+    let sig_hex = sig_line
+        .strip_prefix("sig=")
+        .ok_or_else(|| proto("sig 行格式非法"))?;
     let mut sig_bytes = [0u8; 64];
     // 全字符 hex 校验先行（轮 4 P2：多字节 UTF-8 会让下标切片 panic 于字符边界）。
     if sig_hex.len() != 128 || !sig_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(proto("sig 长度/字符非法"));
     }
     for i in 0..64 {
-        sig_bytes[i] = u8::from_str_radix(&sig_hex[i * 2..i * 2 + 2], 16).map_err(|_| proto("sig 非十六进制"))?;
+        sig_bytes[i] = u8::from_str_radix(&sig_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| proto("sig 非十六进制"))?;
     }
     let sig = Signature::from_bytes(&sig_bytes);
     pubkey
@@ -63,7 +67,9 @@ pub fn parse_manifest(bytes: &[u8], pubkey: &VerifyingKey) -> Result<Manifest> {
     let mut url = None;
     let mut sha = None;
     for line in body.lines() {
-        let (k, v) = line.split_once('=').ok_or_else(|| proto("清单行格式非法"))?;
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| proto("清单行格式非法"))?;
         match k {
             "version" => version = Some(v.trim().to_string()),
             "url" => url = Some(v.trim().to_string()),
@@ -74,7 +80,8 @@ pub fn parse_manifest(bytes: &[u8], pubkey: &VerifyingKey) -> Result<Manifest> {
                 }
                 let mut out = [0u8; 32];
                 for i in 0..32 {
-                    out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).map_err(|_| proto("sha256 非十六进制"))?;
+                    out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)
+                        .map_err(|_| proto("sha256 非十六进制"))?;
                 }
                 sha = Some(out);
             }
@@ -87,7 +94,11 @@ pub fn parse_manifest(bytes: &[u8], pubkey: &VerifyingKey) -> Result<Manifest> {
     if version.is_empty() || url.is_empty() {
         return Err(proto("清单字段为空"));
     }
-    Ok(Manifest { version, url, sha256 })
+    Ok(Manifest {
+        version,
+        url,
+        sha256,
+    })
 }
 
 /// 版本比较：按「.」分段数值比较，缺段视为 0；非数字段按 0 处理。
@@ -96,7 +107,13 @@ pub fn version_gt(candidate: &str, current: &str) -> bool {
         v.trim()
             .trim_start_matches('v')
             .split('.')
-            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0))
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0)
+            })
             .collect()
     }
     let (a, b) = (nums(candidate), nums(current));
@@ -136,17 +153,25 @@ fn parse_url(raw: &str) -> Result<Url> {
         // IPv6 字面量：`[::1]:8443` 带端口才解析；裸 `[::1]`（无端口）走默认端口
         // 分支（轮 4 F9——此前裸 v6 字面量误入本分支，p.parse 必败报「端口非法」）。
         Some((h, p))
-            if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && h.starts_with('[') && h.ends_with(']') =>
+            if p.chars().all(|c| c.is_ascii_digit())
+                && !p.is_empty()
+                && h.starts_with('[')
+                && h.ends_with(']') =>
         {
             let port: u16 = p.parse().map_err(|_| proto("端口非法"))?;
             (h.trim_matches(|c| c == '[' || c == ']'), port)
         }
         // 非字面量主机名（或裸 IPv4）带端口。
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && !h.contains(':') => {
+        Some((h, p))
+            if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() && !h.contains(':') =>
+        {
             let port: u16 = p.parse().map_err(|_| proto("端口非法"))?;
             (h, port)
         }
-        _ => (authority.trim_matches(|c| c == '[' || c == ']'), if https { 443 } else { 80 }),
+        _ => (
+            authority.trim_matches(|c| c == '[' || c == ']'),
+            if https { 443 } else { 80 },
+        ),
     };
     if host.is_empty() {
         return Err(proto("URL 缺少主机"));
@@ -155,7 +180,12 @@ fn parse_url(raw: &str) -> Result<Url> {
     if !https && !is_loopback_host(host) {
         return Err(proto("明文更新源仅允许回环主机（规格 §5.1）"));
     }
-    Ok(Url { https, host: host.to_string(), port, path: path.to_string() })
+    Ok(Url {
+        https,
+        host: host.to_string(),
+        port,
+        path: path.to_string(),
+    })
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -191,7 +221,9 @@ async fn open_stream(url: &Url) -> Result<BoxIo> {
             return Ok::<BoxIo, Error>(Box::new(tcp));
         }
         // 规格 §5.1：更新源强制 https，证书走 webpki 根集（系统信任链纯 Rust 等价）。
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
         let cfg = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -264,7 +296,9 @@ async fn request_and_head(url: &Url) -> Result<(BoxIo, Head)> {
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         match k.trim().to_ascii_lowercase().as_str() {
             "location" => location = Some(v.trim().to_string()),
             "content-length" => content_length = v.trim().parse::<usize>().ok(),
@@ -273,7 +307,16 @@ async fn request_and_head(url: &Url) -> Result<(BoxIo, Head)> {
         }
     }
     let body_so_far = raw[(header_end + 4).min(raw.len())..].to_vec();
-    Ok((io, Head { status, location, content_length, chunked, body_so_far }))
+    Ok((
+        io,
+        Head {
+            status,
+            location,
+            content_length,
+            chunked,
+            body_so_far,
+        },
+    ))
 }
 
 /// GET 请求（跟随 ≤5 次重定向；每次重定向重新执行 https/回环策略）。
@@ -369,7 +412,8 @@ fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>> {
         let Some(line_end) = data.windows(2).position(|w| w == b"\r\n") else {
             return Err(proto("chunked 尺寸行不完整"));
         };
-        let size_str = std::str::from_utf8(&data[..line_end]).map_err(|_| proto("chunked 尺寸非法"))?;
+        let size_str =
+            std::str::from_utf8(&data[..line_end]).map_err(|_| proto("chunked 尺寸非法"))?;
         let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| proto("chunked 尺寸非法"))?;
         data = &data[line_end + 2..];
@@ -398,7 +442,8 @@ fn pubkey_from_hex(hex: &str) -> Result<VerifyingKey> {
     }
     let mut b = [0u8; 32];
     for i in 0..32 {
-        b[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| config_err("UPDATE_PUBKEY 非十六进制"))?;
+        b[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| config_err("UPDATE_PUBKEY 非十六进制"))?;
     }
     VerifyingKey::from_bytes(&b).map_err(|e| config_err(format!("公钥非法: {e}")))
 }
@@ -441,7 +486,10 @@ async fn download_into<W: tokio::io::AsyncWrite + Unpin + Send>(
 ) -> Result<()> {
     let (mut io, head) = request_and_head(url).await?;
     if head.status != 200 {
-        return Err(proto(format!("更新包下载返回 {}（重定向请使用直达 URL）", head.status)));
+        return Err(proto(format!(
+            "更新包下载返回 {}（重定向请使用直达 URL）",
+            head.status
+        )));
     }
     let mut dig = crate::hash::FileDigester::new();
     let mut total: u64 = 0;
@@ -476,8 +524,10 @@ async fn download_into<W: tokio::io::AsyncWrite + Unpin + Send>(
     ) -> Result<String> {
         const MAX_LINE: usize = 8 * 1024;
         loop {
-            if let Some(idx) = pending[*pos..].windows(2).position(|w| w == b"
-") {
+            if let Some(idx) = pending[*pos..].windows(2).position(|w| {
+                w == b"
+"
+            }) {
                 let line = String::from_utf8_lossy(&pending[*pos..*pos + idx]).to_string();
                 *pos += idx + 2;
                 return Ok(line);
@@ -538,8 +588,10 @@ async fn download_into<W: tokio::io::AsyncWrite + Unpin + Send>(
                     return Err(proto("chunked 块尾被截断"));
                 }
             }
-            if &pending[pos..pos + 2] != b"
-" {
+            if &pending[pos..pos + 2]
+                != b"
+"
+            {
                 return Err(proto("chunked 块尾非 CRLF"));
             }
             pos += 2;
@@ -610,7 +662,10 @@ pub fn apply_update(new_file: &Path, expect_sha: [u8; 32]) -> Result<PathBuf> {
         let _ = std::fs::remove_file(&staged);
         // 回滚：旧 exe 复位。
         if std::fs::rename(&bak, &cur).is_err() {
-            return Err(proto(format!("更新失败且回滚失败（.old 保留于 {}）: {e}", bak.display())));
+            return Err(proto(format!(
+                "更新失败且回滚失败（.old 保留于 {}）: {e}",
+                bak.display()
+            )));
         }
         return Err(e);
     }
@@ -633,7 +688,9 @@ pub async fn run_update(
             if n.starts_with("update-") && (n.ends_with(".part") || n.ends_with(".bin")) {
                 if let Ok(md) = e.metadata() {
                     if md.modified().ok().is_some_and(|t| {
-                        now.duration_since(t).map(|d| d > Duration::from_secs(24 * 3600)).unwrap_or(false)
+                        now.duration_since(t)
+                            .map(|d| d > Duration::from_secs(24 * 3600))
+                            .unwrap_or(false)
                     }) {
                         let _ = std::fs::remove_file(e.path());
                     }
@@ -691,7 +748,12 @@ mod tests {
     fn manifest_roundtrip_and_tamper() {
         let (sk, vk) = keypair();
         let sha = crate::hash::sha256(b"pkg");
-        let m = sign_manifest(&sk, "1.2.3", "https://example.com/a.exe", &crate::hash::hex(&sha));
+        let m = sign_manifest(
+            &sk,
+            "1.2.3",
+            "https://example.com/a.exe",
+            &crate::hash::hex(&sha),
+        );
         let parsed = parse_manifest(&m, &vk).unwrap();
         assert_eq!(parsed.version, "1.2.3");
         assert_eq!(parsed.url, "https://example.com/a.exe");
@@ -699,7 +761,10 @@ mod tests {
         // 篡改 version → 签名失败。
         let mut tampered = m.clone();
         tampered[8] = b'9';
-        assert!(parse_manifest(&tampered, &vk).is_err(), "篡改必须被签名识破");
+        assert!(
+            parse_manifest(&tampered, &vk).is_err(),
+            "篡改必须被签名识破"
+        );
         // 无 sig → 拒绝。
         assert!(parse_manifest(b"version=1.0.0\nurl=https://x/y\nsha256=x\n", &vk).is_err());
     }
@@ -718,7 +783,10 @@ mod tests {
         assert!(parse_url("https://example.com/x").is_ok());
         assert!(parse_url("http://127.0.0.1:8080/x").is_ok(), "回环允许明文");
         assert!(parse_url("http://localhost/x").is_ok());
-        assert!(parse_url("http://example.com/x").is_err(), "非回环明文必须拒绝");
+        assert!(
+            parse_url("http://example.com/x").is_err(),
+            "非回环明文必须拒绝"
+        );
         assert!(parse_url("ftp://example.com/x").is_err());
     }
 

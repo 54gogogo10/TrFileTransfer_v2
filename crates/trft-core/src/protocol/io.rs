@@ -1,7 +1,7 @@
 //! 异步读写原语：多字节整数一律小端；
 //! 控制帧读 30s 超时、载荷读 5min 超时（规格 §6.1：普通读超时 30 秒，长任务读窗口 5 分钟）。
 
-use crate::error::{Result, proto};
+use crate::error::{proto, Result};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -10,7 +10,11 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// 长任务读窗口（大文件载荷，允许吞吐静默）。
 pub const LONG_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-async fn read_exact_t<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8], dur: Duration) -> Result<()> {
+async fn read_exact_t<R: AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut [u8],
+    dur: Duration,
+) -> Result<()> {
     match tokio::time::timeout(dur, r.read_exact(buf)).await {
         Ok(res) => {
             res?;
@@ -96,7 +100,10 @@ pub async fn write_str_u16<W: AsyncWrite + Unpin>(w: &mut W, s: &str) -> Result<
     let b = s.as_bytes();
     // 静默截断会导致线框架失步，必须显式失败。
     if b.len() > u16::MAX as usize {
-        return Err(crate::error::proto(format!("字符串超长（{} 字节 > 65535）", b.len())));
+        return Err(crate::error::proto(format!(
+            "字符串超长（{} 字节 > 65535）",
+            b.len()
+        )));
     }
     write_u16(w, b.len() as u16).await?;
     w.write_all(b).await?;

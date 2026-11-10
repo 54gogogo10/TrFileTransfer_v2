@@ -163,7 +163,12 @@ fn webview2_check() -> bool {
     );
     if yes {
         let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", "https://go.microsoft.com/fwlink/p/?LinkId=2124703"])
+            .args([
+                "/c",
+                "start",
+                "",
+                "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+            ])
             .spawn();
     }
     false
@@ -178,7 +183,8 @@ fn webview2_check() -> bool {
 fn use_portable_webview2() -> bool {
     let env_set = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER").is_some();
     let detected = std::env::current_exe().ok().and_then(|exe| {
-        exe.parent().and_then(|dir| detect_portable_runtime(dir, env_set))
+        exe.parent()
+            .and_then(|dir| detect_portable_runtime(dir, env_set))
     });
     match detected {
         Some(dir) => {
@@ -247,7 +253,13 @@ mod portable_tests {
     fn portable_detected_when_marker_present() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("WebView2Runtime")).unwrap();
-        std::fs::write(dir.path().join("WebView2Runtime").join("msedgewebview2.exe"), b"").unwrap();
+        std::fs::write(
+            dir.path()
+                .join("WebView2Runtime")
+                .join("msedgewebview2.exe"),
+            b"",
+        )
+        .unwrap();
         assert_eq!(
             detect_portable_runtime(dir.path(), false).as_deref(),
             Some(dir.path().join("WebView2Runtime").as_path()),
@@ -258,7 +270,11 @@ mod portable_tests {
     #[test]
     fn absent_or_incomplete_marker_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(detect_portable_runtime(dir.path(), false), None, "无文件夹 ≠ 便携版");
+        assert_eq!(
+            detect_portable_runtime(dir.path(), false),
+            None,
+            "无文件夹 ≠ 便携版"
+        );
         std::fs::create_dir_all(dir.path().join("WebView2Runtime")).unwrap();
         assert_eq!(
             detect_portable_runtime(dir.path(), false),
@@ -271,7 +287,13 @@ mod portable_tests {
     fn explicit_env_wins_over_portable_folder() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("WebView2Runtime")).unwrap();
-        std::fs::write(dir.path().join("WebView2Runtime").join("msedgewebview2.exe"), b"").unwrap();
+        std::fs::write(
+            dir.path()
+                .join("WebView2Runtime")
+                .join("msedgewebview2.exe"),
+            b"",
+        )
+        .unwrap();
         assert_eq!(
             detect_portable_runtime(dir.path(), true),
             None,

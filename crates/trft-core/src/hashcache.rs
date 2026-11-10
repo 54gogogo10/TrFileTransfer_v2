@@ -58,9 +58,13 @@ impl HashCache {
             let now = now_secs();
             let ttl_secs = (ttl_days as u64).saturating_mul(24 * 3600);
             for line in text.lines() {
-                let Some(first) = line.find('|') else { continue };
+                let Some(first) = line.find('|') else {
+                    continue;
+                };
                 let (sum_hex, rest) = line.split_at(first);
-                let Ok(sum) = u64::from_str_radix(sum_hex, 16) else { continue };
+                let Ok(sum) = u64::from_str_radix(sum_hex, 16) else {
+                    continue;
+                };
                 if sum != fnv1a(rest[1..].as_bytes()) {
                     continue; // 坏行丢弃（校验体不含首个分隔符）
                 }
@@ -103,7 +107,9 @@ impl HashCache {
     }
 
     pub fn get(&self, path: &str, size: u64, mtime: u64) -> Option<[u8; 32]> {
-        self.map.get(&(fnv1a(path.as_bytes()), size, mtime)).map(|(h, _)| *h)
+        self.map
+            .get(&(fnv1a(path.as_bytes()), size, mtime))
+            .map(|(h, _)| *h)
     }
 
     /// 插入：内存立即生效；持久化走追加日志（FNV 行校验），写失败静默退化为内存缓存。
@@ -120,7 +126,8 @@ impl HashCache {
         if self.degraded && self.map.len() >= DEGRADED_MAP_CAP {
             self.map.clear();
         }
-        self.map.insert((fnv1a(path.as_bytes()), size, mtime), (hash, self.gen));
+        self.map
+            .insert((fnv1a(path.as_bytes()), size, mtime), (hash, self.gen));
     }
 
     fn append_line(&mut self, path: &str, size: u64, mtime: u64, hash: [u8; 32]) {
@@ -147,7 +154,11 @@ impl HashCache {
                 }
             }
         }
-        let inner = format!("{}|{size}|{mtime}|{:016x}", crate::hash::hex(&hash), fnv1a(path.as_bytes()));
+        let inner = format!(
+            "{}|{size}|{mtime}|{:016x}",
+            crate::hash::hex(&hash),
+            fnv1a(path.as_bytes())
+        );
         let line = format!("{:016x}|{inner}\n", fnv1a(inner.as_bytes()));
         let f = self.log.as_mut().unwrap();
         match f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
@@ -270,7 +281,11 @@ mod tests {
         std::fs::write(&p, entry_line("f.txt", 9, now, &h)).unwrap();
         let c = HashCache::load(&p, 7);
         let actual = crate::hash::sha256(b"tampered!");
-        assert_ne!(actual, c.get("f.txt", 9, now).unwrap(), "篡改必须被比对发现");
+        assert_ne!(
+            actual,
+            c.get("f.txt", 9, now).unwrap(),
+            "篡改必须被比对发现"
+        );
     }
 
     #[test]
@@ -348,9 +363,16 @@ mod tests {
         for i in 0..(cap * 2) {
             c.insert(&format!("f{i}"), i, i, [1u8; 32]);
         }
-        assert_eq!(c.get("f0", 0, 0), None, "degraded 下达上限后最早的条目必须被清出（否则 map 无界）");
+        assert_eq!(
+            c.get("f0", 0, 0),
+            None,
+            "degraded 下达上限后最早的条目必须被清出（否则 map 无界）"
+        );
         // 最后一次清空发生在临近末尾——最末条目必然在表内。
         let last = cap * 2 - 1;
-        assert!(c.get(&format!("f{last}"), last, last).is_some(), "最近的条目应可用");
+        assert!(
+            c.get(&format!("f{last}"), last, last).is_some(),
+            "最近的条目应可用"
+        );
     }
 }

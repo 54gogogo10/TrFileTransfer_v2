@@ -7,9 +7,9 @@ use rand_core::{OsRng, RngCore};
 use std::time::Duration;
 use tokio::time::timeout;
 use trft_core::hash::sha256_file;
-use trft_core::transfer::Transport;
-use trft_core::transfer::quic::{server_endpoint, serve_quic_on};
+use trft_core::transfer::quic::{serve_quic_on, server_endpoint};
 use trft_core::transfer::sender::SendOptions;
+use trft_core::transfer::Transport;
 
 #[tokio::test]
 async fn quic_single_file_roundtrip() {
@@ -20,14 +20,22 @@ async fn quic_single_file_roundtrip() {
     std::fs::write(&src, &data).unwrap();
     let out = dir.path().join("out");
 
-    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let addr = endpoint.local_addr().unwrap();
     let server = tokio::spawn(serve_quic_on(endpoint, cert_fp, opts(out.clone(), None, 1)));
 
     let mut send_opts = SendOptions::default();
     send_opts.transport = Transport::Quic;
-    trft_core::transfer::sender::send_file(addr, &src, &send_opts).await.unwrap();
-    timeout(Duration::from_secs(15), server).await.unwrap().unwrap().unwrap();
+    trft_core::transfer::sender::send_file(addr, &src, &send_opts)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(15), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         sha256_file(&out.join("q.bin")).unwrap(),
@@ -42,12 +50,21 @@ async fn quic_pairing_required() {
     std::fs::write(&src, b"secret over quic").unwrap();
     let out = dir.path().join("out");
 
-    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let addr = endpoint.local_addr().unwrap();
-    let server = tokio::spawn(serve_quic_on(endpoint, cert_fp, opts(out.clone(), Some("987654"), 1)));
+    let server = tokio::spawn(serve_quic_on(
+        endpoint,
+        cert_fp,
+        opts(out.clone(), Some("987654"), 1),
+    ));
 
     // 无码 → 拒绝。
-    let no_code = SendOptions { transport: Transport::Quic, ..Default::default() };
+    let no_code = SendOptions {
+        transport: Transport::Quic,
+        ..Default::default()
+    };
     let r = trft_core::transfer::sender::send_file(addr, &src, &no_code).await;
     assert!(r.is_err(), "无配对码必须失败");
 
@@ -57,8 +74,14 @@ async fn quic_pairing_required() {
         pairing_code: Some("987654".into()),
         ..Default::default()
     };
-    trft_core::transfer::sender::send_file(addr, &src, &with_code).await.unwrap();
-    timeout(Duration::from_secs(15), server).await.unwrap().unwrap().unwrap();
+    trft_core::transfer::sender::send_file(addr, &src, &with_code)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(15), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(out.join("secret.txt").exists());
 }
 
@@ -71,7 +94,9 @@ async fn mitm_dual_arm_relay_rejected_by_channel_binding() {
     use std::sync::Arc;
 
     // 真实服务端：配对码 987654（限量 1——拒绝路径不计数，收尾由 abort 兜底）。
-    let (ep, real_fp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (ep, real_fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let real_addr = ep.local_addr().unwrap();
     let out = tempfile::tempdir().unwrap().path().join("out-real");
     let server = tokio::spawn(serve_quic_on(
@@ -81,7 +106,9 @@ async fn mitm_dual_arm_relay_rejected_by_channel_binding() {
     ));
 
     // MITM：自签 endpoint（客户端看到的是 MITM 证书，不是真实服务端证书）。
-    let (mitm_ep, _mfp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (mitm_ep, _mfp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let mitm_addr = mitm_ep.local_addr().unwrap();
     let relay = tokio::spawn(async move {
         // 上行客户端配置（无 pin——模拟无钉扎的真实受害者）。
@@ -97,7 +124,9 @@ async fn mitm_dual_arm_relay_rejected_by_channel_binding() {
             tokio::spawn(async move {
                 eprintln!("[MITM] 下游连接进入");
                 let Ok(down) = inc.await else { return };
-                let Ok((cs, cr)) = down.accept_bi().await else { return };
+                let Ok((cs, cr)) = down.accept_bi().await else {
+                    return;
+                };
                 eprintln!("[MITM] 下游流建立");
                 // 第二腿：连接真实服务端（MITM 是这里的客户端）。
                 let Ok(up_conn) = up_ep2.connect(real_addr, "trft.local").unwrap().await else {
@@ -105,7 +134,9 @@ async fn mitm_dual_arm_relay_rejected_by_channel_binding() {
                     return;
                 };
                 eprintln!("[MITM] 上游连接建立");
-                let Ok((us, ur)) = up_conn.open_bi().await else { return };
+                let Ok((us, ur)) = up_conn.open_bi().await else {
+                    return;
+                };
                 eprintln!("[MITM] 上游流建立——开始转发");
                 let (mut cs, mut cr) = (cs, cr);
                 let (mut us, mut ur) = (us, ur);
@@ -148,7 +179,9 @@ async fn blind_accept_fake_server_rejected_by_s2c_proof() {
     use trft_core::protocol::{frame::R_PAIRING_SALT, frame::T_PAIRING_BOUND};
 
     // 假服务端：自签证书，不知道配对码——走完 0x0D 流程并「盲接受」。
-    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let addr = ep.local_addr().unwrap();
     let server = tokio::spawn(async move {
         use trft_core::protocol::io::{read_str_u16, read_u64};
@@ -166,12 +199,18 @@ async fn blind_accept_fake_server_rejected_by_s2c_proof() {
         // 像真接收器一样照单全收文件帧（0x00 + 名 + 大小 + 载荷 + 哈希）并回 OK——
         // 偷数据型假服务端模型；无 s2c 校验时 send_file 将假成功（判别基线）。
         // s2c 生效时客户端在校验处断开——读失败即优雅退出（不得 panic）。
-        let Ok(frame) = read_u8(&mut recv).await else { return };
+        let Ok(frame) = read_u8(&mut recv).await else {
+            return;
+        };
         if frame != 0x00 {
             return;
         }
-        let Ok(_name) = read_str_u16(&mut recv).await else { return };
-        let Ok(size) = read_u64(&mut recv).await else { return };
+        let Ok(_name) = read_str_u16(&mut recv).await else {
+            return;
+        };
+        let Ok(size) = read_u64(&mut recv).await else {
+            return;
+        };
         let mut left = size;
         let mut buf = vec![0u8; 4096];
         while left > 0 {
@@ -202,7 +241,10 @@ async fn blind_accept_fake_server_rejected_by_s2c_proof() {
     std::fs::write(&src, b"victim").unwrap();
     let r = trft_core::transfer::sender::send_file(addr, &src, &opts).await;
     assert!(r.is_err(), "盲接受型假服务端必须被 S→C 证明拒绝");
-    timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 /// 轮 2 F1 判别：**伪装旧服务端的强制降级必败**。主动中间人无配对码，对 0x0D
@@ -213,10 +255,12 @@ async fn blind_accept_fake_server_rejected_by_s2c_proof() {
 async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc as StdArc;
-    use trft_core::protocol::io::{read_n, read_str_u16, read_u64, read_u8, write_all, write_u8};
     use trft_core::protocol::frame::{T_PAIRING, T_PAIRING_BOUND};
+    use trft_core::protocol::io::{read_n, read_str_u16, read_u64, read_u8, write_all, write_u8};
 
-    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let addr = ep.local_addr().unwrap();
     let stole = StdArc::new(AtomicBool::new(false));
     let stole2 = stole.clone();
@@ -226,9 +270,13 @@ async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
         let mut conn_count = 0u32;
         while let Some(inc) = ep.accept().await {
             let Ok(conn) = inc.await else { continue };
-            let Ok((mut send, mut recv)) = conn.accept_bi().await else { continue };
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                continue;
+            };
             let _ = read_u8(&mut recv).await; // 版本字节
-            let Ok(t) = read_u8(&mut recv).await else { continue };
+            let Ok(t) = read_u8(&mut recv).await else {
+                continue;
+            };
             conn_count += 1;
             match t {
                 T_PAIRING_BOUND => {
@@ -247,7 +295,11 @@ async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
                     // 窃取载荷：0x00 帧（名 + 大小 + 载荷 + 哈希）照单全收。
                     let frame_ok = matches!(read_u8(&mut recv).await, Ok(0x00))
                         && read_str_u16(&mut recv).await.is_ok();
-                    let size = if frame_ok { read_u64(&mut recv).await.unwrap_or(0) } else { 0 };
+                    let size = if frame_ok {
+                        read_u64(&mut recv).await.unwrap_or(0)
+                    } else {
+                        0
+                    };
                     if frame_ok {
                         let mut left = size;
                         let mut buf = vec![0u8; 4096];
@@ -265,7 +317,7 @@ async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
                             let _ = read_n(&mut recv, 32).await;
                             stole2.store(true, Ordering::SeqCst); // 载荷已到手
                             let _ = write_u8(&mut send, 0x01).await; // 令客户端假成功
-                            // FIN + 保活：最终状态字节必须送达（同上——立即 drop 会作废未确认数据）。
+                                                                     // FIN + 保活：最终状态字节必须送达（同上——立即 drop 会作废未确认数据）。
                             let _ = send.finish();
                             tokio::time::sleep(Duration::from_millis(300)).await;
                         }
@@ -288,8 +340,14 @@ async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
         ..Default::default()
     };
     let r = trft_core::transfer::sender::send_file(addr, &src, &victim).await;
-    assert!(r.is_err(), "伪装旧服务端强制降级必须被默认拒绝（不得进入明文 0x05 腿）");
-    assert!(!stole.load(Ordering::SeqCst), "默认路径不得让 MITM 窃取载荷");
+    assert!(
+        r.is_err(),
+        "伪装旧服务端强制降级必须被默认拒绝（不得进入明文 0x05 腿）"
+    );
+    assert!(
+        !stole.load(Ordering::SeqCst),
+        "默认路径不得让 MITM 窃取载荷"
+    );
 
     // 显式放行：允许降级（对接真旧服务端的出口；此时成功是用户决策）。
     let allowed = SendOptions {

@@ -85,8 +85,14 @@ mod tests {
     fn pairing_proof_is_deterministic_and_key_dependent() {
         let k1 = derive_pairing_key("123456", b"saaaaaaaaaaaa");
         let k2 = derive_pairing_key("654321", b"saaaaaaaaaaaa");
-        assert_ne!(pairing_proof(&k1, b"saaaaaaaaaaaa"), pairing_proof(&k2, b"saaaaaaaaaaaa"));
-        assert_eq!(pairing_proof(&k1, b"saaaaaaaaaaaa"), pairing_proof(&k1, b"saaaaaaaaaaaa"));
+        assert_ne!(
+            pairing_proof(&k1, b"saaaaaaaaaaaa"),
+            pairing_proof(&k2, b"saaaaaaaaaaaa")
+        );
+        assert_eq!(
+            pairing_proof(&k1, b"saaaaaaaaaaaa"),
+            pairing_proof(&k1, b"saaaaaaaaaaaa")
+        );
     }
 
     /// M6'：绑定证明与明文证明域分隔；指纹/盐/密钥任一变化即变化。
@@ -96,14 +102,33 @@ mod tests {
         let salt = b"saaaaaaaaaaaa";
         let fp_a = [1u8; 32];
         let fp_b = [2u8; 32];
-        assert_ne!(pairing_proof_bound(&k, salt, &fp_a), pairing_proof(&k, salt), "域分隔");
-        assert_ne!(pairing_proof_bound(&k, salt, &fp_a), pairing_proof_bound(&k, salt, &fp_b));
-        assert_eq!(pairing_proof_bound(&k, salt, &fp_a), pairing_proof_bound(&k, salt, &fp_a));
+        assert_ne!(
+            pairing_proof_bound(&k, salt, &fp_a),
+            pairing_proof(&k, salt),
+            "域分隔"
+        );
+        assert_ne!(
+            pairing_proof_bound(&k, salt, &fp_a),
+            pairing_proof_bound(&k, salt, &fp_b)
+        );
+        assert_eq!(
+            pairing_proof_bound(&k, salt, &fp_a),
+            pairing_proof_bound(&k, salt, &fp_a)
+        );
         let k2 = derive_pairing_key("654321", salt);
-        assert_ne!(pairing_proof_bound(&k, salt, &fp_a), pairing_proof_bound(&k2, salt, &fp_a));
+        assert_ne!(
+            pairing_proof_bound(&k, salt, &fp_a),
+            pairing_proof_bound(&k2, salt, &fp_a)
+        );
         // S→C 方向证明与 C→S 域分隔。
-        assert_ne!(pairing_proof_s2c(&k, salt, &fp_a), pairing_proof_bound(&k, salt, &fp_a));
-        assert_ne!(pairing_proof_s2c(&k, salt, &fp_a), pairing_proof_s2c(&k, salt, &fp_b));
+        assert_ne!(
+            pairing_proof_s2c(&k, salt, &fp_a),
+            pairing_proof_bound(&k, salt, &fp_a)
+        );
+        assert_ne!(
+            pairing_proof_s2c(&k, salt, &fp_a),
+            pairing_proof_s2c(&k, salt, &fp_b)
+        );
     }
 
     #[test]

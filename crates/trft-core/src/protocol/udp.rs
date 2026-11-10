@@ -1,7 +1,7 @@
 //! 单向 UDP 帧：20 字节公共头（规格 §4.2），无回传链路、落盘即状态。
 //! 布局: [0]=版本 [1]=帧类型 [2..10]=会话ID(LE) [10..18]=序号(LE) [18..20]=保留。
 
-use crate::error::{Result, proto};
+use crate::error::{proto, Result};
 use crate::hash::sha256;
 
 pub const UDP_HEADER_LEN: usize = 20;
@@ -58,7 +58,11 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = UdpHeader { frame: U_F_DATA, session: 0x1122334455667788, seq: 42 };
+        let h = UdpHeader {
+            frame: U_F_DATA,
+            session: 0x1122334455667788,
+            seq: 42,
+        };
         let b = h.to_bytes();
         assert_eq!(b.len(), 20);
         assert_eq!(UdpHeader::from_bytes(&b).unwrap(), h);
@@ -66,7 +70,12 @@ mod tests {
 
     #[test]
     fn rejects_wrong_version_and_short() {
-        let mut b = UdpHeader { frame: U_F_START, session: 1, seq: 1 }.to_bytes();
+        let mut b = UdpHeader {
+            frame: U_F_START,
+            session: 1,
+            seq: 1,
+        }
+        .to_bytes();
         b[0] = 9;
         assert!(UdpHeader::from_bytes(&b).is_err());
         assert!(UdpHeader::from_bytes(&b[..10]).is_err());

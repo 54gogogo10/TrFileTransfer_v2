@@ -3,7 +3,7 @@
 //! 线上编排在传输里程碑接入。
 
 use crate::crypto::cipher::SegmentCipher;
-use crate::error::{Result, crypto};
+use crate::error::{crypto, Result};
 use crate::hash::sha256;
 use hkdf::Hkdf;
 use p256::ecdh::EphemeralSecret;
@@ -38,7 +38,11 @@ pub struct Handshake {
 
 pub fn new_handshake() -> Result<Handshake> {
     let secret = EphemeralSecret::random(&mut OsRng);
-    let my_pub = secret.public_key().to_encoded_point(false).as_bytes().to_vec();
+    let my_pub = secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
     Ok(Handshake { secret, my_pub })
 }
 
@@ -80,12 +84,18 @@ fn derive_session(z: &[u8], client_pub: &[u8], server_pub: &[u8]) -> Result<Sess
     let mut kmb = [0u8; 32];
     let mut kca = [0u8; 32];
     let mut kcb = [0u8; 32];
-    hk.expand(b"trft-v2 c2s aes", &mut ka).map_err(|e| crypto(e.to_string()))?;
-    hk.expand(b"trft-v2 c2s mac", &mut kma).map_err(|e| crypto(e.to_string()))?;
-    hk.expand(b"trft-v2 s2c aes", &mut kb).map_err(|e| crypto(e.to_string()))?;
-    hk.expand(b"trft-v2 s2c mac", &mut kmb).map_err(|e| crypto(e.to_string()))?;
-    hk.expand(b"trft-v2 c2s conf", &mut kca).map_err(|e| crypto(e.to_string()))?;
-    hk.expand(b"trft-v2 s2c conf", &mut kcb).map_err(|e| crypto(e.to_string()))?;
+    hk.expand(b"trft-v2 c2s aes", &mut ka)
+        .map_err(|e| crypto(e.to_string()))?;
+    hk.expand(b"trft-v2 c2s mac", &mut kma)
+        .map_err(|e| crypto(e.to_string()))?;
+    hk.expand(b"trft-v2 s2c aes", &mut kb)
+        .map_err(|e| crypto(e.to_string()))?;
+    hk.expand(b"trft-v2 s2c mac", &mut kmb)
+        .map_err(|e| crypto(e.to_string()))?;
+    hk.expand(b"trft-v2 c2s conf", &mut kca)
+        .map_err(|e| crypto(e.to_string()))?;
+    hk.expand(b"trft-v2 s2c conf", &mut kcb)
+        .map_err(|e| crypto(e.to_string()))?;
     Ok(SessionKeys {
         c2s: SegmentCipher::new(ka, kma),
         s2c: SegmentCipher::new(kb, kmb),

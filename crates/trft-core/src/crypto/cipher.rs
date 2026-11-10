@@ -1,7 +1,7 @@
 //! 段加密器：AES-256-CTR + 截断 HMAC（16B）+ 段序绑定。
 //! 规格 §5.1：等长段重排/交换立即校验失败 → tag 输入绑定 seq。
 
-use crate::error::{Result, crypto};
+use crate::error::{crypto, Result};
 use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
@@ -55,7 +55,8 @@ impl SegmentCipher {
     }
 
     fn crypt(key: &[u8; 32], iv: &[u8; 16], data: &mut [u8]) {
-        let mut c = Ctr128BE::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
+        let mut c =
+            Ctr128BE::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
         c.apply_keystream(data);
     }
 

@@ -81,7 +81,10 @@ mod tests {
         let t0 = Instant::now();
         b.acquire(4_000_000).await;
         let el = t0.elapsed();
-        assert!(el >= Duration::from_millis(2_800), "超容量请求未按速率放行: {el:?}");
+        assert!(
+            el >= Duration::from_millis(2_800),
+            "超容量请求未按速率放行: {el:?}"
+        );
         assert!(el < Duration::from_secs(8), "超容量请求过慢: {el:?}");
     }
 

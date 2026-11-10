@@ -37,7 +37,11 @@ fn frontend_full_contract_deserializes() {
     js["nofec"] = true.into();
     js["limit"] = 512.into();
     let r: SendRequest = serde_json::from_value(js).unwrap();
-    assert_eq!(r.src_port, Some(50000), "srcPort ↔ src_port（本轮新增接线）");
+    assert_eq!(
+        r.src_port,
+        Some(50000),
+        "srcPort ↔ src_port（本轮新增接线）"
+    );
     assert_eq!(r.passes, Some(2));
     assert_eq!(r.fec_parity, Some(3));
     assert_eq!(r.limit, Some(512));
@@ -79,10 +83,19 @@ fn display_name_three_shapes() {
         nofec: false,
         pin: None,
     };
-    assert_eq!(mk(Some("D:\\a\\报告终稿.zip".into()), None).display_name(), "报告终稿.zip");
+    assert_eq!(
+        mk(Some("D:\\a\\报告终稿.zip".into()), None).display_name(),
+        "报告终稿.zip"
+    );
     assert!(
-        mk(None, Some("hello 文本消息".into())).display_name().starts_with("文本"),
+        mk(None, Some("hello 文本消息".into()))
+            .display_name()
+            .starts_with("文本"),
         "文本任务显示名带前缀"
     );
-    assert_eq!(mk(None, None).display_name(), "发送", "无路径无文本回落通用名");
+    assert_eq!(
+        mk(None, None).display_name(),
+        "发送",
+        "无路径无文本回落通用名"
+    );
 }

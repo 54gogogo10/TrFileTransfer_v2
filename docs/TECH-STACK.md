@@ -52,12 +52,13 @@
 
 ## 3. 传输槽位映射
 
-规格 §3.1 的三种传输 → 本实现的对应关系：
+规格 §3.1 的四种传输（UDT/QUIC 槽位拆分，2026-11-10——原「UDT」槽位恢复 UDT 语义，QUIC 独立成模式）→ 本实现的对应关系：
 
 | 规格协议 | 本实现 | 线协议帧 | 状态 |
 |---|---|---|---|
 | TCP（通用） | tokio `TcpStream` + 0x09 加密装饰器（双向确认）+ 0x08 压缩装饰器（认证后协商） | 0x00 单文件 / 0x01 文件夹 / 0x02 分块 / 0x03/0x04 续传 / 0x05 配对 / 0x06 文本 / 0x08/0x09 加密压缩 / 0x0A–0x0C 能力覆盖收尾 / 0x10/0x11/0x1A 应答 | ✅ 已实现（0x07/0x17 旧版加密不实现——无旧版互通承诺） |
-| UDT（可靠 UDP 流） | **QUIC**（quinn，替代槽位；`--pin` 钉扎可选） | 与 TCP 同帧 + 1 字节版本握手 | ✅ 已实现（含全部新帧） |
+| UDT（可靠 UDP 流） | **UDT**（原生 Rust 自研：ARQ + SACK + 固定窗口 256×1200B，`transfer::udt`；**与 UDT4 不做包级互通**——§4.3 口径不变；线格式 WIRE-PROTOCOL.md §7） | 与 TCP 同帧（0x05/0x09/0x0A/0x08 全继承 TCP 路径） | ✅ 已实现（含丢包注入单测与真 socket e2e） |
+| QUIC（拆分新增槽位） | **QUIC**（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定；`--pin` 钉扎可选） | 与 TCP 同帧 + 1 字节版本握手 | ✅ 已实现（含全部新帧） |
 | 单向 UDP + RS-FEC | tokio `UdpSocket` + `reed-solomon-erasure` | 20 字节公共头 + 0x01/0x02/0x03/0x04 | ✅ 收发引擎全链路已实现 |
 
 ## 4. 线协议处置
@@ -232,6 +233,15 @@
    - **G2 目录类生效提示**（规格 §3.3「下次服务器启动生效（有提示）」）：保存设置时若任一接收器运行中，追加 warn toast 提示目录类选项下次启动生效；
    - **G3 最近接收定位——登记不做**：Rust 最近接收仅存文件名（无完整路径），定位需扩 core 事件载荷（可选后续项）；原版 RecentFiles 存全路径；
    - **验证**：mock 实测定位调用路径透传 + 双 toast；全量 210/0。
+28. **UDT/QUIC 槽位拆分**（2026-11-10，用户拍板：原「UDT」恢复 UDT 语义、QUIC 独立成第四模式）：
+   - **UDT 原生实现**（`transfer::udt` + `protocol/udt.rs`，~900 行）：UDP 之上可靠有序双向字节流——HS/HS_ACK 握手（conn_id 随机 + nonce 回显防 off-path）、DATA/ACK+SACK（立即逐包确认、乱序重排上限 1024 包）、FIN/FIN_ACK 收尾、RST 附原因；RTO 按 RFC 6298 简化 EWMA（200ms–3s），单包重传 >12 断连；固定窗口 256×1200B（无拥塞控制——局域网工具定位，**与 UDT4 语义差异登记**）；30s 空闲超时（对齐原版 UDT_RCVTIMEO/UDT_SNDTIMEO）；服务端单 socket 按 conn_id 多路分解 + IP 过滤先于握手 + 连接表 256；帧层复用 `handle_conn`（TCP 入口）——0x05/0x09/0x0A/0x08 与 TCP 同路径（**不得复用 QUIC 入口**——其跳过 0x09，机密性语义不同）；
+   - **拆分改名**：UI/CLI 全线 `UDT (QUIC)` → `QUIC` 独立模式 + 新增 `UDT` 模式（CLI `--proto tcp|quic|udt|udp`；`--pin` 归 QUIC）；`Transport::Udt` 新变体接入 `connect_stack`/`send_file`/`send_text`/`send_folder_auto`/`MonitorProto`；GUI 接收页四卡、设置页四目录、协议↔端口跟随映射；
+   - **发现帧 0xD2 向后兼容扩展**：flags bit1 语义正名（= QUIC，旧版把它显示为 UDT 恰与其实现一致），新增 bit3 + 尾部可选 `udt_port` 字段——旧解码器读新帧把 quic_port 当 udt_port 显示，语义恰好一致；新解码器对旧短帧回 `udt_port=None`；
+   - **存量迁移**：devices.json / queue.txt 里 proto `"udt"`（拆分前=QUIC 槽位）首载一次性改写 `"quic"` 并落盘（devices 走 `DeviceStore::load`；queue 以 `#trft-queue-v2` 版本头判别，迁移幂等）；此后 `"udt"` 即真 UDT；
+   - **配置新键**：`server_port_udt` / `save_dir_udt`（默认 8080 / AppData 下 `udt` 子目录，随「各传输同默认端口、UDP 族同端口需错开」既有约定）；
+   - **实现坑登记（本轮排障实录）**：(1) tokio `Notify::notified()` future 逐 poll 重建、**drop 即从等待队列注销**——`notify_waiters` 丢唤醒致 shutdown 永挂，FIN_ACK 改走 mpsc 通道（waker 挂 Receiver 上常驻存活）；(2) `watch::Sender::send` 在**无接收者时静默失败且不存值**——`error()` 所在对象必须持有 `err_rx`，否则 RST/超时被误读为干净 EOF（「结果未知 ≠ 成功」红线）；(3) current-thread runtime 上 `recv_from/recv` 有积压即同步 Ready——demux/泵/驱动循环**必须逐包 `yield_now()`**，否则互相饿死（loopback 上表现为 ~55KB/s 限速与偶发重传超限）；(4) std::sync::Mutex 不可重入——同语句两个临时 guard 同锁 = 死锁；
+   - **性能登记**：loopback 实测 ~85KB/s（1MB 真传输）——每数据包跨 ~8 次任务调度 + Windows socket 事件唤醒（每包 ms 级）为主因；**优化项登记**（后续批次）：ACK 合批、批量收发（一次事件多包收集）、应用写聚合；真实高 RTT 链路上限由窗口给出（256×1200B/RTT，50ms ≈ 6MB/s）；
+   - **测试**：`tests/e2e_udt.rs`（真 socket：单文件 SHA-256 一致、配对门三态、0x09 加密路径、握手版本门 fail-closed）+ 引擎单测（对偶注入：无损双向+FIN/EOF、25% 丢包重传恢复、RST 传播、重复 DATA 不重复投递）+ 发现帧新旧兼容 + devices 迁移幂等判别；全量回归绿。
 
 ## 8. 记录在案的否决项
 

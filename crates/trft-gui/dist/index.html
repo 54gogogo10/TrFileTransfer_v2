@@ -63,7 +63,8 @@
           <input type="text" id="send-port" class="mono w80" value="8080" />
           <select id="send-proto">
             <option value="tcp">TCP</option>
-            <option value="udt">UDT (QUIC)</option>
+            <option value="quic">QUIC</option>
+            <option value="udt">UDT</option>
             <option value="udp">UDP (单向)</option>
           </select>
           <input type="text" id="send-srcport" class="mono w80" data-i18n-ph="srcport_ph" placeholder="源端口" />
@@ -127,7 +128,8 @@
           <input type="text" id="monitor-port" class="mono w80" value="8080" />
           <select id="monitor-proto">
             <option value="tcp">TCP</option>
-            <option value="udt">UDT (QUIC)</option>
+            <option value="quic">QUIC</option>
+            <option value="udt">UDT</option>
             <option value="udp">UDP (单向)</option>
           </select>
           <input type="text" id="monitor-code" class="mono w120" data-i18n-ph="code_ph_send" placeholder="对端配对码" />
@@ -190,8 +192,25 @@
             <button class="btn recv-open" data-i18n="open_dir">打开目录</button>
           </div>
         </div>
+        <div class="card recv-card" data-proto="quic">
+          <div class="card-title"><span class="dot" id="dot-quic"></span><span>QUIC</span></div>
+          <div class="row"><label class="lbl" data-i18n="port">端口</label><input type="text" class="mono w80 recv-port" value="8080" /></div>
+          <div class="row"><label class="lbl" data-i18n="save_dir">保存目录</label><input type="text" class="grow mono recv-dir" /><button class="btn recv-browse" data-i18n="browse">浏览…</button></div>
+                    <div class="row">
+            <label class="lbl" data-i18n="bind_addr">绑定地址</label>
+            <div class="dd grow" data-addr-proto="quic">
+              <button type="button" class="dd-toggle btn grow"><span class="dd-label"></span><span class="dd-caret">▾</span></button>
+              <div class="dd-panel hidden"></div>
+            </div>
+          </div>
+<div class="row">
+            <button class="btn primary recv-start" data-i18n="start">启动</button>
+            <button class="btn recv-stop" data-i18n="stop">停止</button>
+            <button class="btn recv-open" data-i18n="open_dir">打开目录</button>
+          </div>
+        </div>
         <div class="card recv-card" data-proto="udt">
-          <div class="card-title"><span class="dot" id="dot-udt"></span><span>UDT (QUIC)</span></div>
+          <div class="card-title"><span class="dot" id="dot-udt"></span><span>UDT</span></div>
           <div class="row"><label class="lbl" data-i18n="port">端口</label><input type="text" class="mono w80 recv-port" value="8080" /></div>
           <div class="row"><label class="lbl" data-i18n="save_dir">保存目录</label><input type="text" class="grow mono recv-dir" /><button class="btn recv-browse" data-i18n="browse">浏览…</button></div>
                     <div class="row">
@@ -248,7 +267,8 @@
           <label class="lbl" data-i18n="share_dir">共享目录</label>
           <select id="share-dir-sel">
             <option value="save_dir_tcp">TCP</option>
-            <option value="save_dir_quic">UDT</option>
+            <option value="save_dir_quic">QUIC</option>
+            <option value="save_dir_udt">UDT</option>
             <option value="save_dir_udp">UDP</option>
           </select>
           <button id="btn-http-start" class="btn primary" data-i18n="share_start">开启共享</button>
@@ -383,8 +403,13 @@
         </div>
         <div class="row">
           <span class="lbl"></span>
-          <span class="lbl-s mono">UDT</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_quic" />
+          <span class="lbl-s mono">QUIC</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_quic" />
           <button class="btn cfg-dir-browse" data-key="save_dir_quic" data-i18n="browse">浏览…</button>
+        </div>
+        <div class="row">
+          <span class="lbl"></span>
+          <span class="lbl-s mono">UDT</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_udt" />
+          <button class="btn cfg-dir-browse" data-key="save_dir_udt" data-i18n="browse">浏览…</button>
         </div>
         <div class="row">
           <span class="lbl"></span>

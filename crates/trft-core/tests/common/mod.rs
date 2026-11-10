@@ -48,9 +48,7 @@ pub fn random_file(dir: &std::path::Path, name: &str, len: usize) -> (std::path:
 }
 
 /// 等待限量接收器按预期收尾（10s 兜底以失败形式呈现死锁）。
-pub async fn wait_server(
-    server: tokio::task::JoinHandle<Result<(), trft_core::error::Error>>,
-) {
+pub async fn wait_server(server: tokio::task::JoinHandle<Result<(), trft_core::error::Error>>) {
     timeout(Duration::from_secs(10), server)
         .await
         .unwrap_or_else(|_| panic!("接收器 10s 内未收尾（疑似死锁）"))

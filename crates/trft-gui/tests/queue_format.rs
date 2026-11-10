@@ -5,7 +5,7 @@
 //! 历史两次事故都在这层（轮 7 P1 tab 分割持久化形同虚设；轮 7 F2/本轮
 //! camelCase 缺失致队列 UDP 参数跨重启静默丢失）。round-trip + 键对齐双向钉死。
 
-use trft_gui::commands::{parse_queue_text, queue_items_to_text, QueueItem};
+use trft_gui::commands::{migrate_queue_text, parse_queue_text, queue_items_to_text, QueueItem};
 
 fn full_item() -> QueueItem {
     QueueItem {
@@ -49,7 +49,21 @@ fn round_trip_none_snapshot_fields() {
     let parsed = parse_queue_text(&text);
     assert_eq!(parsed.len(), 1);
     // 全字段键都存在（None 显式化——前端恢复逻辑按 hasSnap 判定 ip/port/proto 存在性）。
-    for k in ["kind", "path", "ip", "port", "proto", "code", "limit", "nocompress", "noencrypt", "passes", "fecParity", "nofec", "srcPort"] {
+    for k in [
+        "kind",
+        "path",
+        "ip",
+        "port",
+        "proto",
+        "code",
+        "limit",
+        "nocompress",
+        "noencrypt",
+        "passes",
+        "fecParity",
+        "nofec",
+        "srcPort",
+    ] {
         assert!(parsed[0].get(k).is_some(), "缺键 {k}");
     }
     let back: QueueItem = serde_json::from_value(parsed[0].clone()).unwrap();
@@ -79,8 +93,16 @@ fn serde_keys_align_with_frontend_persist_shape() {
     });
     let it: QueueItem = serde_json::from_value(frontend_shape).unwrap();
     assert_eq!(it.passes, Some(2), "passes 必须落位（camelCase 同名）");
-    assert_eq!(it.fec_parity, Some(3), "fecParity ↔ fec_parity（历史事故点）");
-    assert_eq!(it.src_port, Some(51000), "srcPort ↔ src_port（本轮新增字段）");
+    assert_eq!(
+        it.fec_parity,
+        Some(3),
+        "fecParity ↔ fec_parity（历史事故点）"
+    );
+    assert_eq!(
+        it.src_port,
+        Some(51000),
+        "srcPort ↔ src_port（本轮新增字段）"
+    );
     assert_eq!(it.nofec, Some(false));
     // 键对齐全链路：JSON → 结构 → 行 → 解析 → JSON → 结构。
     let back: QueueItem = serde_json::from_value(
@@ -120,9 +142,22 @@ fn defensive_write_side_skips_separator_pollution() {
     // 写侧防御：path/ip/code 含 `|` 的条目整行跳过（该字符 Windows 文件名非法，
     // 出现即为异常输入——宁少存不写坏行）。
     let text = queue_items_to_text(&[
-        QueueItem { kind: "file".into(), path: "bad|name.bin".into(), ..Default::default() },
-        QueueItem { kind: "file".into(), path: "ok.bin".into(), ip: Some("bad|ip".into()), ..Default::default() },
-        QueueItem { kind: "file".into(), path: "good.bin".into(), ..Default::default() },
+        QueueItem {
+            kind: "file".into(),
+            path: "bad|name.bin".into(),
+            ..Default::default()
+        },
+        QueueItem {
+            kind: "file".into(),
+            path: "ok.bin".into(),
+            ip: Some("bad|ip".into()),
+            ..Default::default()
+        },
+        QueueItem {
+            kind: "file".into(),
+            path: "good.bin".into(),
+            ..Default::default()
+        },
     ]);
     let parsed = parse_queue_text(&text);
     assert_eq!(parsed.len(), 1, "污染行必须整行跳过");
@@ -131,10 +166,73 @@ fn defensive_write_side_skips_separator_pollution() {
 
 #[test]
 fn parse_takes_first_500_and_ignores_junk_lines() {
-    assert!(parse_queue_text("\n  \nx\n").is_empty(), "空行与 <2 段行忽略");
+    assert!(
+        parse_queue_text("\n  \nx\n").is_empty(),
+        "空行与 <2 段行忽略"
+    );
     let many = queue_items_to_text(&vec![
-        QueueItem { kind: "file".into(), path: "p.bin".into(), ..Default::default() };
+        QueueItem {
+            kind: "file".into(),
+            path: "p.bin".into(),
+            ..Default::default()
+        };
         600
     ]);
-    assert_eq!(parse_queue_text(&many).len(), 500, "解析层钳 500（与写侧上限同口径）");
+    assert_eq!(
+        parse_queue_text(&many).len(),
+        500,
+        "解析层钳 500（与写侧上限同口径）"
+    );
+}
+
+/// UDT/QUIC 拆分存量迁移（TECH-STACK §7.28）：旧格式行 proto "udt"（=QUIC 槽位）
+/// → "quic" + 版本头；幂等（二次迁移不动）；新格式行 "udt"（真 UDT）不迁移。
+#[test]
+fn legacy_udt_proto_migrates_to_quic_once() {
+    // 13 字段旧行：proto 在第 5 段（index 4）。
+    let legacy = "file|old.bin|192.168.1.5|8080|udt||1024|1|0|2|2|0|50000
+";
+    let migrated = migrate_queue_text(legacy);
+    assert!(
+        migrated.starts_with(
+            "#trft-queue-v2
+"
+        ),
+        "迁移必须加版本头"
+    );
+    let parsed = parse_queue_text(&migrated);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["proto"], "quic", "存量 udt 必须迁移为 quic");
+    // 幂等：带版本头的迁移结果二次迁移原样。
+    assert_eq!(migrate_queue_text(&migrated), migrated);
+    // 新格式（真 UDT 条目）不迁移。
+    let fresh = format!(
+        "#trft-queue-v2
+{}
+",
+        legacy
+    );
+    assert_eq!(
+        migrate_queue_text(&fresh),
+        fresh,
+        "带版本头的新文件不得再迁移"
+    );
+    let real_udt = "file|new.bin|192.168.1.6|8080|udt||1024|1|0|2|2|0|50000
+";
+    let fresh2 = format!(
+        "#trft-queue-v2
+{}
+",
+        real_udt
+    );
+    assert_eq!(
+        migrate_queue_text(&fresh2),
+        fresh2,
+        "版本头之下 udt 即真 UDT"
+    );
+    // 旧格式但 proto 非 udt（tcp/udp）不误伤。
+    let tcp = "file|a.bin|192.168.1.7|8080|tcp||1024|1|0|2|2|0|50000
+";
+    let m2 = migrate_queue_text(tcp);
+    assert!(m2.contains("|tcp|"), "tcp 行不迁移");
 }

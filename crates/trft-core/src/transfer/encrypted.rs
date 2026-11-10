@@ -13,7 +13,7 @@
 
 use crate::crypto::handshake::{self, SessionKeys};
 use crate::crypto::kdf::{ct_eq, derive_pairing_key, hmac_sha256};
-use crate::error::{Error, Result, proto};
+use crate::error::{proto, Error, Result};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -112,7 +112,18 @@ impl<S: AsyncRead + Unpin> AsyncRead for Encrypted<S> {
         out: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let Self { inner, recv, recv_seq, plain, plain_pos, header, header_pos, sealed, sealed_pos, .. } = this;
+        let Self {
+            inner,
+            recv,
+            recv_seq,
+            plain,
+            plain_pos,
+            header,
+            header_pos,
+            sealed,
+            sealed_pos,
+            ..
+        } = this;
         loop {
             // 1) 有已解密明文：直接供给。
             if *plain_pos < plain.len() {
@@ -191,7 +202,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Encrypted<S> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let Self { inner, send, send_seq, pending, pending_in, .. } = this;
+        let Self {
+            inner,
+            send,
+            send_seq,
+            pending,
+            pending_in,
+            ..
+        } = this;
         // write_all 契约：Pending 后以同一 buf 重试。首次进入时把输入收进
         // 状态机，之后按 256KB 分段依次封段写出。
         if pending_in.is_none() && pending.is_none() {
@@ -355,13 +373,17 @@ where
     match (code, flags_s & 1 == 1) {
         (Some(_), false) => {
             // fail-closed：客户端要求配对码认证，对端未能证明自己持有配对码。
-            return Err(Error::AuthRejected("对端未启用配对码，无法完成双向认证".into()));
+            return Err(Error::AuthRejected(
+                "对端未启用配对码，无法完成双向认证".into(),
+            ));
         }
         (Some(_), true) => {
             let ps = crate::protocol::io::read_n(&mut enc, 32).await?;
             let expect = confirm_proof(&conf_s, &material, k_code.as_ref().unwrap());
             if !ct_eq(&ps, &expect) {
-                return Err(Error::AuthRejected("服务端证明校验失败（疑似中间人）".into()));
+                return Err(Error::AuthRejected(
+                    "服务端证明校验失败（疑似中间人）".into(),
+                ));
             }
         }
         // 与服务端对称：无码但对端出示了证明 → 读掉 32B 保持字节流同步
@@ -416,7 +438,9 @@ where
             let expect = confirm_proof(&conf_c, &material, k_code.as_ref().unwrap());
             if !ct_eq(&proof, &expect) {
                 enc.write_all(&[STATUS_REJECT]).await?;
-                return Err(Error::AuthRejected("客户端证明校验失败（配对码错误）".into()));
+                return Err(Error::AuthRejected(
+                    "客户端证明校验失败（配对码错误）".into(),
+                ));
             }
             authed = true;
         }
@@ -462,7 +486,11 @@ mod tests {
     }
     impl Trickle {
         fn new() -> Self {
-            Self { buf: Vec::new(), pending: false, woken: false }
+            Self {
+                buf: Vec::new(),
+                pending: false,
+                woken: false,
+            }
         }
     }
     impl tokio::io::AsyncWrite for Trickle {
@@ -559,7 +587,15 @@ mod tests {
         enc.write_all(&data).await.unwrap();
         let bytes = std::mem::replace(&mut enc.inner, Cursor::new(Vec::new())).into_inner();
 
-        let mut dec = Encrypted::new(Dribble { data: bytes, pos: 0, toggle: false }, kb, false);
+        let mut dec = Encrypted::new(
+            Dribble {
+                data: bytes,
+                pos: 0,
+                toggle: false,
+            },
+            kb,
+            false,
+        );
         let mut out = Vec::new();
         dec.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, data, "隔次 Pending 的分段读必须无进度丢失");
@@ -590,7 +626,10 @@ mod tests {
             enc.write_all(&[0u8; 32]).await.unwrap();
         });
         let r = client_wrap(c_io, Some("123456")).await;
-        assert!(matches!(r, Err(Error::AuthRejected(_))), "伪造服务端证明必须被识破");
+        assert!(
+            matches!(r, Err(Error::AuthRejected(_))),
+            "伪造服务端证明必须被识破"
+        );
         fake.abort();
     }
 
@@ -606,9 +645,15 @@ mod tests {
             server_wrap(s, Some("999999")).await
         });
         let r = client_wrap(c_io, Some("111111")).await;
-        assert!(matches!(r, Err(Error::AuthRejected(_))), "错误配对码必须被拒绝");
+        assert!(
+            matches!(r, Err(Error::AuthRejected(_))),
+            "错误配对码必须被拒绝"
+        );
         let sr = server.await.unwrap();
-        assert!(matches!(sr, Err(Error::AuthRejected(_))), "服务端侧同样拒绝");
+        assert!(
+            matches!(sr, Err(Error::AuthRejected(_))),
+            "服务端侧同样拒绝"
+        );
     }
 
     #[tokio::test]
@@ -638,12 +683,12 @@ mod tests {
     async fn mutual_confirmation_success() {
         let (c_io, s_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
-        let mut s = s_io;
-        let mut first = [0u8; 1];
-        s.read_exact(&mut first).await.unwrap();
-        assert_eq!(first[0], T_ENCRYPT);
-        server_wrap(s, Some("999999")).await
-    });
+            let mut s = s_io;
+            let mut first = [0u8; 1];
+            s.read_exact(&mut first).await.unwrap();
+            assert_eq!(first[0], T_ENCRYPT);
+            server_wrap(s, Some("999999")).await
+        });
         let (enc, authed) = client_wrap(c_io, Some("999999")).await.unwrap();
         assert!(authed, "双侧配对码必须完成双向认证");
         let (_, s_authed) = server.await.unwrap().unwrap();
@@ -691,12 +736,12 @@ mod tests {
         // 客户端有码、服务端无码 → fail-closed（配置错误不可静默通过）。
         let (c_io, s_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
-        let mut s = s_io;
-        let mut first = [0u8; 1];
-        s.read_exact(&mut first).await.unwrap();
-        assert_eq!(first[0], T_ENCRYPT);
-        server_wrap(s, None).await
-    });
+            let mut s = s_io;
+            let mut first = [0u8; 1];
+            s.read_exact(&mut first).await.unwrap();
+            assert_eq!(first[0], T_ENCRYPT);
+            server_wrap(s, None).await
+        });
         let r = client_wrap(c_io, Some("123456")).await;
         assert!(matches!(r, Err(Error::AuthRejected(_))));
         let sr = server.await.unwrap();

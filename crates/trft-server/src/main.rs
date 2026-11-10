@@ -7,7 +7,11 @@ use std::sync::Arc;
 use trft_server::{AuthConfig, WebState};
 
 #[derive(Parser)]
-#[command(name = "trft-server", version, about = "TrFileTransfer Web 共享/管理面")]
+#[command(
+    name = "trft-server",
+    version,
+    about = "TrFileTransfer Web 共享/管理面"
+)]
 struct Args {
     /// 共享目录
     #[arg(long, default_value = ".")]
@@ -37,15 +41,27 @@ async fn main() {
             std::process::exit(2);
         }
     }
-    let auth = args.code.clone().map(|pairing_code| AuthConfig { pairing_code });
+    let auth = args
+        .code
+        .clone()
+        .map(|pairing_code| AuthConfig { pairing_code });
     let state = Arc::new(WebState::new(args.dir.clone(), auth));
     let app = trft_server::build_router(state);
     let addr = format!("{}:{}", args.bind, args.port)
         .parse::<std::net::SocketAddr>()
         .expect("绑定地址非法");
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("端口绑定失败");
-    let auth_note = if args.code.is_some() { "鉴权=配对码" } else { "无鉴权（仅建议回环）" };
-    eprintln!("Web 共享[{auth_note}]: http://{addr}/ → {}", args.dir.display());
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("端口绑定失败");
+    let auth_note = if args.code.is_some() {
+        "鉴权=配对码"
+    } else {
+        "无鉴权（仅建议回环）"
+    };
+    eprintln!(
+        "Web 共享[{auth_note}]: http://{addr}/ → {}",
+        args.dir.display()
+    );
     // 上传半成品孤儿清扫（轮 5 P2-2：Drop 守卫不覆盖进程被杀，7 天口径与 core 一致）。
     trft_server::cleanup_upload_orphans(&args.dir);
     // 头读超时 15s（规格 §6.1；轮 2 P1——slowloris 不得占满并发闸）。

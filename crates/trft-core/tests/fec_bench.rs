@@ -52,8 +52,12 @@ fn fec_throughput_encode_and_reconstruct() {
     let t1 = Instant::now();
     for _ in 0..GROUPS {
         let g = mk_group(&mut rng);
-        let mut shards: Vec<Option<Vec<u8>>> =
-            codec.encode_group(g).unwrap().into_iter().map(Some).collect();
+        let mut shards: Vec<Option<Vec<u8>>> = codec
+            .encode_group(g)
+            .unwrap()
+            .into_iter()
+            .map(Some)
+            .collect();
         let last = shards.len() - 1;
         shards[last] = None; // 擦除一片
         let rec = codec.try_reconstruct(shards).unwrap();

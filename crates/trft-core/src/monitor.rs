@@ -10,7 +10,7 @@
 //!   重试，不阻塞队首）；已消失文件直接丢弃；未就绪/失败日志按文件节流
 //!   （首报立即、后续 60 秒一次）；成功后移入「已发送文件/」（重名追加序号）。
 
-use crate::error::{Error, Result, config_err};
+use crate::error::{config_err, Error, Result};
 use crate::transfer::resume::send_file_auto;
 use crate::transfer::sender::SendOptions;
 use crate::transfer::udp::{send_file_udp, UdpSendOptions};
@@ -44,6 +44,8 @@ pub enum MonitorEvent {
 pub enum MonitorProto {
     Tcp,
     Quic,
+    /// UDT 槽位（原生可靠 UDP 流）。
+    Udt,
     Udp,
 }
 
@@ -64,12 +66,20 @@ pub struct MonitorConfig {
 }
 
 impl MonitorConfig {
-    pub fn new(watch_dir: PathBuf, addr: SocketAddr, proto: MonitorProto, stop: watch::Receiver<bool>) -> Self {
+    pub fn new(
+        watch_dir: PathBuf,
+        addr: SocketAddr,
+        proto: MonitorProto,
+        stop: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             watch_dir,
             addr,
             proto,
-            send_opts: SendOptions { transport: Transport::Tcp, ..Default::default() },
+            send_opts: SendOptions {
+                transport: Transport::Tcp,
+                ..Default::default()
+            },
             udp_opts: UdpSendOptions::default(),
             poll_interval: POLL_INTERVAL,
             stable_window: STABLE_WINDOW,
@@ -88,7 +98,10 @@ impl MonitorConfig {
 /// 入口：启动全量扫描 + 主循环。返回前保证停止信号已消费（GUI abort 亦可）。
 pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
     if !cfg.watch_dir.is_dir() {
-        return Err(config_err(format!("监控目录不存在: {}", cfg.watch_dir.display())));
+        return Err(config_err(format!(
+            "监控目录不存在: {}",
+            cfg.watch_dir.display()
+        )));
     }
     // 事件加速器：任何 FS 事件 → 提前触发一次扫描（失败 = 纯轮询，零损失）。
     use notify::Watcher;
@@ -97,7 +110,8 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         let _ = tick_tx.send(());
     })
     .map(|mut w| {
-        w.watch(&cfg.watch_dir, notify::RecursiveMode::NonRecursive).ok();
+        w.watch(&cfg.watch_dir, notify::RecursiveMode::NonRecursive)
+            .ok();
         w
     })
     .map_err(|e| eprintln!("[监控] 事件侦听不可用（纯轮询模式）: {e}"))
@@ -117,7 +131,10 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         queue.push_back(f);
     }
     for q in &queue {
-        cfg.emit(MonitorEvent::Queued { name: file_name(q), queue_len: queue.len() });
+        cfg.emit(MonitorEvent::Queued {
+            name: file_name(q),
+            queue_len: queue.len(),
+        });
     }
 
     loop {
@@ -138,25 +155,32 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         // 扫描新文件（唯一事实来源）：入队去重（已发送/已消失的不再出现）。
         for f in scan_dir(&cfg.watch_dir) {
             if queued.insert(f.clone()) {
-                cfg.emit(MonitorEvent::Queued { name: file_name(&f), queue_len: queue.len() + 1 });
+                cfg.emit(MonitorEvent::Queued {
+                    name: file_name(&f),
+                    queue_len: queue.len() + 1,
+                });
                 queue.push_back(f);
             }
         }
         // 待归档重试（每轮一次；事件经节流通道，规格 §3.2）。
-        pending_archive.retain(|p| {
-            match move_to_sent(&cfg.watch_dir, p) {
-                Ok(dest) => {
-                    queued.remove(p);
-                    cfg.emit(MonitorEvent::Sent { name: file_name(p), to: dest.display().to_string() });
-                    false
-                }
-                Err(e) => {
-                    let n = file_name(p);
-                    throttled_log(&mut throttle, &n, || {
-                        cfg.emit(MonitorEvent::Failed { name: n.clone(), error: format!("归档失败: {e}") });
+        pending_archive.retain(|p| match move_to_sent(&cfg.watch_dir, p) {
+            Ok(dest) => {
+                queued.remove(p);
+                cfg.emit(MonitorEvent::Sent {
+                    name: file_name(p),
+                    to: dest.display().to_string(),
+                });
+                false
+            }
+            Err(e) => {
+                let n = file_name(p);
+                throttled_log(&mut throttle, &n, || {
+                    cfg.emit(MonitorEvent::Failed {
+                        name: n.clone(),
+                        error: format!("归档失败: {e}"),
                     });
-                    true
-                }
+                });
+                true
             }
         });
 
@@ -214,6 +238,11 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
                 o.transport = Transport::Quic;
                 send_file_auto(cfg.addr, &front, &o).await
             }
+            MonitorProto::Udt => {
+                let mut o = cfg.send_opts.clone();
+                o.transport = Transport::Udt;
+                send_file_auto(cfg.addr, &front, &o).await
+            }
         };
         match res {
             Ok(()) => {
@@ -222,14 +251,20 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
                     Ok(dest) => {
                         queued.remove(&front);
                         eprintln!("[监控] 已发送并归档 {name} → {}", dest.display());
-                        cfg.emit(MonitorEvent::Sent { name, to: dest.display().to_string() });
+                        cfg.emit(MonitorEvent::Sent {
+                            name,
+                            to: dest.display().to_string(),
+                        });
                     }
                     // 归档失败（轮 5 P1）：文件已成功送达对端——绝不重发；
                     // 留在 queued 集合（扫描不再重复入队），转入待归档重试。
                     Err(e) => {
                         pending_archive.push(front);
                         throttled_log(&mut throttle, &name, || {
-                            cfg.emit(MonitorEvent::Failed { name: name.clone(), error: format!("归档失败: {e}") });
+                            cfg.emit(MonitorEvent::Failed {
+                                name: name.clone(),
+                                error: format!("归档失败: {e}"),
+                            });
                         });
                         eprintln!("[监控] 归档失败（转入待归档重试）{name}: {e}");
                     }
@@ -240,7 +275,10 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
                 queue.pop_front();
                 queue.push_back(front.clone());
                 throttled_log(&mut throttle, &name, || {
-                    cfg.emit(MonitorEvent::Failed { name: name.clone(), error: e.to_string() });
+                    cfg.emit(MonitorEvent::Failed {
+                        name: name.clone(),
+                        error: e.to_string(),
+                    });
                 });
                 eprintln!("[监控] 发送失败 {name}: {e}");
             }
@@ -251,7 +289,9 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
 
 /// 顶层文件扫描（跳过子目录 / 「已发送文件」/ 摘要缓存元数据；排序确定性）。
 fn scan_dir(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let sent = dir.join(SENT_DIR);
     let mut out: Vec<PathBuf> = rd
         .flatten()
@@ -270,7 +310,9 @@ fn scan_dir(dir: &Path) -> Vec<PathBuf> {
 /// 拷贝完成双重门：独占打开（Windows share-none；其他平台尽力写句柄）
 /// + 稳定窗内大小与 mtime 双不变。调用方置于 blocking 池（内含 sleep）。
 pub fn copy_complete(path: &Path, window: Duration) -> bool {
-    let Ok(m1) = std::fs::metadata(path) else { return false };
+    let Ok(m1) = std::fs::metadata(path) else {
+        return false;
+    };
     if !m1.is_file() {
         return false;
     }
@@ -278,7 +320,12 @@ pub fn copy_complete(path: &Path, window: Duration) -> bool {
     {
         use std::os::windows::fs::OpenOptionsExt;
         // share_mode(0)：写方仍持有句柄时打开必败——独占探测（规格 §3.2）。
-        if std::fs::OpenOptions::new().read(true).share_mode(0).open(path).is_err() {
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .is_err()
+        {
             return false;
         }
     }
@@ -289,7 +336,9 @@ pub fn copy_complete(path: &Path, window: Duration) -> bool {
         }
     }
     std::thread::sleep(window);
-    let Ok(m2) = std::fs::metadata(path) else { return false };
+    let Ok(m2) = std::fs::metadata(path) else {
+        return false;
+    };
     m1.len() == m2.len() && m1.modified().ok() == m2.modified().ok()
 }
 
@@ -303,7 +352,11 @@ pub fn move_to_sent(watch_dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
         .ok_or_else(|| std::io::Error::other("文件名非 UTF-8"))?;
     let p = Path::new(name);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let ext = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
     let mut dest = sent.join(name);
     if dest.exists() {
         let mut found = None;
@@ -322,13 +375,17 @@ pub fn move_to_sent(watch_dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn file_name(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// 按文件节流：首报立即、后续 LOG_THROTTLE 内静默（规格 §3.2）。
 fn throttled_log(map: &mut HashMap<String, Instant>, name: &str, f: impl FnOnce()) {
     let now = Instant::now();
-    let due = map.get(name).is_none_or(|t| now.duration_since(*t) >= LOG_THROTTLE);
+    let due = map
+        .get(name)
+        .is_none_or(|t| now.duration_since(*t) >= LOG_THROTTLE);
     if due {
         map.insert(name.to_string(), now);
         // 容量防线：1 小时未再出现的文件条目可清。
@@ -363,10 +420,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             std::fs::write(dir2.join("grow.bin"), vec![0u8; 1000]).unwrap();
         });
-        assert!(!copy_complete(&p, Duration::from_millis(300)), "增长中的文件不得判就绪");
+        assert!(
+            !copy_complete(&p, Duration::from_millis(300)),
+            "增长中的文件不得判就绪"
+        );
         writer.join().unwrap();
         // 稳定后判就绪（写者已结束，无并发）。
-        assert!(copy_complete(&p, Duration::from_millis(50)), "稳定文件必须判就绪");
+        assert!(
+            copy_complete(&p, Duration::from_millis(50)),
+            "稳定文件必须判就绪"
+        );
     }
 
     #[test]
@@ -379,7 +442,11 @@ mod tests {
         let b = dir.path().join("x.bin");
         std::fs::write(&b, b"2").unwrap();
         let d2 = move_to_sent(dir.path(), &b).unwrap();
-        assert_eq!(d2, dir.path().join(SENT_DIR).join("x_1.bin"), "重名追加序号");
+        assert_eq!(
+            d2,
+            dir.path().join(SENT_DIR).join("x_1.bin"),
+            "重名追加序号"
+        );
         assert!(!b.exists(), "移走后原位不得残留");
     }
 
@@ -406,7 +473,14 @@ mod tests {
         let out = dir.path().join("out");
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        let server = tokio::spawn(serve_on(l, RecvOptions { save_dir: out.clone(), max_count: Some(1), ..Default::default() }));
+        let server = tokio::spawn(serve_on(
+            l,
+            RecvOptions {
+                save_dir: out.clone(),
+                max_count: Some(1),
+                ..Default::default()
+            },
+        ));
 
         // 预置半截文件（稳定窗内会被补完——此处直接放完整文件）。
         let src = watch.join("auto.bin");
@@ -442,7 +516,10 @@ mod tests {
         let archived = watch.join(SENT_DIR).join("auto.bin");
         let archive_deadline = Instant::now() + Duration::from_secs(5);
         while !archived.exists() {
-            assert!(Instant::now() < archive_deadline, "成功后必须移入「已发送文件/」");
+            assert!(
+                Instant::now() < archive_deadline,
+                "成功后必须移入「已发送文件/」"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let _ = stx.send(true);

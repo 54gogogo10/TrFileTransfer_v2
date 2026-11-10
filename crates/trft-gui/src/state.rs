@@ -13,6 +13,11 @@ use trft_core::config::Config;
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
     Tcp,
+    /// QUIC（quinn：TLS 1.3 + 自签证书 + 0x0D 通道绑定）。
+    /// 历史注记：UDT/QUIC 槽位拆分（TECH-STACK §7.28）前本变体的 serde 值为
+    /// "udt"——存量 devices.json / queue.txt 由各自加载路径迁移为 "quic"。
+    Quic,
+    /// UDT（原生可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议）。
     Udt,
     Udp,
 }
@@ -21,7 +26,8 @@ impl Proto {
     pub fn label(self) -> &'static str {
         match self {
             Proto::Tcp => "TCP",
-            Proto::Udt => "UDT(QUIC)",
+            Proto::Quic => "QUIC",
+            Proto::Udt => "UDT",
             Proto::Udp => "UDP",
         }
     }
@@ -137,7 +143,10 @@ impl AppState {
 }
 
 /// 进度事件转发：core 通道 → 前端事件（通道关闭即转发任务自然结束）。
-pub fn forward_progress(app: tauri::AppHandle, mut rx: tokio::sync::mpsc::UnboundedReceiver<trft_core::progress::ProgressEvent>) {
+pub fn forward_progress(
+    app: tauri::AppHandle,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<trft_core::progress::ProgressEvent>,
+) {
     use tauri::Emitter;
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {

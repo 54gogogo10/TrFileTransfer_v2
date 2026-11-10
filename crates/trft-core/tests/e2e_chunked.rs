@@ -27,7 +27,9 @@ async fn chunked_roundtrip_multi_chunk_chinese_name() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, opts_resident(out.clone(), None)));
 
-    send_file_chunked(addr, &src, &SendOptions::default(), 4).await.unwrap();
+    send_file_chunked(addr, &src, &SendOptions::default(), 4)
+        .await
+        .unwrap();
     server.abort();
 
     assert_eq!(
@@ -47,7 +49,10 @@ async fn chunked_full_stack_pairing_compress() {
     let out = dir.path().join("out");
 
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(serve_on(listener, opts_resident(out.clone(), Some("654321"))));
+    let server = tokio::spawn(serve_on(
+        listener,
+        opts_resident(out.clone(), Some("654321")),
+    ));
 
     let o = SendOptions {
         pairing_code: Some("654321".into()),
@@ -57,7 +62,10 @@ async fn chunked_full_stack_pairing_compress() {
     send_file_chunked(addr, &src, &o, 3).await.unwrap();
     server.abort();
 
-    assert_eq!(sha256_file(&out.join("stacked.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("stacked.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
 }
 
@@ -97,14 +105,17 @@ async fn chunked_fallback_completes_against_old_peer() {
     let out = dir.path().join("out");
 
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(serve_on(listener, trft_core::transfer::receiver::RecvOptions {
-        save_dir: out.clone(),
-        duplicate: trft_core::config::DuplicatePolicy::Rename,
-        enable_chunked: false,
-        enable_resume: false,
-        compress: false,
-        ..Default::default()
-    }));
+    let server = tokio::spawn(serve_on(
+        listener,
+        trft_core::transfer::receiver::RecvOptions {
+            save_dir: out.clone(),
+            duplicate: trft_core::config::DuplicatePolicy::Rename,
+            enable_chunked: false,
+            enable_resume: false,
+            compress: false,
+            ..Default::default()
+        },
+    ));
 
     let r = send_file_chunked(addr, &src, &SendOptions::default(), 4).await;
     assert!(
@@ -112,9 +123,14 @@ async fn chunked_fallback_completes_against_old_peer() {
         "旧对端必须显式 Unsupported，实际 {r:?}"
     );
     // 回退：send_file_auto 首选 0x03，对端无续传能力自动降级 0x00 全量。
-    send_file_auto(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file_auto(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     server.abort();
 
-    assert_eq!(sha256_file(&out.join("fb.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("fb.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
 }

@@ -7,11 +7,11 @@ use rand_core::{OsRng, RngCore};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use trft_core::error::Error;
 use trft_core::config::DuplicatePolicy;
+use trft_core::error::Error;
 use trft_core::hash::sha256_file;
-use trft_core::transfer::receiver::{RecvOptions, serve_on};
-use trft_core::transfer::sender::{SendOptions, send_file, send_text};
+use trft_core::transfer::receiver::{serve_on, RecvOptions};
+use trft_core::transfer::sender::{send_file, send_text, SendOptions};
 
 #[tokio::test]
 async fn single_file_roundtrip_with_chinese_name() {
@@ -25,7 +25,9 @@ async fn single_file_roundtrip_with_chinese_name() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, opts(out.clone(), None, 1)));
 
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     timeout(Duration::from_secs(10), server)
         .await
         .unwrap()
@@ -40,7 +42,11 @@ async fn single_file_roundtrip_with_chinese_name() {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".trft-part"))
         .collect();
-    assert!(leftover.is_empty(), "残留: {:?}", leftover.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+    assert!(
+        leftover.is_empty(),
+        "残留: {:?}",
+        leftover.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -54,7 +60,10 @@ async fn pairing_success_and_missing_code_rejected() {
     let server = tokio::spawn(serve_on(listener, opts(out.clone(), Some("123456"), 1)));
 
     // 正确配对码 → 成功。
-    let ok = SendOptions { pairing_code: Some("123456".into()), ..Default::default() };
+    let ok = SendOptions {
+        pairing_code: Some("123456".into()),
+        ..Default::default()
+    };
     send_file(addr, &src, &ok).await.unwrap();
 
     // 无配对码 → 拒绝（fail-closed）；发送端必须见到错误。
@@ -78,15 +87,22 @@ async fn text_roundtrip_then_second_file() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(
         listener,
-        RecvOptions { text_tx: Some(tx), ..opts(out.clone(), None, 2) },
+        RecvOptions {
+            text_tx: Some(tx),
+            ..opts(out.clone(), None, 2)
+        },
     ));
 
-    send_text(addr, "你好，局域网", &SendOptions::default()).await.unwrap();
+    send_text(addr, "你好，局域网", &SendOptions::default())
+        .await
+        .unwrap();
     assert_eq!(rx.recv().await.unwrap(), "你好，局域网");
 
     let src = dir.path().join("b.bin");
     std::fs::write(&src, vec![1u8; 4096]).unwrap();
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
 
     timeout(Duration::from_secs(10), server)
         .await
@@ -116,7 +132,11 @@ async fn concurrent_same_name_no_crosswrite() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(
         listener,
-        RecvOptions { save_dir: out.clone(), max_count: None, ..opts(out.clone(), None, 1) },
+        RecvOptions {
+            save_dir: out.clone(),
+            max_count: None,
+            ..opts(out.clone(), None, 1)
+        },
     ));
 
     // 直接并发两个发送任务。
@@ -160,13 +180,19 @@ async fn pairing_lockout_after_ten_failures() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, opts(out.clone(), Some("123456"), 1)));
 
-    let wrong = SendOptions { pairing_code: Some("000000".into()), ..Default::default() };
+    let wrong = SendOptions {
+        pairing_code: Some("000000".into()),
+        ..Default::default()
+    };
     for i in 0..10 {
         let r = send_file(addr, &src, &wrong).await;
         assert!(r.is_err(), "第 {} 次错误配对码应失败", i + 1);
     }
     // 锁定生效：正确配对码同样被拒（fail-closed）。
-    let correct = SendOptions { pairing_code: Some("123456".into()), ..Default::default() };
+    let correct = SendOptions {
+        pairing_code: Some("123456".into()),
+        ..Default::default()
+    };
     let r = send_file(addr, &src, &correct).await;
     assert!(r.is_err(), "锁定期间正确配对码也应被拒");
     server.abort();
@@ -179,7 +205,7 @@ async fn raw_send_file_broken_hash(
     payload: &[u8],
     code: Option<&str>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
-        use trft_core::protocol::frame::{sanitize_name, T_SINGLE_FILE};
+    use trft_core::protocol::frame::{sanitize_name, T_SINGLE_FILE};
     use trft_core::protocol::io::{read_n, read_u8, write_all, write_str_u16, write_u64, write_u8};
 
     let mut s = tokio::net::TcpStream::connect(addr).await?;
@@ -216,7 +242,11 @@ async fn hash_mismatch_rejected_and_no_residue() {
     let st = raw_send_file_broken_hash(addr, "bad.bin", b"payload bytes", None)
         .await
         .unwrap();
-    assert_eq!(st, trft_core::protocol::frame::STATUS_REJECT, "坏哈希必须被拒绝");
+    assert_eq!(
+        st,
+        trft_core::protocol::frame::STATUS_REJECT,
+        "坏哈希必须被拒绝"
+    );
     server.abort(); // 错误连接不计入 served，直接收尾
     assert!(!out.join("bad.bin").exists(), "不得落盘");
     let leftover: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
@@ -252,8 +282,14 @@ async fn plaintext_pairing_roundtrip_and_deterministic_reject() {
     send_file(addr, &src, &ok).await.unwrap();
 
     // 无码明文 → 确定性拒绝（读到的状态字节必须是 0x00，而非随机的盐字节）。
-    let st = raw_send_file_broken_hash(addr, "x.bin", b"zz", None).await.unwrap();
-    assert_eq!(st, trft_core::protocol::frame::STATUS_REJECT, "无码必须确定性拒绝");
+    let st = raw_send_file_broken_hash(addr, "x.bin", b"zz", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        st,
+        trft_core::protocol::frame::STATUS_REJECT,
+        "无码必须确定性拒绝"
+    );
 
     server.abort();
     assert!(out.join("p.txt").exists());
@@ -269,8 +305,14 @@ async fn empty_file_roundtrip() {
 
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, opts(out.clone(), None, 1)));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
-    timeout(Duration::from_secs(10), server).await.unwrap().unwrap().unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(out.join("empty.bin").exists());
     assert_eq!(std::fs::read(out.join("empty.bin")).unwrap(), b"");
 }
@@ -286,8 +328,14 @@ async fn ipv6_loopback_roundtrip() {
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_on(listener, opts(out.clone(), None, 1)));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
-    timeout(Duration::from_secs(10), server).await.unwrap().unwrap().unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(out.join("v6.bin").exists());
 }
 
@@ -311,8 +359,14 @@ async fn skip_modified_dest_keeps_renamed_copy() {
             ..opts(out.clone(), None, 1)
         },
     ));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
-    timeout(Duration::from_secs(10), server).await.unwrap().unwrap().unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"version-1");
     assert_eq!(std::fs::read(out.join("a_1.txt")).unwrap(), b"version-2");
@@ -431,10 +485,19 @@ async fn sync_strict_verify_bypasses_digest_cache() {
             let (stx, mut srx) = mpsc::unbounded_channel();
             let shub = trft_core::progress::ProgressHub::new(stx);
             let reporter = shub.register("send", "sync", 0);
-            let sopts = SendOptions { progress: Some(reporter), ..Default::default() };
+            let sopts = SendOptions {
+                progress: Some(reporter),
+                ..Default::default()
+            };
             let session = stable_session_id(&src, "sync-strict-test");
-            send_folder_resume(addr, &src, &sopts, session, Some(&cache)).await.unwrap();
-            timeout(Duration::from_secs(10), server).await.unwrap().unwrap().unwrap();
+            send_folder_resume(addr, &src, &sopts, session, Some(&cache))
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             // 排空事件，取发送侧最后一个 running/done 的 total（= 位图差量汇总）。
             let mut total = 0u64;
             while let Ok(ev) = srx.try_recv() {
@@ -451,7 +514,11 @@ async fn sync_strict_verify_bypasses_digest_cache() {
     // 二次（非 strict）：位图差分全跳过 → 总量 0。
     assert_eq!(run_sync(false).await, 0, "二次同步应全跳过（缓存命中）");
     // 三次（strict）：绕过缓存 → 全量重传。
-    assert_eq!(run_sync(true).await, full, "strict 必须绕过摘要缓存全量重传");
+    assert_eq!(
+        run_sync(true).await,
+        full,
+        "strict 必须绕过摘要缓存全量重传"
+    );
 }
 
 /// IP 过滤判别（规格 §3.3）：deny 含对端 → 拒绝；allow 不含对端 → 拒绝；
@@ -468,7 +535,11 @@ async fn ip_filter_blocks_and_allows() {
     std::fs::write(&src, vec![1u8; 4096]).unwrap();
 
     let mk_opts = |mode: trft_core::config::FilterMode, list: Vec<String>| {
-        let out = dir.path().join(format!("out-{}-{}", mode == trft_core::config::FilterMode::Deny, list.len()));
+        let out = dir.path().join(format!(
+            "out-{}-{}",
+            mode == trft_core::config::FilterMode::Deny,
+            list.len()
+        ));
         RecvOptions {
             save_dir: out,
             ip_filter_mode: mode,
@@ -483,24 +554,41 @@ async fn ip_filter_blocks_and_allows() {
 
     // deny 含回环 → 发送失败（接收器以错误退出属预期，不 unwrap 其结果）
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(serve_on(listener, mk_opts(trft_core::config::FilterMode::Deny, vec!["127.0.0.1".into()])));
+    let server = tokio::spawn(serve_on(
+        listener,
+        mk_opts(
+            trft_core::config::FilterMode::Deny,
+            vec!["127.0.0.1".into()],
+        ),
+    ));
     let r = send_file(addr, &src, &SendOptions::default()).await;
     server.abort();
     assert!(r.is_err(), "deny 命中对端必须拒绝");
 
     // allow 不含回环 → 发送失败
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(serve_on(listener, mk_opts(trft_core::config::FilterMode::Allow, vec!["10.0.0.0/8".into()])));
+    let server = tokio::spawn(serve_on(
+        listener,
+        mk_opts(
+            trft_core::config::FilterMode::Allow,
+            vec!["10.0.0.0/8".into()],
+        ),
+    ));
     let r = send_file(addr, &src, &SendOptions::default()).await;
     server.abort();
     assert!(r.is_err(), "allow 未命中必须拒绝");
 
     // allow 命中（CIDR）→ 成功且内容一致
     let (listener, addr) = ephemeral_listener().await;
-    let o = mk_opts(trft_core::config::FilterMode::Allow, vec!["127.0.0.0/8".into()]);
+    let o = mk_opts(
+        trft_core::config::FilterMode::Allow,
+        vec!["127.0.0.0/8".into()],
+    );
     let out_path = o.save_dir.clone();
     let server = tokio::spawn(serve_on(listener, o));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     server.abort();
     assert!(out_path.join("f.bin").is_file(), "allow 命中必须成功接收");
 }

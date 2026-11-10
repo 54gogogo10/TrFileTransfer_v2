@@ -1,8 +1,12 @@
 //! 设备发现（规格 §3.3）：UDP 广播 0xD1 → 应答 0xD2，仅 IPv4，默认端口 45000。
 //! 帧布局（小端，WIRE-PROTOCOL.md §6）：
 //! - 0xD1 请求：`0xD1 | u16 name_len | name`（请求方通报本机名，供对端记录）；
-//! - 0xD2 应答：`0xD2 | u16 name_len | name | u8 flags | u16 tcp_port | u16 udt_port`；
-//!   flags：bit0 = TCP 监听中、bit1 = UDT 监听中、bit2 = 需配对码。
+//! - 0xD2 应答：`0xD2 | u16 name_len | name | u8 flags | u16 tcp_port | u16 quic_port [| u16 udt_port]`；
+//!   flags：bit0 = TCP 监听中、bit1 = QUIC 监听中、bit2 = 需配对码、bit3 = UDT 监听中。
+//!
+//! 兼容（UDT/QUIC 槽位拆分，TECH-STACK §7.28）：旧版应答尾部只有 tcp+udt（=QUIC）两个
+//! 端口字段——旧解码器读新帧会把 quic_port 当「udt」位显示，语义与其一致（其 bit1 即
+//! QUIC 槽位），天然向后兼容；新解码器对缺第三字段的旧帧回 `udt_port = None`。
 //!
 //! 守卫：name ≤ 64 字节、包总长 ≤ 512 字节（超出整包忽略——fail-closed）。
 //! 应答方仅在有监听器时启动（GUI 决定生命周期）；标志位**实时**读取。
@@ -22,14 +26,18 @@ pub const MAX_NAME: usize = 64;
 pub const MAX_PACKET: usize = 512;
 
 pub const FLAG_TCP: u8 = 1;
-pub const FLAG_UDT: u8 = 2;
+/// bit1：QUIC 槽位监听中（旧版本将此位显示为「UDT」——其 UDT 即本仓库的 QUIC 槽位）。
+pub const FLAG_QUIC: u8 = 2;
 pub const FLAG_PAIRING: u8 = 4;
+/// bit3：UDT 槽位（原生可靠 UDP 流）监听中（拆分新增）。
+pub const FLAG_UDT: u8 = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredDevice {
     pub name: String,
     pub ip: String,
     pub tcp_port: Option<u16>,
+    pub quic_port: Option<u16>,
     pub udt_port: Option<u16>,
     pub needs_pairing: bool,
 }
@@ -52,7 +60,13 @@ pub fn encode_request(name: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn encode_response(name: &str, tcp_port: Option<u16>, udt_port: Option<u16>, needs_pairing: bool) -> Option<Vec<u8>> {
+pub fn encode_response(
+    name: &str,
+    tcp_port: Option<u16>,
+    quic_port: Option<u16>,
+    udt_port: Option<u16>,
+    needs_pairing: bool,
+) -> Option<Vec<u8>> {
     let mut out = vec![FRAME_RESP];
     if !write_name(&mut out, name) {
         return None;
@@ -61,22 +75,38 @@ pub fn encode_response(name: &str, tcp_port: Option<u16>, udt_port: Option<u16>,
     if tcp_port.is_some() {
         flags |= FLAG_TCP;
     }
-    if udt_port.is_some() {
-        flags |= FLAG_UDT;
+    if quic_port.is_some() {
+        flags |= FLAG_QUIC;
     }
     if needs_pairing {
         flags |= FLAG_PAIRING;
     }
+    if udt_port.is_some() {
+        flags |= FLAG_UDT;
+    }
     out.push(flags);
     out.extend_from_slice(&tcp_port.unwrap_or(0).to_le_bytes());
-    out.extend_from_slice(&udt_port.unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&quic_port.unwrap_or(0).to_le_bytes());
+    // 第三端口字段仅在 UDT 槽位启用时追加（旧对端解码器按固定尾部读取，
+    // 多出的 2 字节其 `buf.len()` 检查不涉及——向后兼容布局见模块注释）。
+    if udt_port.is_some() {
+        out.extend_from_slice(&udt_port.unwrap_or(0).to_le_bytes());
+    }
     Some(out)
 }
 
 #[derive(Debug, PartialEq)]
 pub enum DiscoveryMsg {
-    Request { name: String },
-    Response { name: String, tcp_port: Option<u16>, udt_port: Option<u16>, needs_pairing: bool },
+    Request {
+        name: String,
+    },
+    Response {
+        name: String,
+        tcp_port: Option<u16>,
+        quic_port: Option<u16>,
+        udt_port: Option<u16>,
+        needs_pairing: bool,
+    },
 }
 
 fn read_name(buf: &[u8], pos: &mut usize) -> Option<String> {
@@ -113,11 +143,30 @@ pub fn decode(buf: &[u8]) -> Option<DiscoveryMsg> {
                 return None;
             }
             let tcp = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
-            let udt = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
+            let quic = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
+            pos += 4;
+            // 第三端口字段可选（旧版应答无此字段）。
+            let udt = if flags & FLAG_UDT != 0 {
+                if buf.len() < pos + 2 {
+                    return None;
+                }
+                Some(u16::from_le_bytes([buf[pos], buf[pos + 1]]))
+            } else {
+                None
+            };
             Some(DiscoveryMsg::Response {
                 name,
-                tcp_port: if flags & FLAG_TCP != 0 { Some(tcp) } else { None },
-                udt_port: if flags & FLAG_UDT != 0 { Some(udt) } else { None },
+                tcp_port: if flags & FLAG_TCP != 0 {
+                    Some(tcp)
+                } else {
+                    None
+                },
+                quic_port: if flags & FLAG_QUIC != 0 {
+                    Some(quic)
+                } else {
+                    None
+                },
+                udt_port: udt.filter(|p| *p != 0),
                 needs_pairing: flags & FLAG_PAIRING != 0,
             })
         }
@@ -125,11 +174,15 @@ pub fn decode(buf: &[u8]) -> Option<DiscoveryMsg> {
     }
 }
 
+/// 实时 flags 闭包：(TCP 端口, QUIC 端口, UDT 端口, 需配对)。
+pub type DiscoveryFlagsFn =
+    Arc<dyn Fn() -> (Option<u16>, Option<u16>, Option<u16>, bool) + Send + Sync>;
+
 /// 应答服务：收到 0xD1 → 按实时 flags 回 0xD2（单播）。返回的 closure 供 GUI abort。
 pub async fn serve_answer(
     socket: UdpSocket,
     name: String,
-    flags: Arc<dyn Fn() -> (Option<u16>, Option<u16>, bool) + Send + Sync>,
+    flags: DiscoveryFlagsFn,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_PACKET];
     loop {
@@ -138,8 +191,8 @@ pub async fn serve_answer(
             continue;
         }
         if matches!(decode(&buf[..n]), Some(DiscoveryMsg::Request { .. })) {
-            let (tcp, udt, pairing) = flags();
-            if let Some(resp) = encode_response(&name, tcp, udt, pairing) {
+            let (tcp, quic, udt, pairing) = flags();
+            if let Some(resp) = encode_response(&name, tcp, quic, udt, pairing) {
                 let _ = socket.send_to(&resp, peer).await;
             }
         }
@@ -172,16 +225,31 @@ pub async fn discover_on(
                 if n > MAX_PACKET {
                     continue;
                 }
-                if let Some(DiscoveryMsg::Response { name, tcp_port, udt_port, needs_pairing }) = decode(&buf[..n]) {
+                if let Some(DiscoveryMsg::Response {
+                    name,
+                    tcp_port,
+                    quic_port,
+                    udt_port,
+                    needs_pairing,
+                }) = decode(&buf[..n])
+                {
                     let ip = peer.ip().to_string();
                     // 同 IP 去重（多轮应答/多播重复），后到覆盖（标志位更新）。
                     if let Some(d) = out.iter_mut().find(|d| d.ip == ip) {
                         d.name = name;
                         d.tcp_port = tcp_port;
+                        d.quic_port = quic_port;
                         d.udt_port = udt_port;
                         d.needs_pairing = needs_pairing;
                     } else {
-                        out.push(DiscoveredDevice { name, ip, tcp_port, udt_port, needs_pairing });
+                        out.push(DiscoveredDevice {
+                            name,
+                            ip,
+                            tcp_port,
+                            quic_port,
+                            udt_port,
+                            needs_pairing,
+                        });
                     }
                 }
             }
@@ -205,10 +273,16 @@ mod tests {
         let req = encode_request("主机A").unwrap();
         assert!(matches!(decode(&req), Some(DiscoveryMsg::Request { name }) if name == "主机A"));
 
-        let resp = encode_response("PC-1", Some(8080), None, true).unwrap();
+        let resp = encode_response("PC-1", Some(8080), Some(8081), Some(8082), true).unwrap();
         assert!(matches!(
             decode(&resp),
-            Some(DiscoveryMsg::Response { name, tcp_port: Some(8080), udt_port: None, needs_pairing: true }) if name == "PC-1"
+            Some(DiscoveryMsg::Response {
+                name,
+                tcp_port: Some(8080),
+                quic_port: Some(8081),
+                udt_port: Some(8082),
+                needs_pairing: true,
+            }) if name == "PC-1"
         ));
 
         // name 超长 → 编码失败；截断包/坏帧 → 解码 None。
@@ -225,23 +299,50 @@ mod tests {
         assert_eq!(decode(&big), None);
     }
 
+    /// 旧版应答（只有 tcp+udt 两端口、无 bit3）→ 新解码器 quic_port 命中、udt_port=None。
+    #[test]
+    fn legacy_response_without_udt_field_decodes() {
+        let mut out = vec![FRAME_RESP];
+        let name = b"old-pc";
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(FLAG_TCP | 2); // bit1 = 旧「UDT」= 本仓库 QUIC 槽位
+        out.extend_from_slice(&8080u16.to_le_bytes());
+        out.extend_from_slice(&8081u16.to_le_bytes());
+        match decode(&out) {
+            Some(DiscoveryMsg::Response {
+                tcp_port,
+                quic_port,
+                udt_port,
+                ..
+            }) => {
+                assert_eq!(tcp_port, Some(8080));
+                assert_eq!(quic_port, Some(8081), "旧 bit1 端口应归 QUIC 槽位");
+                assert_eq!(udt_port, None, "旧帧无 UDT 槽位");
+            }
+            other => panic!("旧帧必须可解码: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn answer_service_replies_to_discovery() {
         // 应答方绑回环端口；发现方单播查询（回环上广播不可靠——与生产广播同代码路径 discover_on）。
         let ans = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ans_addr = ans.local_addr().unwrap();
-        let flags: Arc<dyn Fn() -> (Option<u16>, Option<u16>, bool) + Send + Sync> =
-            Arc::new(|| (Some(8080), Some(8081), true));
+        let flags: DiscoveryFlagsFn = Arc::new(|| (Some(8080), Some(8081), Some(8082), true));
         let server = tokio::spawn(serve_answer(ans, "测试机".into(), flags));
 
         let disc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let devices = discover_on(&disc, &[ans_addr], Duration::from_secs(3)).await.unwrap();
+        let devices = discover_on(&disc, &[ans_addr], Duration::from_secs(3))
+            .await
+            .unwrap();
         server.abort();
         assert_eq!(devices.len(), 1, "应恰好发现一台");
         let d = &devices[0];
         assert_eq!(d.name, "测试机");
         assert_eq!(d.tcp_port, Some(8080));
-        assert_eq!(d.udt_port, Some(8081));
+        assert_eq!(d.quic_port, Some(8081));
+        assert_eq!(d.udt_port, Some(8082));
         assert!(d.needs_pairing);
         assert_eq!(d.ip, "127.0.0.1");
     }

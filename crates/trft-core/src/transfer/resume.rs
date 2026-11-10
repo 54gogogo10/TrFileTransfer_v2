@@ -9,29 +9,29 @@
 //!   位图应答跳过项；同步语义 = 同一根目录、差异文件校验后 rename 覆盖、
 //!   本地已删除文件服务端保留（增量备份）。
 
-use crate::error::{Error, Result, config_err, proto};
-use crate::hash::{FileDigester, sha256_file};
+use crate::error::{config_err, proto, Error, Result};
+use crate::hash::{sha256_file, FileDigester};
 use crate::hashcache::HashCache;
 use crate::limiter::TokenBucket;
 use crate::protocol::frame::{
-    MAX_MANIFEST_FILES, MAX_TRANSFER_SIZE, R_MANIFEST, R_RESUME_NEGO, STATUS_OK, STATUS_REJECT,
-    T_RESUME_FILE, T_RESUME_FOLDER, sanitize_name, sanitize_rel,
+    sanitize_name, sanitize_rel, MAX_MANIFEST_FILES, MAX_TRANSFER_SIZE, R_MANIFEST, R_RESUME_NEGO,
+    STATUS_OK, STATUS_REJECT, T_RESUME_FILE, T_RESUME_FOLDER,
 };
 use crate::protocol::io::{
     read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, read_u8_long, write_all,
     write_str_u16, write_u32, write_u64, write_u8,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 use crate::transfer::folder::collect_files;
 use crate::transfer::receiver::{
-    PartGuard, RecvOptions, publish_part, record_recv, space_ok, unique_part,
+    publish_part, record_recv, space_ok, unique_part, PartGuard, RecvOptions,
 };
-use crate::transfer::sender::{SendOptions, StackPlan, connect_stack};
+use crate::transfer::sender::{connect_stack, SendOptions, StackPlan};
 use crate::transfer::CHUNK;
 use std::io::SeekFrom;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// 0x10 status：命中同内容文件，零传输（DuplicateFiles=skip，规格 §3.1）。
@@ -65,7 +65,10 @@ pub fn stable_session_id(src: &Path, target: &str) -> u64 {
 
 /// 0x03 半成品路径：确定性派生自 (文件名, 对端 IP)——重启可恢复、跨 IP 天然隔离。
 pub(crate) fn resume_part_path(save_dir: &Path, name: &str, ip: &IpAddr) -> PathBuf {
-    save_dir.join(format!("{name}.{:016x}.trft-resume", fnv1a(ip.to_string().as_bytes())))
+    save_dir.join(format!(
+        "{name}.{:016x}.trft-resume",
+        fnv1a(ip.to_string().as_bytes())
+    ))
 }
 
 /// `.meta` 侧车：`fnv|size|hash_hex`（FNV-1a 行校验，坏行视为无 meta——判错方向是多传）。
@@ -107,7 +110,9 @@ pub fn cleanup_resume_orphans(dir: &Path) {
         if depth > 6 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         let now = std::time::SystemTime::now();
         for e in rd.flatten() {
             let p = e.path();
@@ -122,7 +127,11 @@ pub fn cleanup_resume_orphans(dir: &Path) {
             if let Ok(md) = e.metadata() {
                 if md
                     .modified()
-                    .map(|t| now.duration_since(t).map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600)).unwrap_or(false))
+                    .map(|t| {
+                        now.duration_since(t)
+                            .map(|d| d > std::time::Duration::from_secs(7 * 24 * 3600))
+                            .unwrap_or(false)
+                    })
                     .unwrap_or(false)
                 {
                     let _ = std::fs::remove_file(&p);
@@ -191,7 +200,9 @@ pub(crate) fn cache_key(opts: &RecvOptions, dest: &Path) -> String {
 
 /// 收货后免费填充摘要缓存（规格 §3.1：行内哈希即完整摘要）。
 pub(crate) async fn fill_cache_at(opts: &RecvOptions, dest: &Path, size: u64, hash: [u8; 32]) {
-    let Some(cache) = &opts.hash_cache else { return };
+    let Some(cache) = &opts.hash_cache else {
+        return;
+    };
     let rel = cache_key(opts, dest);
     let mtime = tokio::fs::metadata(dest)
         .await
@@ -220,7 +231,11 @@ where
 }
 
 /// 0x03 单文件续传接收。协商（0x10）在本函数内；最终判决由帧循环补 1B 状态。
-pub(crate) async fn recv_resume_file<S>(s: &mut S, peer: SocketAddr, opts: &RecvOptions) -> Result<()>
+pub(crate) async fn recv_resume_file<S>(
+    s: &mut S,
+    peer: SocketAddr,
+    opts: &RecvOptions,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -279,10 +294,9 @@ where
     // 陈旧前缀保护：半成品 + meta 必须同属本会话（size + claimed hash 双绑定）。
     let mut offset: u64 = 0;
     let mut have_part = false;
-    if let (Ok(pm), Some((msize, mhash))) = (
-        std::fs::metadata(&part),
-        read_meta(Path::new(&meta_path)),
-    ) {
+    if let (Ok(pm), Some((msize, mhash))) =
+        (std::fs::metadata(&part), read_meta(Path::new(&meta_path)))
+    {
         if msize == size && mhash == claimed && pm.len() <= size {
             have_part = true;
             // 偏移权威 = 服务端磁盘事实（轮 4 P0：规格原文「max(声明, 实际)」信任了
@@ -324,7 +338,10 @@ where
 
     // 追加流式接收（offset..size）。
     if offset < size {
-        let mut f = tokio::fs::OpenOptions::new().write(true).open(&part).await?;
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await?;
         f.seek(SeekFrom::Start(offset)).await?;
         let mut lim = TokenBucket::new(opts.recv_limit_bps);
         let mut remaining = size - offset;
@@ -356,7 +373,10 @@ where
     // 收尾硬校验（轮 4 P0 纵深）：半成品长度必须 == 声明 size——
     // 短文件（如声明巨大只收到零星字节却哈希命中空内容）不得发布。
     {
-        let plen = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
+        let plen = tokio::fs::metadata(&part)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         if plen != size {
             remove_resume_files(&part);
             return Err(proto(format!(
@@ -379,7 +399,11 @@ where
 // ============ 0x04 服务端 ============
 
 /// 0x04 文件夹续传/同步接收。位图协商（0x11）在本函数内；最终判决由帧循环补 1B。
-pub(crate) async fn recv_resume_folder<S>(s: &mut S, peer: SocketAddr, opts: &RecvOptions) -> Result<()>
+pub(crate) async fn recv_resume_folder<S>(
+    s: &mut S,
+    peer: SocketAddr,
+    opts: &RecvOptions,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -387,7 +411,9 @@ where
     let root_name = sanitize_name(&read_str_u16(s).await?)?;
     let count = read_u32(s).await? as usize;
     if count > MAX_MANIFEST_FILES {
-        return Err(proto(format!("清单文件数 {count} 超过上限 {MAX_MANIFEST_FILES}")));
+        return Err(proto(format!(
+            "清单文件数 {count} 超过上限 {MAX_MANIFEST_FILES}"
+        )));
     }
     // 同步语义：根目录固定（跨次同步同一目录），不追加冲突名；
     // 根相对的解析目录在会话建立时固定（PerDeviceFolder/AutoArchive，规格 §3.3）。
@@ -422,7 +448,8 @@ where
                         // 缓存键与 fill_cache_at 同口径（dest 相对 save_dir，
                         // 含 PerDevice/AutoArchive 前缀）——判跳过与写缓存一致。
                         let rel_key = cache_key(opts, &dest);
-                        dest_hash(opts, &rel_key, size, mtime_of(&meta), &dest).await == Some(h.try_into().expect("32 字节"))
+                        dest_hash(opts, &rel_key, size, mtime_of(&meta), &dest).await
+                            == Some(h.try_into().expect("32 字节"))
                     }
                     _ => false,
                 }
@@ -463,14 +490,11 @@ where
             .and_then(|n| n.to_str())
             .ok_or_else(|| proto(format!("{rel_raw}: 非法文件名")))?
             .to_string();
-        let report = opts
-            .progress
-            .as_ref()
-            .map(|h| {
-                let r = h.register("recv", rel_raw.clone(), size);
-                r.set_peer(&peer.ip().to_string());
-                r
-            });
+        let report = opts.progress.as_ref().map(|h| {
+            let r = h.register("recv", rel_raw.clone(), size);
+            r.set_peer(&peer.ip().to_string());
+            r
+        });
         let outcome = crate::progress::Outcome::new(report.clone());
         let (part, hash) =
             recv_file_payload(s, &parent, &file_name, size, opts, report.as_ref()).await?;
@@ -481,8 +505,19 @@ where
         outcome.finish();
         recv_bytes += size;
     }
-    record_recv(opts, peer, recv_bytes, to_receive as u32, started, "文件夹同步", &root_name);
-    eprintln!("[接收] 文件夹同步 {root_name}（{to_receive}/{count} 个文件）→ {}", base.display());
+    record_recv(
+        opts,
+        peer,
+        recv_bytes,
+        to_receive as u32,
+        started,
+        "文件夹同步",
+        &root_name,
+    );
+    eprintln!(
+        "[接收] 文件夹同步 {root_name}（{to_receive}/{count} 个文件）→ {}",
+        base.display()
+    );
     Ok(())
 }
 
@@ -528,7 +563,9 @@ where
     let actual = dig.finalize();
     let claimed: [u8; 32] = read_n(s, 32).await?.try_into().expect("32 字节哈希");
     if actual != claimed {
-        return Err(proto(format!("{file_name}: 校验不一致，未完成的文件已删除")));
+        return Err(proto(format!(
+            "{file_name}: 校验不一致，未完成的文件已删除"
+        )));
     }
     std::mem::forget(guard); // 守卫职责移交调用方
     Ok((part, actual))
@@ -572,7 +609,9 @@ where
                     Ok(ResumeNego::Proceed(off))
                 }
                 NEGO_SKIP => Ok(ResumeNego::Skip),
-                _ => Ok(ResumeNego::Rejected("对端拒绝续传（偏移/大小/空间）".into())),
+                _ => Ok(ResumeNego::Rejected(
+                    "对端拒绝续传（偏移/大小/空间）".into(),
+                )),
             }
         }
         STATUS_REJECT => Ok(ResumeNego::Unsupported),
@@ -594,7 +633,15 @@ async fn send_resume_once(
         .ok_or_else(|| config_err("路径没有合法 UTF-8 文件名"))?;
     let name = sanitize_name(raw)?;
     // 能力探询先行：旧对端短路（不发 0x03 头），同时为压缩协商开路。
-    let (mut s, caps) = connect_stack(addr, opts, StackPlan { probe_caps: true, compress: opts.compress }).await?;
+    let (mut s, caps) = connect_stack(
+        addr,
+        opts,
+        StackPlan {
+            probe_caps: true,
+            compress: opts.compress,
+        },
+    )
+    .await?;
     if caps & crate::protocol::frame::CAP_RESUME_FILE == 0 {
         return Err(Error::Unsupported("对端不支持续传（请升级对端）".into()));
     }
@@ -613,7 +660,9 @@ async fn send_resume_once(
             let _ = s.shutdown().await;
             return Ok(0); // 零传输命中
         }
-        ResumeNego::Unsupported => return Err(Error::Unsupported("对端不支持续传（请升级对端）".into())),
+        ResumeNego::Unsupported => {
+            return Err(Error::Unsupported("对端不支持续传（请升级对端）".into()))
+        }
         ResumeNego::Rejected(m) => return Err(Error::Rejected(m)),
         ResumeNego::Proceed(offset) => {
             // 从服务端权威偏移起流式发送（完整哈希已在建连前算完——规格 §3.1）。
@@ -682,16 +731,38 @@ pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -
                 if let Some(r) = &opts.progress {
                     r.finish();
                 }
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                crate::transfer::sender::record_stats(opts, addr, sent_bytes, 1, started, "续传传输", &name);
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                crate::transfer::sender::record_stats(
+                    opts,
+                    addr,
+                    sent_bytes,
+                    1,
+                    started,
+                    "续传传输",
+                    &name,
+                );
                 return Ok(());
             }
             Err(Error::Unsupported(_)) => {
                 // 旧对端：降级 0x00 全量（不计入重试退避）。0x00 路径自带终态上报。
                 let r = crate::transfer::sender::send_file(addr, path, opts).await;
                 if r.is_ok() {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    crate::transfer::sender::record_stats(opts, addr, size, 1, started, "续传不可用，改为直接发送", &name);
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    crate::transfer::sender::record_stats(
+                        opts,
+                        addr,
+                        size,
+                        1,
+                        started,
+                        "续传不可用，改为直接发送",
+                        &name,
+                    );
                 }
                 return r;
             }
@@ -744,10 +815,15 @@ pub async fn send_folder_resume(
     }
 
     // 能力探询先行：0x04 清单可能很大，旧对端直接短路（规格 §1.4 降级路径）。
-    let plan = StackPlan { probe_caps: true, compress: opts.compress };
+    let plan = StackPlan {
+        probe_caps: true,
+        compress: opts.compress,
+    };
     let (mut s, caps) = connect_stack(addr, opts, plan).await?;
     if caps & crate::protocol::frame::CAP_RESUME_FOLDER == 0 {
-        return Err(Error::Unsupported("对端不支持文件夹同步（请升级对端）".into()));
+        return Err(Error::Unsupported(
+            "对端不支持文件夹同步（请升级对端）".into(),
+        ));
     }
 
     // 清单：rel + size + (可选哈希)。哈希仅取自发送端缓存命中（免费）。
@@ -851,8 +927,19 @@ pub async fn send_folder_resume(
     if let Some(r) = &opts.progress {
         r.finish();
     }
-    crate::transfer::sender::record_stats(opts, addr, sent_bytes, sent, started, "文件夹同步", &root_name);
-    eprintln!("[发送] 同步 {root_name}：发送 {sent}/{} 个文件", metas.len());
+    crate::transfer::sender::record_stats(
+        opts,
+        addr,
+        sent_bytes,
+        sent,
+        started,
+        "文件夹同步",
+        &root_name,
+    );
+    eprintln!(
+        "[发送] 同步 {root_name}：发送 {sent}/{} 个文件",
+        metas.len()
+    );
     Ok(())
 }
 
@@ -927,11 +1014,19 @@ mod tests {
         };
         let expect = sha256_file(&dest).unwrap();
         // 第一次：缓存未命中 → 现算。
-        assert_eq!(dest_hash(&opts, "x.bin", 11, mtime, &dest).await, Some(expect));
+        assert_eq!(
+            dest_hash(&opts, "x.bin", 11, mtime, &dest).await,
+            Some(expect)
+        );
         // 第二次：必须命中缓存（回填生效——未回填则此处 Some 但经现算，
         // 判别口径改为直接查缓存表本身）。
         assert_eq!(
-            opts.hash_cache.as_ref().unwrap().lock().await.get("x.bin", 11, mtime),
+            opts.hash_cache
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .get("x.bin", 11, mtime),
             Some(expect),
             "现算后必须回填缓存"
         );

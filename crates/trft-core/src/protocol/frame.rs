@@ -1,7 +1,7 @@
 //! TCP 帧类型常量、状态码与文件名净化。
 //! 帧类型编号沿用规格书 §4.1 的产品语义；字节级布局见 docs/WIRE-PROTOCOL.md（权威）。
 
-use crate::error::{Result, proto};
+use crate::error::{proto, Result};
 
 pub const T_SINGLE_FILE: u8 = 0x00;
 pub const T_FOLDER: u8 = 0x01;
@@ -101,7 +101,12 @@ pub fn sanitize_name(raw: &str) -> Result<String> {
     if name.len() > MAX_NAME_LEN {
         return Err(proto(format!("文件名超过 {MAX_NAME_LEN} 字节")));
     }
-    if name == "." || name == ".." || name.contains("..") || name.contains('/') || name.contains('\\') {
+    if name == "."
+        || name == ".."
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+    {
         return Err(proto(format!("文件名含非法序列: {raw}")));
     }
     check_segment(name, "文件名")?;
@@ -165,7 +170,10 @@ mod tests {
     #[test]
     fn accepts_normal_and_chinese() {
         assert_eq!(sanitize_name("报告 v2.pdf").unwrap(), "报告 v2.pdf");
-        assert_eq!(sanitize_name("v1.2.final.tar.gz").unwrap(), "v1.2.final.tar.gz");
+        assert_eq!(
+            sanitize_name("v1.2.final.tar.gz").unwrap(),
+            "v1.2.final.tar.gz"
+        );
     }
 
     #[test]
@@ -184,7 +192,9 @@ mod tests {
     fn rel_accepts_nested() {
         assert_eq!(
             sanitize_rel("docs/图纸 v2/最终.png").unwrap(),
-            std::path::PathBuf::from("docs").join("图纸 v2").join("最终.png")
+            std::path::PathBuf::from("docs")
+                .join("图纸 v2")
+                .join("最终.png")
         );
     }
 }

@@ -26,7 +26,7 @@ const L10N = {
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     batch_add: "批量入队", help_title: "使用说明", help_close: "关闭",
-    help_body: "发送：类型选文件/文件夹/文本，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/UDT/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：多选「批量入队」后串行发送，可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
+    help_body: "发送：类型选文件/文件夹/文本，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/UDT/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：多选「批量入队」后串行发送，可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
     kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本",
     path: "路径", text: "文本", browse: "浏览…", target: "目标", pairing: "配对码",
@@ -106,7 +106,7 @@ const L10N = {
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     batch_add: "Batch enqueue", help_title: "Help", help_close: "Close",
-    help_body: "Send: pick a type (file/folder/text), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/UDT/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: batch-enqueue files and run serially, with an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
+    help_body: "Send: pick a type (file/folder/text), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/UDT/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: batch-enqueue files and run serially, with an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
     kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text",
     path: "Path", text: "Text", browse: "Browse…", target: "Target", pairing: "Pairing",
@@ -348,7 +348,7 @@ $$("#kind-seg .seg-btn").forEach((b) => {
 $("#send-proto").addEventListener("change", () => {
   // 对齐原版 v2.14「协议↔端口跟随」：切协议时端口框自动跟随对应接收页端口
   // （否则 UDP 发到 TCP 端口是零反馈黑洞）。
-  const key = { tcp: "server_port_tcp", udt: "server_port_quic", udp: "server_port_udp" }[$("#send-proto").value];
+  const key = { tcp: "server_port_tcp", quic: "server_port_quic", udt: "server_port_udt", udp: "server_port_udp" }[$("#send-proto").value];
   if (appState && appState.config[key]) $("#send-port").value = appState.config[key];
   updateKindRows();
 });
@@ -725,7 +725,8 @@ function renderDevices(devices) {
     use.addEventListener("click", () => {
       $("#send-ip").value = d.ip;
       $("#send-port").value = d.port;
-      if (d.proto === "udt" || d.proto === "tcp") $("#send-proto").value = d.proto;
+      // 流式协议记忆名直填（"tcp"/"quic"/"udt" 与发送下拉值一致）；udp 单发无此语义。
+      if (["tcp", "quic", "udt"].includes(d.proto)) $("#send-proto").value = d.proto;
     });
     const toGroup = document.createElement("button");
     toGroup.className = "btn small";
@@ -1194,7 +1195,7 @@ $("#btn-verify-stop").addEventListener("click", () => invoke("verify_stop"));
 function fillShareDirOptions() {
   const sel = $("#share-dir-sel");
   sel.textContent = "";
-  [["save_dir_tcp", "TCP"], ["save_dir_quic", "UDT"], ["save_dir_udp", "UDP"]].forEach(([k, label]) => {
+  [["save_dir_tcp", "TCP"], ["save_dir_quic", "QUIC"], ["save_dir_udt", "UDT"], ["save_dir_udp", "UDP"]].forEach(([k, label]) => {
     const opt = document.createElement("option");
     opt.value = k;
     opt.textContent = label + " — " + (appState.config[k] || "");
@@ -1226,10 +1227,12 @@ function fillSettings() {
   $("#http-port").value = c.http_port;
   $("#version-line").textContent = "v" + appState.version;
   $$(".recv-card").forEach((card) => {
-    const key = { tcp: "save_dir_tcp", udt: "save_dir_quic", udp: "save_dir_udp" }[card.dataset.proto];
+    const key = {
+      tcp: "save_dir_tcp", quic: "save_dir_quic", udt: "save_dir_udt", udp: "save_dir_udp",
+    }[card.dataset.proto];
     card.querySelector(".recv-dir").value = c[key] || "";
     card.querySelector(".recv-port").value = {
-      tcp: c.server_port_tcp, udt: c.server_port_quic, udp: c.server_port_udp,
+      tcp: c.server_port_tcp, quic: c.server_port_quic, udt: c.server_port_udt, udp: c.server_port_udp,
     }[card.dataset.proto];
   });
 }

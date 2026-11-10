@@ -10,9 +10,10 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tauri::{Emitter, Manager};
 use tokio::sync::mpsc;
-use trft_core::error::config_err;
 use trft_core::config::Config;
+use trft_core::error::config_err;
 use trft_core::hashcache::{cache_file_for, HashCache, DEFAULT_TTL_DAYS};
+use trft_core::monitor::MonitorProto;
 use trft_core::transfer::chunked::{send_file_chunked, ChunkTracker};
 use trft_core::transfer::folder::send_folder_auto;
 use trft_core::transfer::receiver::{serve_on, RecvOptions};
@@ -20,9 +21,11 @@ use trft_core::transfer::resume::{send_file_auto, send_folder_resume, stable_ses
 use trft_core::transfer::sender::SendOptions;
 use trft_core::transfer::udp::{send_file_udp, serve_udp_on, UdpRecvOptions, UdpSendOptions};
 use trft_core::transfer::Transport;
-use trft_core::monitor::MonitorProto;
 
-use crate::state::{forward_progress, AppState, DiscoveryAnswer, HttpHandle, MonitorTask, Proto, ReceiverHandle, TaskHandle};
+use crate::state::{
+    forward_progress, AppState, DiscoveryAnswer, HttpHandle, MonitorTask, Proto, ReceiverHandle,
+    TaskHandle,
+};
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -65,7 +68,11 @@ fn set_awake(active: bool) {
         SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
     };
     unsafe {
-        SetThreadExecutionState(if active { ES_CONTINUOUS | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS });
+        SetThreadExecutionState(if active {
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        } else {
+            ES_CONTINUOUS
+        });
     }
 }
 #[cfg(not(windows))]
@@ -73,9 +80,13 @@ fn set_awake(_active: bool) {}
 
 fn addr_of(ip: &str, port: u16) -> Result<SocketAddr, String> {
     if ip.contains(':') {
-        format!("[{ip}]:{port}").parse::<SocketAddr>().map_err(|e| e.to_string())
+        format!("[{ip}]:{port}")
+            .parse::<SocketAddr>()
+            .map_err(|e| e.to_string())
     } else {
-        format!("{ip}:{port}").parse::<SocketAddr>().map_err(|e| e.to_string())
+        format!("{ip}:{port}")
+            .parse::<SocketAddr>()
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -103,7 +114,6 @@ fn parse_pin(pin: &Option<String>) -> Result<Option<[u8; 32]>, String> {
         Some(_) => Err("QUIC 指纹需要 64 位十六进制".into()),
     }
 }
-
 
 // ============ 应用状态 / 配置 ============
 
@@ -185,6 +195,16 @@ pub struct SendRequest {
 }
 
 impl SendRequest {
+    /// 设备记忆/统计里的协议串（devices.json `"tcp"|"quic"|"udt"|"udp"`）。
+    fn peer_proto_of(p: Proto) -> &'static str {
+        match p {
+            Proto::Tcp => "tcp",
+            Proto::Quic => "quic",
+            Proto::Udt => "udt",
+            Proto::Udp => "udp",
+        }
+    }
+
     pub fn display_name(&self) -> String {
         match (&self.path, &self.text) {
             (Some(p), _) => PathBuf::from(p)
@@ -212,10 +232,11 @@ impl SendRequest {
         validate_code(&self.code)?;
         let transport = match self.proto {
             Proto::Tcp | Proto::Udp => Transport::Tcp,
-            Proto::Udt => Transport::Quic,
+            Proto::Quic => Transport::Quic,
+            Proto::Udt => Transport::Udt,
         };
-        if self.proto != Proto::Udt && self.pin.is_some() {
-            return Err("指纹钉扎仅用于 UDT(QUIC)".into());
+        if self.proto != Proto::Quic && self.pin.is_some() {
+            return Err("指纹钉扎仅用于 QUIC".into());
         }
         Ok(SendOptions {
             pairing_code: self.code.clone(),
@@ -331,11 +352,18 @@ async fn settle_send(
     );
     if notify {
         use tauri_plugin_notification::NotificationExt;
-        let n = app.notification().builder().title(format!("TrFileTransfer — {name}"));
+        let n = app
+            .notification()
+            .builder()
+            .title(format!("TrFileTransfer — {name}"));
         let _ = if ok {
             n.body("传输完成").show()
         } else {
-            n.body(format!("失败: {}", done_res.as_ref().err().map(String::as_str).unwrap_or(""))).show()
+            n.body(format!(
+                "失败: {}",
+                done_res.as_ref().err().map(String::as_str).unwrap_or("")
+            ))
+            .show()
         };
     }
     if let Some(tx) = done {
@@ -366,14 +394,22 @@ async fn spawn_send(
         trft_core::progress::ProgressHub::with_id_base(ptx, base)
     };
     // UDP 无暂停/继续语义（规格 §3.2）——kind 区分让前端不绑暂停按钮。
-    let send_kind = if req.kind == "udpfile" { "udp-send" } else { "send" };
+    let send_kind = if req.kind == "udpfile" {
+        "udp-send"
+    } else {
+        "send"
+    };
     let reporter = hub.register(send_kind, name.clone(), 0);
     let progress_id = reporter.id();
 
     let (compress_default, udp_cfg, send_stats) = {
         let st = app.state::<AppState>();
         let cfg = st.cfg.lock().expect("配置锁").clone();
-        (true, (cfg.udp_passes, cfg.udp_fec, cfg.udp_fec_parity), st.stats.clone())
+        (
+            true,
+            (cfg.udp_passes, cfg.udp_fec, cfg.udp_fec_parity),
+            st.stats.clone(),
+        )
     };
     let addr = req.addr()?;
     let id = {
@@ -389,7 +425,8 @@ async fn spawn_send(
         let res = match req.kind.as_str() {
             "file" => {
                 let path = PathBuf::from(req.path.clone().unwrap_or_default());
-                let opts = req.stream_opts(Some(reporter), compress_default, Some(send_stats.clone()));
+                let opts =
+                    req.stream_opts(Some(reporter), compress_default, Some(send_stats.clone()));
                 match opts {
                     // 拖放多选把目录按 file 入队（前端拿不到 is_dir）——自动路由整夹发送
                     // （0x01 失败转 0x04 差量续传，规格 §3.2，轮 6 P2-5）。
@@ -400,7 +437,8 @@ async fn spawn_send(
             }
             "folder" => {
                 let path = PathBuf::from(req.path.clone().unwrap_or_default());
-                let opts = req.stream_opts(Some(reporter), compress_default, Some(send_stats.clone()));
+                let opts =
+                    req.stream_opts(Some(reporter), compress_default, Some(send_stats.clone()));
                 match opts {
                     // 0x01 失败转 0x04 差量续传（规格 §3.2，轮 6 P2-5）。
                     Ok(o) => send_folder_auto(addr, &path, &o).await,
@@ -433,7 +471,7 @@ async fn spawn_send(
             }
             other => Err(config_err(format!("未知发送类型: {other}"))),
         };
-        let peer_proto = if req.proto == Proto::Udt { "udt" } else { "tcp" };
+        let peer_proto = SendRequest::peer_proto_of(req.proto);
         let peer = Some((req.ip.clone(), req.port, peer_proto, req.code.is_some()));
         settle_send(app2, id, name2, res, peer, Some(&settled2), Some(done_tx)).await;
     });
@@ -442,7 +480,10 @@ async fn spawn_send(
         finish_task(&app, id, None);
     }
     update_awake(&app);
-    let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": progress_id }));
+    let _ = app.emit(
+        "trft://task-start",
+        serde_json::json!({ "id": id, "progressId": progress_id }),
+    );
     Ok((id, done_rx))
 }
 
@@ -499,7 +540,7 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
             }
             other => other,
         };
-        let peer_proto = if req.proto == Proto::Udt { "udt" } else { "tcp" };
+        let peer_proto = SendRequest::peer_proto_of(req.proto);
         let peer = Some((req.ip.clone(), req.port, peer_proto, req.code.is_some()));
         settle_send(app2, id, name2, res, peer, Some(&settled2), None).await;
     });
@@ -507,7 +548,10 @@ pub async fn send_chunked_start(app: tauri::AppHandle, req: SendRequest) -> Resu
         finish_task(&app, id, None);
     }
     update_awake(&app);
-    let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": first_progress_id }));
+    let _ = app.emit(
+        "trft://task-start",
+        serde_json::json!({ "id": id, "progressId": first_progress_id }),
+    );
     Ok(id)
 }
 
@@ -571,7 +615,11 @@ pub async fn send_queue(
             let mut attempt = 0u32;
             while sub.is_err() && attempt < retries {
                 attempt += 1;
-                emit_log(&app2, "warn", &format!("{label} 失败，重试 {attempt}/{retries}"));
+                emit_log(
+                    &app2,
+                    "warn",
+                    &format!("{label} 失败，重试 {attempt}/{retries}"),
+                );
                 sub = run_single_send(app2.clone(), item.clone()).await;
             }
             if sub.is_ok() {
@@ -676,7 +724,11 @@ pub async fn sync_start(
     let progress_id = reporter.id();
 
     let opts = SendOptions {
-        transport: if proto == Proto::Udt { Transport::Quic } else { Transport::Tcp },
+        transport: match proto {
+            Proto::Quic => Transport::Quic,
+            Proto::Udt => Transport::Udt,
+            _ => Transport::Tcp,
+        },
         pairing_code: code.clone(),
         speed_limit_bps: limit.unwrap_or(0).min(10_000_000) * 1024,
         src_port,
@@ -707,14 +759,22 @@ pub async fn sync_start(
     let settled2 = settled.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let res = send_folder_resume(addr, &path, &opts, session, cache.as_ref()).await;
-        let peer = Some((ip.to_string(), port, if proto == Proto::Udt { "udt" } else { "tcp" }, code.is_some()));
+        let peer = Some((
+            ip.to_string(),
+            port,
+            SendRequest::peer_proto_of(proto),
+            code.is_some(),
+        ));
         settle_send(app2, id, name2, res, peer, Some(&settled2), None).await;
     });
     if register_task_checked(&app, id, handle, Some(progress_id), &settled) {
         finish_task(&app, id, None);
     }
     update_awake(&app);
-    let _ = app.emit("trft://task-start", serde_json::json!({ "id": id, "progressId": progress_id }));
+    let _ = app.emit(
+        "trft://task-start",
+        serde_json::json!({ "id": id, "progressId": progress_id }),
+    );
     Ok(id)
 }
 
@@ -739,11 +799,16 @@ fn parse_bind_addrs(addrs: Option<Vec<String>>) -> Result<Vec<std::net::IpAddr>,
 /// UDP 监听（与 trft-core::serve_udp 同口径：4MB 收缓冲，规格 §6.1），
 /// 绑定在调用侧完成以支持逐地址失败上报。
 async fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
-    let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
-    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
-        .map_err(|e| e.to_string())?;
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock =
+        socket2::Socket::new(domain, socket2::Type::DGRAM, None).map_err(|e| e.to_string())?;
     sock.set_nonblocking(true).map_err(|e| e.to_string())?;
-    sock.bind(&addr.into()).map_err(|e| format!("{} 绑定失败: {e}", addr))?;
+    sock.bind(&addr.into())
+        .map_err(|e| format!("{} 绑定失败: {e}", addr))?;
     if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
         eprintln!("[警告] UDP 收缓冲设置失败: {e}");
     }
@@ -756,9 +821,8 @@ fn next_free_port(proto: Proto, ip: std::net::IpAddr, port: u16) -> Option<u16> 
     for p in (port + 1)..=(port.saturating_add(10).min(65535)) {
         let addr = SocketAddr::new(ip, p);
         let free = match proto {
-            Proto::Udp => std::net::UdpSocket::bind(addr).is_ok(),
-            // UDT(QUIC) 走 UDP 传输（轮 7 P3：此前误用 TCP 探测）。
-            Proto::Udt => std::net::UdpSocket::bind(addr).is_ok(),
+            // QUIC/UDT 均走 UDP 传输（轮 7 P3：此前误用 TCP 探测）。
+            Proto::Udp | Proto::Quic | Proto::Udt => std::net::UdpSocket::bind(addr).is_ok(),
             Proto::Tcp => std::net::TcpListener::bind(addr).is_ok(),
         };
         if free {
@@ -829,7 +893,13 @@ pub async fn recv_start(
         // 会让后者覆盖前者的句柄，前者成为无法停止的孤儿监听器。失败路径回滚。
         g.insert(
             proto,
-            ReceiverHandle { proto, port, bound: vec![], handles: vec![], gen: gen.clone() },
+            ReceiverHandle {
+                proto,
+                port,
+                bound: vec![],
+                handles: vec![],
+                gen: gen.clone(),
+            },
         );
     }
     let cfg = app.state::<AppState>().config();
@@ -837,7 +907,8 @@ pub async fn recv_start(
         Some(d) if !d.is_empty() => PathBuf::from(d),
         _ => match proto {
             Proto::Tcp => cfg.save_dir_tcp.clone(),
-            Proto::Udt => cfg.save_dir_quic.clone(),
+            Proto::Quic => cfg.save_dir_quic.clone(),
+            Proto::Udt => cfg.save_dir_udt.clone(),
             Proto::Udp => cfg.save_dir_udp.clone(),
         },
     };
@@ -891,7 +962,8 @@ pub async fn recv_start(
             // 接收前确认（规格 §3.3）：mode ≠ off 时起应答消费任务 → 前端弹窗。
             let mut confirm_tx = None;
             if cfg.confirm_receive != trft_core::config::ConfirmMode::Off {
-                let (ctx, mut crx) = mpsc::unbounded_channel::<trft_core::transfer::receiver::ConfirmRequest>();
+                let (ctx, mut crx) =
+                    mpsc::unbounded_channel::<trft_core::transfer::receiver::ConfirmRequest>();
                 let appc = app.clone();
                 tauri::async_runtime::spawn(async move {
                     while let Some(req) = crx.recv().await {
@@ -966,14 +1038,30 @@ pub async fn recv_start(
                 }
                 Err(e) => failed.push((addr, e.to_string())),
             },
-            Proto::Udt => match trft_core::transfer::quic::server_endpoint(addr).await {
+            Proto::Quic => match trft_core::transfer::quic::server_endpoint(addr).await {
                 Ok((endpoint, cert_fp)) => {
                     let o = shared.as_ref().expect("QUIC 选项已建").clone();
                     let a2 = app2.clone();
                     let g2 = gen.clone();
                     let ex = exited.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        let r = trft_core::transfer::quic::serve_quic_on(endpoint, cert_fp, o).await;
+                        let r =
+                            trft_core::transfer::quic::serve_quic_on(endpoint, cert_fp, o).await;
+                        receiver_task_exit(a2, Proto::Quic, g2, ex, r);
+                    }));
+                    bound.push(addr.to_string());
+                }
+                Err(e) => failed.push((addr, e.to_string())),
+            },
+            // UDT 槽位：可靠 UDP 流（与单向 UDP 共用 bind_udp 的逐地址绑定/失败上报）。
+            Proto::Udt => match bind_udp(addr).await {
+                Ok(socket) => {
+                    let o = shared.as_ref().expect("UDT 选项已建").clone();
+                    let a2 = app2.clone();
+                    let g2 = gen.clone();
+                    let ex = exited.clone();
+                    handles.push(tauri::async_runtime::spawn(async move {
+                        let r = trft_core::transfer::udt::serve_udt_on(socket, o).await;
                         receiver_task_exit(a2, Proto::Udt, g2, ex, r);
                     }));
                     bound.push(addr.to_string());
@@ -1026,7 +1114,12 @@ pub async fn recv_start(
             .lock()
             .expect("接收器锁")
             .remove(&proto);
-        return Err(format!("{} 监听器全部绑定失败 —— {}{}", proto.label(), detail, suggestion));
+        return Err(format!(
+            "{} 监听器全部绑定失败 —— {}{}",
+            proto.label(),
+            detail,
+            suggestion
+        ));
     }
 
     {
@@ -1037,7 +1130,13 @@ pub async fn recv_start(
                 // 正常路径：占位仍是本代 → 覆盖为真句柄。
                 g.insert(
                     proto,
-                    ReceiverHandle { proto, port, bound: bound.clone(), handles, gen: gen.clone() },
+                    ReceiverHandle {
+                        proto,
+                        port,
+                        bound: bound.clone(),
+                        handles,
+                        gen: gen.clone(),
+                    },
                 );
             }
             _ => {
@@ -1058,11 +1157,13 @@ pub async fn recv_start(
     // 按所启协议生成（轮 6 P3-11：此前恒 protocol=TCP——首个启动的是 UDP/UDT
     // 接收器时放行错协议，命令无效）。
     if !cfg.firewall_hinted {
-        let hint_port = bound.first().and_then(|b| b.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()));
+        let hint_port = bound
+            .first()
+            .and_then(|b| b.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()));
         let (fw_proto, default_port) = match proto {
             Proto::Tcp => ("TCP", cfg.server_port_tcp),
-            // QUIC 与单向 UDP 均承载于 UDP。
-            Proto::Udt | Proto::Udp => ("UDP", cfg.server_port_udp),
+            // QUIC/UDT 与单向 UDP 均承载于 UDP。
+            Proto::Quic | Proto::Udt | Proto::Udp => ("UDP", cfg.server_port_udp),
         };
         let p = hint_port.unwrap_or(default_port);
         let _ = app.emit(
@@ -1075,7 +1176,15 @@ pub async fn recv_start(
         st.cfg.lock().expect("配置锁").firewall_hinted = true;
         let _ = st.save_config();
     }
-    emit_log(&app, "ok", &format!("{} 接收器启动 :{port} ← {}", proto.label(), bound.join(", ")));
+    emit_log(
+        &app,
+        "ok",
+        &format!(
+            "{} 接收器启动 :{port} ← {}",
+            proto.label(),
+            bound.join(", ")
+        ),
+    );
     Ok(serde_json::json!({
         "proto": proto,
         "port": port,
@@ -1147,9 +1256,19 @@ pub async fn http_start(
         }
         secret
     };
-    let token = cfg.pairing_code.as_ref().map(|c| trft_server::token_for(&secret, c));
-    let auth = cfg.pairing_code.clone().map(|pairing_code| trft_server::AuthConfig { pairing_code });
-    let state = Arc::new(trft_server::WebState::with_token_secret(dir.clone(), auth, secret));
+    let token = cfg
+        .pairing_code
+        .as_ref()
+        .map(|c| trft_server::token_for(&secret, c));
+    let auth = cfg
+        .pairing_code
+        .clone()
+        .map(|pairing_code| trft_server::AuthConfig { pairing_code });
+    let state = Arc::new(trft_server::WebState::with_token_secret(
+        dir.clone(),
+        auth,
+        secret,
+    ));
     let router = trft_server::build_router(state);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
@@ -1158,14 +1277,23 @@ pub async fn http_start(
     let app2 = app.clone();
     let _handle = tauri::async_runtime::spawn(async move {
         let _ = axum_like_serve(listener, router, rx).await;
-        let _ = app2.emit("trft://log", serde_json::json!({ "level": "ok", "message": "HTTP 共享已停止" }));
+        let _ = app2.emit(
+            "trft://log",
+            serde_json::json!({ "level": "ok", "message": "HTTP 共享已停止" }),
+        );
     });
     {
         let st = app.state::<AppState>();
-        st.http.lock().expect("http 锁").replace(HttpHandle { port, shutdown: tx });
+        st.http
+            .lock()
+            .expect("http 锁")
+            .replace(HttpHandle { port, shutdown: tx });
     }
     update_awake(&app);
-    let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": format!("HTTP 共享启动 :{port}") }));
+    let _ = app.emit(
+        "trft://log",
+        serde_json::json!({ "level": "ok", "message": format!("HTTP 共享启动 :{port}") }),
+    );
     Ok(serde_json::json!({ "port": port, "token": token, "dir": dir.to_string_lossy() }))
 }
 
@@ -1214,7 +1342,9 @@ pub fn qr_svg(text: String) -> Result<String, String> {
         if *c == Color::Dark {
             let x = i % w;
             let y = i / w;
-            svg.push_str(&format!(r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#111827"/>"##));
+            svg.push_str(&format!(
+                r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#111827"/>"##
+            ));
         }
     }
     svg.push_str("</svg>");
@@ -1241,7 +1371,12 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
     let cfg = app.state::<AppState>().config();
     // 去重 + 仅存在的根（规格 §3.5）。
     let mut roots: Vec<PathBuf> = Vec::new();
-    for d in [cfg.save_dir_tcp, cfg.save_dir_quic, cfg.save_dir_udp] {
+    for d in [
+        cfg.save_dir_tcp,
+        cfg.save_dir_quic,
+        cfg.save_dir_udt,
+        cfg.save_dir_udp,
+    ] {
         if d.is_dir() && !roots.contains(&d) {
             roots.push(d);
         }
@@ -1274,7 +1409,10 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
             let appv = app2.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some((done, total)) = vrx.recv().await {
-                    let _ = appv.emit("trft://verify", serde_json::json!({ "done": done, "total": total }));
+                    let _ = appv.emit(
+                        "trft://verify",
+                        serde_json::json!({ "done": done, "total": total }),
+                    );
                 }
             });
             let mut prog = move |done: u64, total: u64| {
@@ -1288,7 +1426,10 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
             .await;
             match res {
                 Ok(mut r) => {
-                    let dir_label = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let dir_label = root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     for m in &mut r.mismatches {
                         *m = format!("{dir_label}/{m}");
                     }
@@ -1329,10 +1470,14 @@ pub fn verify_stop(app: tauri::AppHandle) {
 pub async fn update_check(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let url = manifest_url(&app)?;
     let pubkey = trft_core::update::embedded_pubkey().map_err(err)?;
-    let m = trft_core::update::fetch_manifest(&url, &pubkey).await.map_err(err)?;
+    let m = trft_core::update::fetch_manifest(&url, &pubkey)
+        .await
+        .map_err(err)?;
     let current = env!("CARGO_PKG_VERSION");
     let has = trft_core::update::version_gt(&m.version, current);
-    Ok(serde_json::json!({ "hasUpdate": has, "current": current, "version": m.version, "url": m.url }))
+    Ok(
+        serde_json::json!({ "hasUpdate": has, "current": current, "version": m.version, "url": m.url }),
+    )
 }
 
 #[tauri::command]
@@ -1375,7 +1520,10 @@ pub fn open_locate(path: String) -> Result<(), String> {
     {
         let p = std::path::Path::new(&path);
         let dir = p.parent().unwrap_or(p);
-        std::process::Command::new("xdg-open").arg(dir).spawn().map_err(err)?;
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(err)?;
         Ok(())
     }
 }
@@ -1392,7 +1540,10 @@ pub fn open_path(path: String) -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        std::process::Command::new("xdg-open").arg(&path).spawn().map_err(err)?;
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(err)?;
         Ok(())
     }
 }
@@ -1406,11 +1557,15 @@ pub fn autostart_set(enable: bool) -> Result<(), String> {
         use winreg::RegKey;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let run = hkcu
-            .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_SET_VALUE)
+            .open_subkey_with_flags(
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                KEY_SET_VALUE,
+            )
             .map_err(err)?;
         if enable {
             let exe = std::env::current_exe().map_err(err)?;
-            run.set_value("TrFileTransfer", &format!("\"{}\"", exe.display())).map_err(err)?;
+            run.set_value("TrFileTransfer", &format!("\"{}\"", exe.display()))
+                .map_err(err)?;
         } else {
             let _ = run.delete_value("TrFileTransfer");
         }
@@ -1505,7 +1660,11 @@ pub fn stats_summary(app: tauri::AppHandle) -> serde_json::Value {
 
 /// 历史明细（按时间倒序，最近 `limit` 条；direction: "all"|"S"|"R"）。
 #[tauri::command]
-pub fn stats_records(app: tauri::AppHandle, direction: String, limit: usize) -> Vec<serde_json::Value> {
+pub fn stats_records(
+    app: tauri::AppHandle,
+    direction: String,
+    limit: usize,
+) -> Vec<serde_json::Value> {
     let st = app.state::<AppState>();
     let mut records = st.stats.load();
     records.reverse(); // 最新在前
@@ -1589,7 +1748,8 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
 
     let core_proto = match req.proto {
         Proto::Tcp => MonitorProto::Tcp,
-        Proto::Udt => MonitorProto::Quic,
+        Proto::Quic => MonitorProto::Quic,
+        Proto::Udt => MonitorProto::Udt,
         Proto::Udp => MonitorProto::Udp,
     };
     let (stx, srx) = tokio::sync::watch::channel(false);
@@ -1632,15 +1792,20 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
     let mgen = Arc::new(());
     {
         let st = app.state::<AppState>();
-        *st.monitor_handle.lock().expect("监控锁") =
-            Some(MonitorTask { gen: mgen.clone(), handle: tauri::async_runtime::spawn(async {}) });
+        *st.monitor_handle.lock().expect("监控锁") = Some(MonitorTask {
+            gen: mgen.clone(),
+            handle: tauri::async_runtime::spawn(async {}),
+        });
     }
     let a3 = app.clone();
     let g3 = mgen.clone();
     let handle = tauri::async_runtime::spawn(async move {
         // run_monitor 启动即败（目录竞删等）——上报并清理句柄槽（轮 5 P3）。
         if let Err(e) = trft_core::monitor::run_monitor(mcfg).await {
-            let _ = a3.emit("trft://log", serde_json::json!({ "level": "err", "message": format!("监控退出: {e}") }));
+            let _ = a3.emit(
+                "trft://log",
+                serde_json::json!({ "level": "err", "message": format!("监控退出: {e}") }),
+            );
             let st = a3.state::<AppState>();
             *st.monitor_stop.lock().expect("监控锁") = None;
             let mut g = st.monitor_handle.lock().expect("监控锁");
@@ -1656,7 +1821,10 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
         let mut g = st.monitor_handle.lock().expect("监控锁");
         match g.as_ref() {
             Some(t) if Arc::ptr_eq(&t.gen, &mgen) => {
-                *g = Some(MonitorTask { gen: mgen.clone(), handle });
+                *g = Some(MonitorTask {
+                    gen: mgen.clone(),
+                    handle,
+                });
             }
             _ => {
                 // 占位已被清理任务摘除（启动即败）或被并发 start 替换：放弃本代。
@@ -1692,7 +1860,10 @@ pub async fn monitor_stop(app: tauri::AppHandle) -> Result<(), String> {
         // 给循环最多 2s 自然退出（abort 兜底——半成品由孤儿清扫兜底口径不变）。
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), t.handle).await;
     }
-    let _ = app.emit("trft://log", serde_json::json!({ "level": "ok", "message": "监控已停止" }));
+    let _ = app.emit(
+        "trft://log",
+        serde_json::json!({ "level": "ok", "message": "监控已停止" }),
+    );
     update_awake(&app);
     Ok(())
 }
@@ -1716,7 +1887,10 @@ pub async fn discover_devices(app: tauri::AppHandle) -> Result<Vec<DeviceInfo>, 
             if let if_addrs::IfAddr::V4(v4) = a.addr {
                 if let Some(bcast) = v4.broadcast {
                     if !bcast.is_loopback() && !bcast.is_unspecified() {
-                        targets.push(SocketAddr::new(std::net::IpAddr::V4(bcast), cfg.discovery_port));
+                        targets.push(SocketAddr::new(
+                            std::net::IpAddr::V4(bcast),
+                            cfg.discovery_port,
+                        ));
                     }
                 }
             }
@@ -1726,23 +1900,35 @@ pub async fn discover_devices(app: tauri::AppHandle) -> Result<Vec<DeviceInfo>, 
         .into_iter()
         .map(|t| SocketAddr::new(t.ip(), cfg.discovery_port))
         .collect();
-    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
-    sock.set_broadcast(true).map_err(err)?;
-    let found = trft_core::discovery::discover_on(&sock, &targets, std::time::Duration::from_millis(1500))
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(err)?;
-    // 发现结果并入设备记忆（core DeviceStore）。
+    sock.set_broadcast(true).map_err(err)?;
+    let found =
+        trft_core::discovery::discover_on(&sock, &targets, std::time::Duration::from_millis(1500))
+            .await
+            .map_err(err)?;
+    // 发现结果并入设备记忆（core DeviceStore）。端口优先级 tcp > quic > udt
+    // （「使用」按钮默认选什么协议填什么端口）。
     let store = app.state::<AppState>().devices.clone();
     let devices: Vec<DeviceInfo> = found
         .into_iter()
-        .map(|d| DeviceInfo {
-            name: d.name,
-            ip: d.ip,
-            port: d.tcp_port.or(d.udt_port).unwrap_or(cfg.discovery_port),
-            proto: if d.tcp_port.is_some() { "tcp".into() } else { "udt".into() },
-            needs_pairing: d.needs_pairing,
-            last_seen: now_secs(),
-            source: trft_core::devices::DeviceSource::Discovery,
+        .map(|d| {
+            let (port, proto) = match (d.tcp_port, d.quic_port, d.udt_port) {
+                (Some(p), _, _) => (p, "tcp"),
+                (_, Some(p), _) => (p, "quic"),
+                (_, _, Some(p)) => (p, "udt"),
+                _ => (cfg.discovery_port, "tcp"),
+            };
+            DeviceInfo {
+                name: d.name,
+                ip: d.ip,
+                port,
+                proto: proto.into(),
+                needs_pairing: d.needs_pairing,
+                last_seen: now_secs(),
+                source: trft_core::devices::DeviceSource::Discovery,
+            }
         })
         .collect();
     for d in devices.clone() {
@@ -1762,7 +1948,7 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
         .lock()
         .expect("接收器锁")
         .keys()
-        .any(|p| matches!(p, Proto::Tcp | Proto::Udt));
+        .any(|p| matches!(p, Proto::Tcp | Proto::Quic | Proto::Udt));
     let mut slot = st.discovery_answer.lock().expect("应答锁");
     let dead = slot
         .as_ref()
@@ -1774,15 +1960,17 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
         let cfg = st.config();
         let app_flags = app.clone();
         let app_spawn = app.clone();
-        let flags: std::sync::Arc<dyn Fn() -> (Option<u16>, Option<u16>, bool) + Send + Sync> =
-            std::sync::Arc::new(move || {
-                let st2 = app_flags.state::<AppState>();
-                let map = st2.receivers.lock().expect("接收器锁");
-                let tcp = map.get(&Proto::Tcp).map(|r| r.port);
-                let udt = map.get(&Proto::Udt).map(|r| r.port);
-                let pairing = st2.config().pairing_code.is_some();
-                (tcp, udt, pairing)
-            });
+        let flags: std::sync::Arc<
+            dyn Fn() -> (Option<u16>, Option<u16>, Option<u16>, bool) + Send + Sync,
+        > = std::sync::Arc::new(move || {
+            let st2 = app_flags.state::<AppState>();
+            let map = st2.receivers.lock().expect("接收器锁");
+            let tcp = map.get(&Proto::Tcp).map(|r| r.port);
+            let quic = map.get(&Proto::Quic).map(|r| r.port);
+            let udt = map.get(&Proto::Udt).map(|r| r.port);
+            let pairing = st2.config().pairing_code.is_some();
+            (tcp, quic, udt, pairing)
+        });
         let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "TrFileTransfer".into());
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done2 = done.clone();
@@ -1790,13 +1978,18 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
             done,
             handle: tauri::async_runtime::spawn(async move {
                 let app2 = app_spawn;
-                let bind = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), cfg.discovery_port);
+                let bind =
+                    SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), cfg.discovery_port);
                 match tokio::net::UdpSocket::bind(bind).await {
                     Ok(sock) => {
                         let _ = trft_core::discovery::serve_answer(sock, name, flags).await;
                     }
                     Err(e) => {
-                        let _ = tauri::Emitter::emit(&app2, "trft://log", serde_json::json!({ "level": "warn", "message": format!("发现应答端口 {} 占用: {e}", cfg.discovery_port) }));
+                        let _ = tauri::Emitter::emit(
+                            &app2,
+                            "trft://log",
+                            serde_json::json!({ "level": "warn", "message": format!("发现应答端口 {} 占用: {e}", cfg.discovery_port) }),
+                        );
                     }
                 }
                 done2.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1836,7 +2029,11 @@ pub fn text_history_append(text: &str) {
         one_line
     };
     lines.push(format!("{stamp}	{one_line}"));
-    let keep: Vec<String> = if lines.len() > 200 { lines[lines.len() - 200..].to_vec() } else { lines };
+    let keep: Vec<String> = if lines.len() > 200 {
+        lines[lines.len() - 200..].to_vec()
+    } else {
+        lines
+    };
     let mut out = String::new();
     for l in keep.iter().rev() {
         out.push_str(l);
@@ -1921,8 +2118,12 @@ pub fn queue_items_to_text(items: &[QueueItem]) -> String {
             it.proto.clone().unwrap_or_default(),
             code,
             it.limit.map(|l| l.to_string()).unwrap_or_default(),
-            it.nocompress.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
-            it.noencrypt.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
+            it.nocompress
+                .map(|b| if b { "1" } else { "0" })
+                .unwrap_or(""),
+            it.noencrypt
+                .map(|b| if b { "1" } else { "0" })
+                .unwrap_or(""),
             it.passes.map(|n| n.to_string()).unwrap_or_default(),
             it.fec_parity.map(|n| n.to_string()).unwrap_or_default(),
             it.nofec.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
@@ -1953,14 +2154,26 @@ pub fn parse_queue_text(text: &str) -> Vec<serde_json::Value> {
                 v["proto"] = serde_json::json!(if f[4].is_empty() { None } else { Some(f[4]) });
                 v["code"] = serde_json::json!(if f[5].is_empty() { None } else { Some(f[5]) });
                 v["limit"] = serde_json::json!(num(f[6]));
-                v["nocompress"] = serde_json::json!(match f[7] { "1" => Some(true), "0" => Some(false), _ => None });
-                v["noencrypt"] = serde_json::json!(match f[8] { "1" => Some(true), "0" => Some(false), _ => None });
+                v["nocompress"] = serde_json::json!(match f[7] {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                });
+                v["noencrypt"] = serde_json::json!(match f[8] {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                });
             }
             // ≥12 字段：UDP 专属参数（轮 7 F2）。
             if f.len() >= 12 {
                 v["passes"] = serde_json::json!(f[9].parse::<u32>().ok());
                 v["fecParity"] = serde_json::json!(f[10].parse::<u8>().ok());
-                v["nofec"] = serde_json::json!(match f[11] { "1" => Some(true), "0" => Some(false), _ => None });
+                v["nofec"] = serde_json::json!(match f[11] {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                });
             }
             // ≥13 字段：源端口（§3.1 可选绑定）。
             if f.len() >= 13 {
@@ -1972,10 +2185,49 @@ pub fn parse_queue_text(text: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// 队列文件格式版本头（UDT/QUIC 拆分引入；`parse_queue_text` 天然跳过此行）。
+const QUEUE_HEADER: &str = "#trft-queue-v2";
+
+/// 纯迁移（无副作用，供单测）：无版本头 → proto `"udt"`（拆分前=QUIC 槽位）
+/// 改写 `"quic"` 并加版本头；已带版本头原样返回。
+pub fn migrate_queue_text(text: &str) -> String {
+    if text
+        .lines()
+        .next()
+        .is_some_and(|l| l.trim() == QUEUE_HEADER)
+    {
+        return text.to_string();
+    }
+    let migrated: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let f: Vec<&str> = l.split('|').collect();
+            if f.len() >= 9 && f[4] == "udt" {
+                let mut f2 = f.clone();
+                f2[4] = "quic";
+                f2.join("|")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    format!("{QUEUE_HEADER}\n{}\n", migrated.join("\n"))
+}
+
+/// 存量迁移（TECH-STACK §7.28）：首载一次性改写并写回（带版本头，幂等）；
+/// 此后 `"udt"` 即真 UDT。写回失败不阻塞加载——按内存态迁移结果解析。
+fn migrate_legacy_queue(text: String) -> String {
+    let out = migrate_queue_text(&text);
+    if out != text {
+        let _ = trft_core::config::atomic_write(&queue_path(), out.as_bytes());
+    }
+    out
+}
+
 #[tauri::command]
 pub fn queue_load() -> Vec<serde_json::Value> {
     std::fs::read_to_string(queue_path())
-        .map(|t| parse_queue_text(&t))
+        .map(|t| parse_queue_text(&migrate_legacy_queue(t)))
         .unwrap_or_default()
 }
 
@@ -1984,14 +2236,18 @@ pub fn queue_save(items: Vec<QueueItem>) -> Result<(), String> {
     if items.len() > 500 {
         return Err("队列上限 500 项（规格 §3.2）".into());
     }
-    trft_core::config::atomic_write(&queue_path(), queue_items_to_text(&items).as_bytes()).map_err(err)
+    let text = format!("{QUEUE_HEADER}\n{}", queue_items_to_text(&items));
+    trft_core::config::atomic_write(&queue_path(), text.as_bytes()).map_err(err)
 }
 
 /// 日志双写（规格 §3.7 文件日志）：UI 事件（trft://log）+ 当天文件各一份。
 /// 全部后端日志出口统一走此辅助——文件侧不得有独立于 UI 事件之外的第二套来源。
 pub fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, level: &str, message: &str) {
     use tauri::Emitter;
-    let _ = app.emit("trft://log", serde_json::json!({ "level": level, "message": message }));
+    let _ = app.emit(
+        "trft://log",
+        serde_json::json!({ "level": level, "message": message }),
+    );
     crate::logging::log_line(level, message);
 }
 

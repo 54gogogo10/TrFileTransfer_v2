@@ -1,7 +1,7 @@
 //! Reed-Solomon 前向纠错（规格 §3.1 单向 UDP：多轮重发 + RS 前向纠错）。
 //! 基于 reed-solomon-erasure（Galois 8）。
 
-use crate::error::{Result, proto};
+use crate::error::{proto, Result};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 pub const FEC_DATA_SHARDS: usize = 4;
@@ -39,7 +39,10 @@ impl FecCodec {
     /// 输入恰好 data_shards 个等长数据分片，返回 data+parity 全部分片（parity 槽位补零后由库覆写）。
     pub fn encode_group(&self, mut shards: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
         if shards.len() != self.data_shards {
-            return Err(proto(format!("编码需要恰好 {} 个数据分片", self.data_shards)));
+            return Err(proto(format!(
+                "编码需要恰好 {} 个数据分片",
+                self.data_shards
+            )));
         }
         let len = shards[0].len();
         if shards.iter().any(|s| s.len() != len) {
@@ -48,16 +51,23 @@ impl FecCodec {
         for _ in 0..self.parity_shards {
             shards.push(vec![0u8; len]);
         }
-        self.rs.encode(&mut shards).map_err(|e| proto(e.to_string()))?;
+        self.rs
+            .encode(&mut shards)
+            .map_err(|e| proto(e.to_string()))?;
         Ok(shards)
     }
 
     /// 缺失分片用 None 占位；可恢复则原地补齐（全部变 Some）。
-    pub fn try_reconstruct(&self, mut shards: Vec<Option<Vec<u8>>>) -> Result<Vec<Option<Vec<u8>>>> {
+    pub fn try_reconstruct(
+        &self,
+        mut shards: Vec<Option<Vec<u8>>>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         if shards.len() != self.data_shards + self.parity_shards {
             return Err(proto("分片数与编解码器配置不符"));
         }
-        self.rs.reconstruct(&mut shards).map_err(|e| proto(e.to_string()))?;
+        self.rs
+            .reconstruct(&mut shards)
+            .map_err(|e| proto(e.to_string()))?;
         Ok(shards)
     }
 }
@@ -74,7 +84,8 @@ mod tests {
     fn encode_then_reconstruct_with_loss() {
         let f = FecCodec::new(4, 2).unwrap();
         let len = 1024;
-        let original: Vec<Vec<u8>> = vec![shard(1, len), shard(2, len), shard(3, len), shard(4, len)];
+        let original: Vec<Vec<u8>> =
+            vec![shard(1, len), shard(2, len), shard(3, len), shard(4, len)];
         let shards = f.encode_group(original.clone()).unwrap();
         assert_eq!(shards.len(), 6);
         // 丢 2 个分片（= parity 上限）仍可恢复。

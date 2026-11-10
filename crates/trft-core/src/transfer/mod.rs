@@ -11,6 +11,7 @@ pub mod receiver;
 pub mod resume;
 pub mod sender;
 pub mod udp;
+pub mod udt;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -25,8 +26,12 @@ pub enum Transport {
     /// 通用、防火墙友好。
     #[default]
     Tcp,
-    /// 可靠 UDP 流槽位（QUIC 实现，规格书原 UDT 的替代）。
+    /// QUIC（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定）。
     Quic,
+    /// UDT 槽位（原生 Rust：UDP 之上的可靠有序字节流，`transfer::udt`）。
+    /// 对齐原版 C# 的 UDT 模式语义（STREAM 可靠流 + 与 TCP 同帧协议），
+    /// 线格式为本仓库自定义（不与 UDT4 包级互通，规格 §4.3）。
+    Udt,
 }
 
 /// 统一读写 trait：客户端栈装箱用（Tcp / Encrypted<Tcp> / QuicStream / Compressed<…>）。

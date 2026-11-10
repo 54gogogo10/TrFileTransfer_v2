@@ -22,26 +22,32 @@ fn output(cmd: &mut Command) -> (i32, String, String) {
 #[test]
 fn usage_errors_exit_2() {
     // 配对码格式非法。
-    let (code, _, _) = output(
-        trft().args(["send", "--ip", "127.0.0.1", "--port", "1", "--file", "x", "--code", "12ab"]),
-    );
+    let (code, _, _) = output(trft().args([
+        "send",
+        "--ip",
+        "127.0.0.1",
+        "--port",
+        "1",
+        "--file",
+        "x",
+        "--code",
+        "12ab",
+    ]));
     assert_eq!(code, 2, "非法配对码必须是用法错误（退出码 2）");
     // --passes 越界。
-    let (code, _, _) = output(
-        trft().args([
-            "send",
-            "--ip",
-            "127.0.0.1",
-            "--port",
-            "1",
-            "--file",
-            "x",
-            "--proto",
-            "udp",
-            "--passes",
-            "9",
-        ]),
-    );
+    let (code, _, _) = output(trft().args([
+        "send",
+        "--ip",
+        "127.0.0.1",
+        "--port",
+        "1",
+        "--file",
+        "x",
+        "--proto",
+        "udp",
+        "--passes",
+        "9",
+    ]));
     assert_eq!(code, 2, "--passes 越界必须是用法错误");
     // --count 0。
     let (code, _, _) = output(trft().args(["recv", "--port", "1", "--count", "0"]));
@@ -56,9 +62,8 @@ fn usage_errors_exit_2() {
 
 #[test]
 fn sync_unimplemented_exits_1() {
-    let (code, _, stderr) = output(
-        trft().args(["sync", "--folder", ".", "--ip", "127.0.0.1", "--port", "1"]),
-    );
+    let (code, _, stderr) =
+        output(trft().args(["sync", "--folder", ".", "--ip", "127.0.0.1", "--port", "1"]));
     assert_eq!(code, 1, "未实现的运行时错误退出码 1");
     assert!(stderr.contains("错误"), "应有错误信息: {stderr}");
 }

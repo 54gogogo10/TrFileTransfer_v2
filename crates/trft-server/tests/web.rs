@@ -1,15 +1,20 @@
 //! Web 管理面端到端测试（进程内 oneshot，规格 §3.4 验收矩阵）。
 
-use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use http_body_util::BodyExt;
+use std::sync::Arc;
 use tower::ServiceExt;
 use trft_server::{AuthConfig, WebState};
 
 fn state_with_auth(dir: std::path::PathBuf, code: &str) -> Arc<WebState> {
-    Arc::new(WebState::new(dir, Some(AuthConfig { pairing_code: code.to_string() })))
+    Arc::new(WebState::new(
+        dir,
+        Some(AuthConfig {
+            pairing_code: code.to_string(),
+        }),
+    ))
 }
 
 fn state_open(dir: std::path::PathBuf) -> Arc<WebState> {
@@ -63,16 +68,20 @@ async fn token_query_grants_access() {
     // 端到端判别（轮 6 P2-1）：必须经 token_for 生成——此前测试手写哈希绕过
     // token_for，掩盖了 check_token 与 token_for 长度错开（扫码直连整链失效）。
     let secret = [7u8; 32];
-    let app = trft_server::build_router(Arc::new(
-        trft_server::WebState::with_token_secret(
-            dir.path().to_path_buf(),
-            Some(AuthConfig { pairing_code: "123456".into() }),
-            secret,
-        ),
-    ));
+    let app = trft_server::build_router(Arc::new(trft_server::WebState::with_token_secret(
+        dir.path().to_path_buf(),
+        Some(AuthConfig {
+            pairing_code: "123456".into(),
+        }),
+        secret,
+    )));
     let token = trft_server::token_for(&secret, "123456");
     let res = send(app.clone(), req("GET", &format!("/?t={token}"))).await;
-    assert_eq!(res.status(), StatusCode::OK, "?t= 有效令牌必须放行（token_for↔check_token 同链）");
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "?t= 有效令牌必须放行（token_for↔check_token 同链）"
+    );
     let res = send(app, req("GET", "/?t=deadbeef")).await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER, "无效令牌必须拒绝");
 }
@@ -86,24 +95,47 @@ async fn login_flow_and_lockout() {
     for i in 0..10 {
         let res = send(
             app.clone(),
-            req_with("POST", "/login", &[("content-type", "application/x-www-form-urlencoded")], b"code=000000".to_vec()),
+            req_with(
+                "POST",
+                "/login",
+                &[("content-type", "application/x-www-form-urlencoded")],
+                b"code=000000".to_vec(),
+            ),
         )
         .await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "第 {i} 次错误码必须 401");
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "第 {i} 次错误码必须 401"
+        );
         last = Some(res);
     }
     let res = send(
         app.clone(),
-        req_with("POST", "/login", &[("content-type", "application/x-www-form-urlencoded")], b"code=000000".to_vec()),
+        req_with(
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"code=000000".to_vec(),
+        ),
     )
     .await;
-    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS, "10 次失败必须锁定");
+    assert_eq!(
+        res.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "10 次失败必须锁定"
+    );
     let _ = last;
 
     // 锁定期间正确码也被拒（按 IP 计错语义，测试无 ConnectInfo 视为同一 IP）。
     let res = send(
         app.clone(),
-        req_with("POST", "/login", &[("content-type", "application/x-www-form-urlencoded")], b"code=123456".to_vec()),
+        req_with(
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"code=123456".to_vec(),
+        ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -115,7 +147,12 @@ async fn login_success_sets_session_cookie() {
     let app = trft_server::build_router(state_with_auth(dir.path().to_path_buf(), "123456"));
     let res = send(
         app.clone(),
-        req_with("POST", "/login", &[("content-type", "application/x-www-form-urlencoded")], b"code=123456".to_vec()),
+        req_with(
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            b"code=123456".to_vec(),
+        ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
@@ -128,7 +165,10 @@ async fn login_success_sets_session_cookie() {
         .join("; ");
     assert!(cookie.contains("trft_sid="), "必须发会话 Cookie: {cookie}");
     assert!(cookie.contains("HttpOnly"), "会话必须 HttpOnly");
-    assert!(cookie.contains("SameSite=Strict"), "会话必须 SameSite=Strict");
+    assert!(
+        cookie.contains("SameSite=Strict"),
+        "会话必须 SameSite=Strict"
+    );
     assert!(cookie.contains("trft_csrf="), "必须发 CSRF Cookie");
 
     // 会话放行。
@@ -136,7 +176,12 @@ async fn login_success_sets_session_cookie() {
     let sid = cookie[sid_start..sid_start + 32].to_string();
     let res = send(
         app,
-        req_with("GET", "/", &[("cookie", &format!("trft_sid={sid}"))], vec![]),
+        req_with(
+            "GET",
+            "/",
+            &[("cookie", &format!("trft_sid={sid}"))],
+            vec![],
+        ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::OK, "有效会话必须放行");
@@ -147,10 +192,21 @@ async fn security_headers_present() {
     let dir = tempfile::tempdir().unwrap();
     let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
     let res = send(app, req("GET", "/health")).await;
-    assert_eq!(res.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(
+        res.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
     assert_eq!(res.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
-    let csp = res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
-    assert!(csp.contains("default-src 'none'"), "CSP 必须默认拒绝: {csp}");
+    let csp = res
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        csp.contains("default-src 'none'"),
+        "CSP 必须默认拒绝: {csp}"
+    );
 }
 
 #[tokio::test]
@@ -177,23 +233,45 @@ async fn download_range_semantics() {
     assert_eq!(body_bytes(res.into_body()).await, data);
 
     // 单区间 206 + Content-Range。
-    let res = send(app.clone(), req_with("GET", "/dl/blob.bin", &[("range", "bytes=2-5")], vec![])).await;
+    let res = send(
+        app.clone(),
+        req_with("GET", "/dl/blob.bin", &[("range", "bytes=2-5")], vec![]),
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(res.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 2-5/16");
+    assert_eq!(
+        res.headers().get(header::CONTENT_RANGE).unwrap(),
+        "bytes 2-5/16"
+    );
     assert_eq!(body_bytes(res.into_body()).await, &data[2..6]);
 
     // 后缀区间。
-    let res = send(app.clone(), req_with("GET", "/dl/blob.bin", &[("range", "bytes=-4")], vec![])).await;
+    let res = send(
+        app.clone(),
+        req_with("GET", "/dl/blob.bin", &[("range", "bytes=-4")], vec![]),
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(res.into_body()).await, &data[12..]);
 
     // 不可满足 → 416 + bytes */size。
-    let res = send(app.clone(), req_with("GET", "/dl/blob.bin", &[("range", "bytes=999-")], vec![])).await;
+    let res = send(
+        app.clone(),
+        req_with("GET", "/dl/blob.bin", &[("range", "bytes=999-")], vec![]),
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-    assert_eq!(res.headers().get(header::CONTENT_RANGE).unwrap(), "bytes */16");
+    assert_eq!(
+        res.headers().get(header::CONTENT_RANGE).unwrap(),
+        "bytes */16"
+    );
 
     // 端点越界裁剪（RFC 容忍）。
-    let res = send(app.clone(), req_with("GET", "/dl/blob.bin", &[("range", "bytes=10-999")], vec![])).await;
+    let res = send(
+        app.clone(),
+        req_with("GET", "/dl/blob.bin", &[("range", "bytes=10-999")], vec![]),
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(res.into_body()).await, &data[10..]);
 }
@@ -207,9 +285,17 @@ async fn html_force_attachment() {
     let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
     for (f, inline) in [("page.html", false), ("pic.svg", false), ("a.txt", true)] {
         let res = send(app.clone(), req("GET", &format!("/dl/{f}"))).await;
-        let cd = res.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
+        let cd = res
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(cd.starts_with("inline"), inline, "{f}: {cd}");
-        assert!(cd.contains("filename*="), "RFC5987 filename* 必须存在: {cd}");
+        assert!(
+            cd.contains("filename*="),
+            "RFC5987 filename* 必须存在: {cd}"
+        );
     }
 }
 
@@ -220,7 +306,10 @@ async fn upload_multipart_streaming() {
     let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
     let boundary = "XyZZy123";
     let mut body = Vec::new();
-    for (name, content) in [("a.txt", &b"hello upload"[..]), ("b.bin", &[1u8, 2, 3, 4, 5][..])] {
+    for (name, content) in [
+        ("a.txt", &b"hello upload"[..]),
+        ("b.bin", &[1u8, 2, 3, 4, 5][..]),
+    ] {
         body.extend_from_slice(format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"{name}\"\r\ncontent-type: application/octet-stream\r\n\r\n").as_bytes());
         body.extend_from_slice(content);
         body.extend_from_slice(b"\r\n");
@@ -231,14 +320,23 @@ async fn upload_multipart_streaming() {
         req_with(
             "POST",
             "/up/sub",
-            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
             body,
         ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER, "上传必须成功");
-    assert_eq!(std::fs::read(dir.path().join("sub/a.txt")).unwrap(), b"hello upload");
-    assert_eq!(std::fs::read(dir.path().join("sub/b.bin")).unwrap(), &[1, 2, 3, 4, 5]);
+    assert_eq!(
+        std::fs::read(dir.path().join("sub/a.txt")).unwrap(),
+        b"hello upload"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("sub/b.bin")).unwrap(),
+        &[1, 2, 3, 4, 5]
+    );
 }
 
 #[tokio::test]
@@ -255,7 +353,10 @@ async fn upload_rejects_bad_name_and_oversize() {
         req_with(
             "POST",
             "/up/",
-            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
             body.into_bytes(),
         ),
     )
@@ -274,7 +375,10 @@ async fn upload_rejects_bad_name_and_oversize() {
         req_with(
             "POST",
             "/up/",
-            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
             body.into_bytes(),
         ),
     )
@@ -282,7 +386,11 @@ async fn upload_rejects_bad_name_and_oversize() {
     assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     // 半成品不得残留。
     let leftover: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
-    assert!(leftover.is_empty(), "上传失败路径不得残留: {:?}", leftover.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+    assert!(
+        leftover.is_empty(),
+        "上传失败路径不得残留: {:?}",
+        leftover.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
 }
 
 /// 回归（GUI 实机测试发现）：在共享根目录上传后，303 跳转目标必须是 `/`。
@@ -301,7 +409,10 @@ async fn root_upload_redirects_to_root_listing() {
         req_with(
             "POST",
             "/up/",
-            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
             body.into_bytes(),
         ),
     )
@@ -315,7 +426,10 @@ async fn root_upload_redirects_to_root_listing() {
     assert_eq!(send(app, req("GET", "/")).await.status(), StatusCode::OK);
     // 修复前的坏目标确实是 404（钉住问题形态，防再次引入）。
     let app2 = trft_server::build_router(state_open(dir.path().to_path_buf()));
-    assert_eq!(send(app2, req("GET", "/view/")).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(app2, req("GET", "/view/")).await.status(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
@@ -332,14 +446,25 @@ async fn upload_conflict_gets_suffixed_name() {
         req_with(
             "POST",
             "/up/",
-            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
             body.into_bytes(),
         ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(std::fs::read(dir.path().join("dup.txt")).unwrap(), b"old", "既有文件不得被覆盖");
-    assert_eq!(std::fs::read(dir.path().join("dup_1.txt")).unwrap(), b"new", "冲突名追加序号");
+    assert_eq!(
+        std::fs::read(dir.path().join("dup.txt")).unwrap(),
+        b"old",
+        "既有文件不得被覆盖"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("dup_1.txt")).unwrap(),
+        b"new",
+        "冲突名追加序号"
+    );
 }
 
 #[tokio::test]
@@ -364,7 +489,12 @@ async fn delete_flow_with_csrf() {
     // 无 csrf → 403。
     let res = send(
         app.clone(),
-        req_with("POST", "/del/gone.txt", &[("cookie", &format!("trft_csrf={csrf}"))], b"csrf=wrong".to_vec()),
+        req_with(
+            "POST",
+            "/del/gone.txt",
+            &[("cookie", &format!("trft_csrf={csrf}"))],
+            b"csrf=wrong".to_vec(),
+        ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN, "CSRF 双重校验必须拦截");
@@ -373,7 +503,12 @@ async fn delete_flow_with_csrf() {
     // 有 csrf（表单 + Cookie 一致）→ 303 → 文件删除。
     let res = send(
         app.clone(),
-        req_with("POST", "/del/gone.txt", &[("cookie", &format!("trft_csrf={csrf}"))], format!("csrf={csrf}").into_bytes()),
+        req_with(
+            "POST",
+            "/del/gone.txt",
+            &[("cookie", &format!("trft_csrf={csrf}"))],
+            format!("csrf={csrf}").into_bytes(),
+        ),
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
@@ -388,10 +523,19 @@ async fn delete_refuses_directories() {
     let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
     let res = send(
         app,
-        req_with("POST", "/del/sub", &[("cookie", "trft_csrf=c")], b"csrf=c".to_vec()),
+        req_with(
+            "POST",
+            "/del/sub",
+            &[("cookie", "trft_csrf=c")],
+            b"csrf=c".to_vec(),
+        ),
     )
     .await;
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "目录删除必须拒绝（仅单文件）");
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "目录删除必须拒绝（仅单文件）"
+    );
     assert!(dir.path().join("sub/x.txt").exists());
 }
 
@@ -408,7 +552,10 @@ async fn chinese_filename_roundtrip() {
         req_with(
             "POST",
             "/up/",
-            &[("content-type", &format!("multipart/form-data; boundary={boundary}"))],
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
             body.into_bytes(),
         ),
     )
@@ -418,9 +565,20 @@ async fn chinese_filename_roundtrip() {
     // 下载：RFC5987 filename*。
     let res = send(app.clone(), req("GET", "/dl/%E6%8A%A5%E5%91%8A%20v2.txt")).await;
     assert_eq!(res.status(), StatusCode::OK);
-    let cd = res.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
-    assert!(cd.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v2.txt"), "RFC5987 编码: {cd}");
-    assert_eq!(body_bytes(res.into_body()).await, b"\xE5\x86\x85\xE5\xAE\xB9");
+    let cd = res
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        cd.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v2.txt"),
+        "RFC5987 编码: {cd}"
+    );
+    assert_eq!(
+        body_bytes(res.into_body()).await,
+        b"\xE5\x86\x85\xE5\xAE\xB9"
+    );
 }
 
 // ============ 真实 TCP 驱动（轮 4 F1 判别） ============
@@ -446,8 +604,15 @@ async fn real_tcp_get_serves_without_panic() {
         .await
         .expect("应答不得超时")
         .expect("连接不得被重置（panic 面）");
-    assert!(n > 0, "必须读到应答字节（修复前每个 h1 请求 panic → RST → 0 字节）");
-    assert!(buf.starts_with(b"HTTP/1.1 200"), "应答开头: {}", String::from_utf8_lossy(&buf[..n.min(32)]));
+    assert!(
+        n > 0,
+        "必须读到应答字节（修复前每个 h1 请求 panic → RST → 0 字节）"
+    );
+    assert!(
+        buf.starts_with(b"HTTP/1.1 200"),
+        "应答开头: {}",
+        String::from_utf8_lossy(&buf[..n.min(32)])
+    );
     srv.abort();
 }
 
@@ -462,8 +627,10 @@ async fn half_open_header_is_cut_after_timeout() {
 
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     use tokio::io::AsyncWriteExt;
-    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // 半个头，不发结尾
-    // 服务器必须在 ~15s（+裕量）内关闭连接；修复前（无 Timer）永不关闭。
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap(); // 半个头，不发结尾
+                   // 服务器必须在 ~15s（+裕量）内关闭连接；修复前（无 Timer）永不关闭。
     let mut buf = [0u8; 64];
     let t0 = std::time::Instant::now();
     let read = tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -477,9 +644,13 @@ async fn half_open_header_is_cut_after_timeout() {
     })
     .await;
     let elapsed = t0.elapsed();
-    assert!(read.is_ok(), "半开连接必须在 20s 内被关闭（slowloris 守卫）");
     assert!(
-        elapsed >= std::time::Duration::from_secs(10) && elapsed <= std::time::Duration::from_secs(19),
+        read.is_ok(),
+        "半开连接必须在 20s 内被关闭（slowloris 守卫）"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(10)
+            && elapsed <= std::time::Duration::from_secs(19),
         "关闭时机应在头读超时附近，实际 {elapsed:?}"
     );
     srv.abort();

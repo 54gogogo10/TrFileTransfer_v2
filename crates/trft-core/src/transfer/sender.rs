@@ -2,22 +2,25 @@
 //! 前导栈协商（0x0A 能力探询 + 0x08 压缩，WIRE-PROTOCOL.md §2）。
 //! 失败必须上抛（规格 §7.1），不得把失败吞成成功。
 
-use crate::crypto::kdf::{ct_eq, derive_pairing_key, pairing_proof, pairing_proof_bound, pairing_proof_s2c};
-use crate::error::{Error, Result, config_err, proto};
+use crate::crypto::kdf::{
+    ct_eq, derive_pairing_key, pairing_proof, pairing_proof_bound, pairing_proof_s2c,
+};
+use crate::error::{config_err, proto, Error, Result};
 use crate::hash::FileDigester;
 use crate::limiter::TokenBucket;
 use crate::protocol::frame::{
-    CAP_COMPRESS, MAX_TRANSFER_SIZE, R_CAPABILITY, R_PAIRING_SALT, STATUS_OK, STATUS_REJECT,
-    T_CAPABILITY, T_COMPRESS, T_COMPRESS_OK, T_PAIRING, T_PAIRING_BOUND, T_SINGLE_FILE, T_TEXT,
-    sanitize_name,
+    sanitize_name, CAP_COMPRESS, MAX_TRANSFER_SIZE, R_CAPABILITY, R_PAIRING_SALT, STATUS_OK,
+    STATUS_REJECT, T_CAPABILITY, T_COMPRESS, T_COMPRESS_OK, T_PAIRING, T_PAIRING_BOUND,
+    T_SINGLE_FILE, T_TEXT,
 };
 use crate::protocol::io::{
     read_n, read_u8, write_all, write_str_u16, write_u32, write_u64, write_u8,
 };
 use crate::transfer::compress::Compressed;
 use crate::transfer::encrypted;
-use crate::transfer::quic::{QuicStream, connect_quic, connect_quic_full};
-use crate::transfer::{BoxStream, CHUNK, Transport};
+use crate::transfer::quic::{connect_quic, connect_quic_full, QuicStream};
+use crate::transfer::udt::connect_udt;
+use crate::transfer::{BoxStream, Transport, CHUNK};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -104,8 +107,11 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) async fn connect(addr: SocketAddr, src_port: Option<u16>) -> Result<TcpStream> {
     match src_port {
-        None => Ok(tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await
-            .map_err(|_| proto("连接超时（10s）"))??),
+        None => Ok(
+            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .map_err(|_| proto("连接超时（10s）"))??,
+        ),
         Some(port) => {
             let local = SocketAddr::new(
                 if addr.is_ipv4() {
@@ -115,7 +121,11 @@ pub(crate) async fn connect(addr: SocketAddr, src_port: Option<u16>) -> Result<T
                 },
                 port,
             );
-            let sock = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+            let sock = if addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
             sock.bind(local)?;
             Ok(tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(addr))
                 .await
@@ -179,7 +189,9 @@ where
     // 无法伪造 HMAC(K, s2c 域‖盐‖fp)，恒时校验失败即断。
     let s2c: [u8; 32] = read_n(s, 32).await?.try_into().expect("32 字节证明");
     if !ct_eq(&s2c, &pairing_proof_s2c(&k, &salt, cert_fp)) {
-        return Err(Error::AuthRejected("服务端配对证明校验失败（疑似假服务端）".into()));
+        return Err(Error::AuthRejected(
+            "服务端配对证明校验失败（疑似假服务端）".into(),
+        ));
     }
     Ok(())
 }
@@ -231,7 +243,8 @@ pub(crate) async fn connect_stack(
             t.set_nodelay(true).ok();
             if opts.encrypt {
                 // 0x09 加密握手；证明绑定公钥转写，认证在握手中完成。
-                let (enc, _authed) = encrypted::client_wrap(t, opts.pairing_code.as_deref()).await?;
+                let (enc, _authed) =
+                    encrypted::client_wrap(t, opts.pairing_code.as_deref()).await?;
                 Box::new(enc)
             } else {
                 let mut t = t;
@@ -243,6 +256,20 @@ pub(crate) async fn connect_stack(
             // 配对已在 connect_quic_auth 内完成（含 0x0D 通道绑定/旧端回退）。
             let q = connect_quic_auth(addr, opts).await?;
             Box::new(q)
+        }
+        Transport::Udt => {
+            // 与 TCP 同口径：可选 0x09 加密 / 明文 0x05 配对
+            // （UDT 无证书体系，无 0x0D 通道绑定）。
+            let u = connect_udt(addr, opts.src_port).await?;
+            if opts.encrypt {
+                let (enc, _authed) =
+                    encrypted::client_wrap(u, opts.pairing_code.as_deref()).await?;
+                Box::new(enc)
+            } else {
+                let mut u = u;
+                authenticate(&mut u, opts.pairing_code.as_deref()).await?;
+                Box::new(u)
+            }
         }
     };
     let mut caps = 0u8;
@@ -346,7 +373,8 @@ pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Res
             s.set_nodelay(true).ok();
             if opts.encrypt {
                 // 0x09 加密握手；证明绑定公钥转写，认证在握手中完成。
-                let (mut enc, _authed) = encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
+                let (mut enc, _authed) =
+                    encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
                 stream_send_file(&mut enc, path, opts).await
             } else {
                 let mut s = s;
@@ -357,6 +385,18 @@ pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Res
         Transport::Quic => {
             let mut s = connect_quic_auth(addr, opts).await?;
             stream_send_file(&mut s, path, opts).await
+        }
+        Transport::Udt => {
+            let s = connect_udt(addr, opts.src_port).await?;
+            if opts.encrypt {
+                let (mut enc, _authed) =
+                    encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
+                stream_send_file(&mut enc, path, opts).await
+            } else {
+                let mut s = s;
+                authenticate(&mut s, opts.pairing_code.as_deref()).await?;
+                stream_send_file(&mut s, path, opts).await
+            }
         }
     };
     if res.is_ok() {
@@ -372,7 +412,8 @@ pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Resu
             let s = connect(addr, opts.src_port).await?;
             s.set_nodelay(true).ok();
             if opts.encrypt {
-                let (mut enc, _authed) = encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
+                let (mut enc, _authed) =
+                    encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
                 stream_send_text(&mut enc, text).await
             } else {
                 let mut s = s;
@@ -384,9 +425,29 @@ pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Resu
             let mut s = connect_quic_auth(addr, opts).await?;
             stream_send_text(&mut s, text).await
         }
+        Transport::Udt => {
+            let s = connect_udt(addr, opts.src_port).await?;
+            if opts.encrypt {
+                let (mut enc, _authed) =
+                    encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
+                stream_send_text(&mut enc, text).await
+            } else {
+                let mut s = s;
+                authenticate(&mut s, opts.pairing_code.as_deref()).await?;
+                stream_send_text(&mut s, text).await
+            }
+        }
     };
     if res.is_ok() {
-        record_stats(opts, addr, text.as_bytes().len() as u64, 0, started, "文本消息", "<文本>");
+        record_stats(
+            opts,
+            addr,
+            text.as_bytes().len() as u64,
+            0,
+            started,
+            "文本消息",
+            "<文本>",
+        );
     }
     res
 }

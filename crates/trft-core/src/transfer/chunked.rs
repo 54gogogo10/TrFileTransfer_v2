@@ -9,21 +9,20 @@
 //!   组装失败必须移除会话，让 0x0C 回 0x00 强制客户端整组重来（杜绝假成功）。
 //! - 会话表 64 组、10 分钟无块逐出并删除半成品；孤儿 `.trft-part` 另受 7 天清扫兜底。
 
-use crate::error::{Error, Result, config_err, proto};
+use crate::error::{config_err, proto, Error, Result};
 use crate::hash::sha256_file;
 use crate::limiter::TokenBucket;
 use crate::protocol::frame::{
-    MAX_CHUNK_PAYLOAD, MAX_CHUNK_SESSIONS, MAX_MERGED_RANGES, MAX_TRANSFER_SIZE, STATUS_INCOMPLETE,
-    STATUS_OK, STATUS_REJECT, T_CHUNKED, T_CHUNK_END, T_COVERAGE_QUERY, sanitize_name,
+    sanitize_name, MAX_CHUNK_PAYLOAD, MAX_CHUNK_SESSIONS, MAX_MERGED_RANGES, MAX_TRANSFER_SIZE,
+    STATUS_INCOMPLETE, STATUS_OK, STATUS_REJECT, T_CHUNKED, T_CHUNK_END, T_COVERAGE_QUERY,
 };
 use crate::protocol::io::{
-    read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, read_u8_long,
-    write_all, write_str_u16, write_u32, write_u64, write_u8,
+    read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, read_u8_long, write_all,
+    write_str_u16, write_u32, write_u64, write_u8,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
-use crate::transfer::receiver::{RecvOptions, publish_part};
+use crate::transfer::receiver::{publish_part, RecvOptions};
 use crate::transfer::resume;
-use crate::transfer::sender::{SendOptions, StackPlan, connect_stack};
+use crate::transfer::sender::{connect_stack, SendOptions, StackPlan};
 use crate::transfer::{BoxStream, CHUNK};
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
@@ -32,6 +31,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// 空闲会话逐出（与单向 UDP 会话 TTL 同源纪律）。
@@ -150,7 +150,8 @@ impl ChunkTracker {
         // 中途放弃的组被逐出后，接收侧进度卡永久 running；与 UDP 引擎惰性清扫
         // 同纪律）。
         map.retain(|_, s| {
-            let fresh = now.saturating_sub(s.last_seen_ms.load(Ordering::Relaxed)) < SESSION_TTL.as_millis() as u64;
+            let fresh = now.saturating_sub(s.last_seen_ms.load(Ordering::Relaxed))
+                < SESSION_TTL.as_millis() as u64;
             if !fresh {
                 let _ = std::fs::remove_file(&s.part);
                 if let Some(r) = &s.report {
@@ -184,7 +185,9 @@ impl ChunkTracker {
         let part = group_part_path(save_dir, name, &gid);
         // 磁盘预检（轮 1：0x02 此前缺席——规格 §3.1 口径对齐其余接收路径）。
         if !crate::transfer::receiver::space_ok(save_dir, total) {
-            return Err(proto("分块接收：磁盘可用空间不足（需要 ≥ 声明 + 64MB 余量）"));
+            return Err(proto(
+                "分块接收：磁盘可用空间不足（需要 ≥ 声明 + 64MB 余量）",
+            ));
         }
         let file = match tokio::fs::OpenOptions::new()
             .write(true)
@@ -282,7 +285,12 @@ impl ChunkTracker {
             let Some(s) = map.get(&gid) else {
                 return Err(proto("分块传输已中断（会话已失效）"));
             };
-            (s.part.clone(), s.name.clone(), s.report.clone(), s.notify.clone())
+            (
+                s.part.clone(),
+                s.name.clone(),
+                s.report.clone(),
+                s.notify.clone(),
+            )
         };
         if let Err(e) = self.assemble(&part, &name, opts).await {
             {
@@ -316,9 +324,15 @@ impl ChunkTracker {
             .map_err(|e| proto(e.to_string()))??;
         // 发布目录 = 会话半成品所在目录（PerDeviceFolder/AutoArchive 下即
         // 解析后的设备/日期目录）——目录在会话建立时固定，与续传语义一致。
-        let dir = part.parent().map(Path::to_path_buf).unwrap_or_else(|| opts.save_dir.clone());
+        let dir = part
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| opts.save_dir.clone());
         let final_dest = publish_part(part, &dir, name).await?;
-        let size = tokio::fs::metadata(&final_dest).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&final_dest)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         // 免费填充：组装后现算的哈希即完整摘要（规格 §3.1 缓存免费填充路径）。
         resume::fill_cache_at(opts, &final_dest, size, hash).await;
         eprintln!("[接收] 分块组装 {name} → {}", final_dest.display());
@@ -372,7 +386,11 @@ impl ChunkTracker {
 // ============ 服务端帧处理 ============
 
 /// 0x02 块帧：16B groupId + u64 offset + u64 totalSize + str16 name + u32 len + payload。
-pub(crate) async fn recv_chunk_frame<S>(s: &mut S, peer: SocketAddr, opts: &RecvOptions) -> Result<()>
+pub(crate) async fn recv_chunk_frame<S>(
+    s: &mut S,
+    peer: SocketAddr,
+    opts: &RecvOptions,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -394,7 +412,9 @@ where
         .checked_add(plen as u64)
         .ok_or_else(|| proto(format!("块区间 [{offset},+{plen}) 溢出 u64")))?;
     if offset > total || end > total {
-        return Err(proto(format!("块区间 [{offset},{end}) 越界（total={total}）")));
+        return Err(proto(format!(
+            "块区间 [{offset},{end}) 越界（total={total}）"
+        )));
     }
     // 流式读入（轮 4 F3）：不按声明预分配整段（read_n_long 会让 40B 帧头
     // 钉住 8MB 提交内存 ×64 闸至 300s 超时）；与 0x00/0x03 同纪律按固定
@@ -413,7 +433,15 @@ where
         read_exact_long(s, &mut buf[..want]).await?;
         if opts
             .chunk_sessions
-            .receive(gid, &name, total, pos, &buf[..want], &dir, &peer.ip().to_string())
+            .receive(
+                gid,
+                &name,
+                total,
+                pos,
+                &buf[..want],
+                &dir,
+                &peer.ip().to_string(),
+            )
             .await?
         {
             completed = true;
@@ -583,10 +611,15 @@ pub async fn send_file_chunked(
     }
 
     // 能力探询先行：旧对端短路（不发大清单）。
-    let plan = StackPlan { probe_caps: true, compress: opts.compress };
+    let plan = StackPlan {
+        probe_caps: true,
+        compress: opts.compress,
+    };
     let (s0, caps) = connect_stack(addr, opts, plan).await?;
     if caps & crate::protocol::frame::CAP_CHUNKED == 0 {
-        return Err(Error::Unsupported("对端不支持分块传输（请升级对端）".into()));
+        return Err(Error::Unsupported(
+            "对端不支持分块传输（请升级对端）".into(),
+        ));
     }
     let ranges = split_ranges(size, connections.clamp(1, 8) as usize);
     let started = std::time::Instant::now();
@@ -606,8 +639,17 @@ pub async fn send_file_chunked(
         let range = *r;
         set.spawn(async move {
             let rep = opts3.progress.clone();
-            send_chunks_conn(s_conn, gid2, &name3, size, &[range], &path3, opts3.speed_limit_bps, rep.as_ref())
-                .await
+            send_chunks_conn(
+                s_conn,
+                gid2,
+                &name3,
+                size,
+                &[range],
+                &path3,
+                opts3.speed_limit_bps,
+                rep.as_ref(),
+            )
+            .await
         });
     }
     let mut saw_complete = false;
@@ -621,20 +663,38 @@ pub async fn send_file_chunked(
         }
     }
     if fatal {
-        return Err(Error::Rejected("分块传输已中断（对端已清理或重启），需整组重发".into()));
+        return Err(Error::Rejected(
+            "分块传输已中断（对端已清理或重启），需整组重发".into(),
+        ));
     }
     if !saw_complete {
         for _ in 0..3 {
             if send_complement(addr, &opts2, gid, &name, size, &path2).await? {
                 outcome.finish();
-                crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("分块传输（补发）"), &name);
+                crate::transfer::sender::record_stats(
+                    opts,
+                    addr,
+                    size,
+                    1,
+                    started,
+                    &format!("分块传输（补发）"),
+                    &name,
+                );
                 return Ok(());
             }
         }
         return Err(Error::Rejected("分块补发 3 轮仍未覆盖完整文件".into()));
     }
     outcome.finish();
-    crate::transfer::sender::record_stats(opts, addr, size, 1, started, &format!("分块传输×{connections}"), &name);
+    crate::transfer::sender::record_stats(
+        opts,
+        addr,
+        size,
+        1,
+        started,
+        &format!("分块传输×{connections}"),
+        &name,
+    );
     Ok(())
 }
 
@@ -650,7 +710,15 @@ async fn send_complement(
 ) -> Result<bool> {
     // probe_caps: true——压缩协商依赖能力位（false 时 caps=0 → 补发轮恒明文直传，
     // 可压缩数据补发流量放大，轮 1 F8）。
-    let (mut s, _) = connect_stack(addr, opts, StackPlan { probe_caps: true, compress: opts.compress }).await?;
+    let (mut s, _) = connect_stack(
+        addr,
+        opts,
+        StackPlan {
+            probe_caps: true,
+            compress: opts.compress,
+        },
+    )
+    .await?;
     write_u8(&mut s, T_COVERAGE_QUERY).await?;
     write_all(&mut s, &gid).await?;
     let st = read_u8(&mut s).await?;
@@ -738,7 +806,10 @@ mod tests {
         let opts = crate::transfer::receiver::RecvOptions::default();
         let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let r = recv_chunk_frame(&mut server, peer, &opts).await;
-        assert!(r.is_err(), "越界 offset 必须回 Err（不得溢出 panic / 回绕接受）");
+        assert!(
+            r.is_err(),
+            "越界 offset 必须回 Err（不得溢出 panic / 回绕接受）"
+        );
     }
 
     #[test]
@@ -749,7 +820,11 @@ mod tests {
         assert_eq!(r, vec![(0, 150)]);
         assert_eq!(merge_range(&mut r, 200, 300).unwrap(), 100);
         assert_eq!(r, vec![(0, 150), (200, 300)]);
-        assert_eq!(merge_range(&mut r, 150, 200).unwrap(), 50, "填补缺口 = 新增 50");
+        assert_eq!(
+            merge_range(&mut r, 150, 200).unwrap(),
+            50,
+            "填补缺口 = 新增 50"
+        );
         assert_eq!(r, vec![(0, 300)]);
         assert!(covered_range(&r, 0, 300));
         assert!(covered_range(&r, 10, 290));
@@ -770,9 +845,34 @@ mod tests {
         let gid = [0xABu8; 16];
         let payload = vec![7u8; 3000];
         // 三个块覆盖 [0,3000)：最后一块返回 completed=true（组装开始）。
-        let c0 = tracker.receive(gid, "a.bin", 3000, 0, &payload[..1000], &out, "203.0.113.9").await.unwrap();
-        let c1 = tracker.receive(gid, "a.bin", 3000, 1000, &payload[1000..2000], &out, "203.0.113.9").await.unwrap();
-        let c2 = tracker.receive(gid, "a.bin", 3000, 2000, &payload[2000..], &out, "203.0.113.9").await.unwrap();
+        let c0 = tracker
+            .receive(gid, "a.bin", 3000, 0, &payload[..1000], &out, "203.0.113.9")
+            .await
+            .unwrap();
+        let c1 = tracker
+            .receive(
+                gid,
+                "a.bin",
+                3000,
+                1000,
+                &payload[1000..2000],
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
+        let c2 = tracker
+            .receive(
+                gid,
+                "a.bin",
+                3000,
+                2000,
+                &payload[2000..],
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
         assert!((c0, c1, c2) == (false, false, true));
         // 组装尚未完成（finish 未被调用）：0x0C 必须不是 0x01。
         // 暂停时钟下等待窗口立即到期——修复前此处直接回 STATUS_OK（红）。
@@ -787,26 +887,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let opts = RecvOptions { save_dir: out.clone(), ..Default::default() };
+        let opts = RecvOptions {
+            save_dir: out.clone(),
+            ..Default::default()
+        };
         let tracker = ChunkTracker::default();
 
         // 成功路径。
         let g1 = [0x11u8; 16];
         let payload = vec![1u8; 2000];
-        tracker.receive(g1, "ok.bin", 2000, 0, &payload[..1000], &out, "203.0.113.9").await.unwrap();
-        tracker.receive(g1, "ok.bin", 2000, 1000, &payload[1000..], &out, "203.0.113.9").await.unwrap();
+        tracker
+            .receive(g1, "ok.bin", 2000, 0, &payload[..1000], &out, "203.0.113.9")
+            .await
+            .unwrap();
+        tracker
+            .receive(
+                g1,
+                "ok.bin",
+                2000,
+                1000,
+                &payload[1000..],
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
         tracker.finish(g1, &opts).await.unwrap();
-        assert_eq!(tracker.end_status(g1).await, STATUS_OK, "组装成功后 0x0C 判 0x01");
+        assert_eq!(
+            tracker.end_status(g1).await,
+            STATUS_OK,
+            "组装成功后 0x0C 判 0x01"
+        );
         // 组装成功后会话保留完成态：0x0B 回满覆盖（迟到查询稳定收敛）。
         assert_eq!(tracker.ranges_of(g1).await, Some(vec![(0, 2000)]));
 
         // 失败路径：删除半成品令组装（哈希）失败 → 会话移除 → 0x00。
         let g2 = [0x22u8; 16];
-        tracker.receive(g2, "bad.bin", 2000, 0, &payload[..1000], &out, "203.0.113.9").await.unwrap();
-        tracker.receive(g2, "bad.bin", 2000, 1000, &payload[1000..], &out, "203.0.113.9").await.unwrap();
+        tracker
+            .receive(
+                g2,
+                "bad.bin",
+                2000,
+                0,
+                &payload[..1000],
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
+        tracker
+            .receive(
+                g2,
+                "bad.bin",
+                2000,
+                1000,
+                &payload[1000..],
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
         std::fs::remove_file(group_part_path(&out, "bad.bin", &g2)).unwrap();
         tracker.finish(g2, &opts).await.unwrap_err();
-        assert_eq!(tracker.end_status(g2).await, STATUS_REJECT, "组装失败必须判 0x00（无假成功）");
+        assert_eq!(
+            tracker.end_status(g2).await,
+            STATUS_REJECT,
+            "组装失败必须判 0x00（无假成功）"
+        );
     }
 
     /// 轮 3 F1 判别：部分覆盖的会话被逐出（TTL/LRU）时必须对进度 Reporter
@@ -819,17 +966,34 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = crate::progress::ProgressHub::new(tx);
-        let tracker = ChunkTracker { progress: Some(hub), ..Default::default() };
+        let tracker = ChunkTracker {
+            progress: Some(hub),
+            ..Default::default()
+        };
         let payload = vec![1u8; 100];
 
         // victim：部分覆盖（未完成）。
         let victim = [0x99u8; 16];
-        tracker.receive(victim, "victim.bin", 10_000, 0, &payload, &out, "203.0.113.9").await.unwrap();
+        tracker
+            .receive(
+                victim,
+                "victim.bin",
+                10_000,
+                0,
+                &payload,
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
         // 填充到 64 组挤占 LRU（victim 最旧 → 被逐出）。
         for i in 0..MAX_CHUNK_SESSIONS {
             let mut gid = [0u8; 16];
             gid[0] = i as u8;
-            tracker.receive(gid, "f.bin", 10_000, 0, &payload, &out, "203.0.113.9").await.unwrap();
+            tracker
+                .receive(gid, "f.bin", 10_000, 0, &payload, &out, "203.0.113.9")
+                .await
+                .unwrap();
         }
         // 排空事件流，找到 victim 的 Reporter 是否收到 failed。
         let mut victim_failed = false;
@@ -842,15 +1006,35 @@ mod tests {
 
         // done 会话被逐出不得翻转：完整接收 + finish 成功后，用新组挤出。
         let done = [0xAAu8; 16];
-        let opts = RecvOptions { save_dir: out.clone(), ..Default::default() };
+        let opts = RecvOptions {
+            save_dir: out.clone(),
+            ..Default::default()
+        };
         let full = vec![2u8; 200];
-        tracker.receive(done, "done.bin", 200, 0, &full, &out, "203.0.113.9").await.unwrap();
-        tracker.receive(done, "done.bin", 200, 100, &full[100..], &out, "203.0.113.9").await.unwrap();
+        tracker
+            .receive(done, "done.bin", 200, 0, &full, &out, "203.0.113.9")
+            .await
+            .unwrap();
+        tracker
+            .receive(
+                done,
+                "done.bin",
+                200,
+                100,
+                &full[100..],
+                &out,
+                "203.0.113.9",
+            )
+            .await
+            .unwrap();
         tracker.finish(done, &opts).await.unwrap();
         for i in 0..MAX_CHUNK_SESSIONS {
             let mut gid = [1u8; 16];
             gid[0] = i as u8;
-            tracker.receive(gid, "g.bin", 10_000, 0, &payload, &out, "203.0.113.9").await.unwrap();
+            tracker
+                .receive(gid, "g.bin", 10_000, 0, &payload, &out, "203.0.113.9")
+                .await
+                .unwrap();
         }
         let mut done_flipped = false;
         while let Ok(ev) = rx.try_recv() {

@@ -5,7 +5,7 @@
 //! 而传输帧不携带设备名——名字仅来自 discovery 0xD1/0xD2 应答与发送成功记忆。
 //! 持久化 `devices.json`，进程内 `DeviceStore` 快照供接收器热读。
 
-use crate::error::{Result, config_err};
+use crate::error::{config_err, Result};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ pub struct DeviceInfo {
     pub name: String,
     pub ip: String,
     pub port: u16,
-    /// "tcp" | "udt"
+    /// "tcp" | "quic" | "udt"（拆分前存量 "udt" 于 load 时迁移为 "quic"）
     pub proto: String,
     pub needs_pairing: bool,
     pub last_seen: u64,
@@ -99,17 +99,40 @@ impl std::fmt::Debug for DeviceStore {
 
 impl DeviceStore {
     /// 从磁盘加载（文件缺失/损坏 = 空表——记忆属可再生数据）。
+    /// 存量迁移（TECH-STACK §7.28）：UDT/QUIC 槽位拆分前写入的 `"udt"` 全部实为
+    /// QUIC 槽位 → 首次加载一次性改写为 `"quic"` 并落盘；此后 `"udt"` 即真 UDT。
     pub fn load(path: PathBuf) -> Self {
-        let list = std::fs::read_to_string(&path)
+        let list: Vec<DeviceInfo> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        Self { inner: Mutex::new(list), path: Some(path) }
+        let mut migrated = false;
+        let list: Vec<DeviceInfo> = list
+            .into_iter()
+            .map(|mut d| {
+                if d.proto == "udt" {
+                    d.proto = "quic".into();
+                    migrated = true;
+                }
+                d
+            })
+            .collect();
+        let store = Self {
+            inner: Mutex::new(list),
+            path: Some(path.clone()),
+        };
+        if migrated {
+            store.persist(&store.snapshot());
+        }
+        store
     }
 
     /// 纯内存实例（测试用；不落盘）。
     pub fn in_memory() -> Self {
-        Self { inner: Mutex::new(Vec::new()), path: None }
+        Self {
+            inner: Mutex::new(Vec::new()),
+            path: None,
+        }
     }
 
     fn persist(&self, list: &[DeviceInfo]) {
@@ -168,13 +191,10 @@ impl DeviceStore {
     /// （轮 2 P1：伪造 0xD2 应答不得把自己洗成「已知」）。
     pub fn is_known(&self, ip: IpAddr) -> bool {
         self.name_for(ip).is_some()
-            && self
-                .inner
-                .lock()
-                .expect("设备锁")
-                .iter()
-                .any(|d| d.ip.parse::<IpAddr>().map(|x| x == ip).unwrap_or(false)
-                    && d.source != DeviceSource::Discovery)
+            && self.inner.lock().expect("设备锁").iter().any(|d| {
+                d.ip.parse::<IpAddr>().map(|x| x == ip).unwrap_or(false)
+                    && d.source != DeviceSource::Discovery
+            })
     }
 }
 
@@ -257,8 +277,15 @@ mod tests {
         fake.source = DeviceSource::Discovery;
         st.upsert(fake.clone());
         let ip: IpAddr = "10.9.9.9".parse().unwrap();
-        assert_eq!(st.name_for(ip).as_deref(), Some("attacker"), "名字可用于展示/命名");
-        assert!(!st.is_known(ip), "Discovery 来源不得判为已知（fail-closed）");
+        assert_eq!(
+            st.name_for(ip).as_deref(),
+            Some("attacker"),
+            "名字可用于展示/命名"
+        );
+        assert!(
+            !st.is_known(ip),
+            "Discovery 来源不得判为已知（fail-closed）"
+        );
         // 同 IP 的成功传输记忆把来源升级为 Transfer → 才算已知。
         let mut ok = fake;
         ok.source = DeviceSource::Transfer;
@@ -277,6 +304,34 @@ mod tests {
         st.upsert(dev("nas", "10.1.1.1"));
         drop(st);
         let st2 = DeviceStore::load(p);
-        assert_eq!(st2.name_for("10.1.1.1".parse().unwrap()).as_deref(), Some("nas"));
+        assert_eq!(
+            st2.name_for("10.1.1.1".parse().unwrap()).as_deref(),
+            Some("nas")
+        );
+    }
+
+    /// 拆分迁移判别（TECH-STACK §7.28）：存量 "udt"（=QUIC 槽位）首载一次性改写
+    /// 为 "quic" 并落盘；改写后再载入不得二次迁移（"udt" 即真 UDT）。
+    #[test]
+    fn legacy_udt_proto_migrates_to_quic_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("devices.json");
+        let legacy = r#"[{
+            "name": "old-box", "ip": "10.0.0.9", "port": 8080,
+            "proto": "udt", "needs_pairing": false, "last_seen": 1,
+            "source": "Transfer"
+        }]"#;
+        std::fs::write(&p, legacy).unwrap();
+        let st = DeviceStore::load(p.clone());
+        assert_eq!(
+            st.snapshot()[0].proto,
+            "quic",
+            "存量 udt 必须迁移为 quic（旧 UDT 实为 QUIC 槽位）"
+        );
+        drop(st);
+        // 落盘后文件里已是 "quic"。
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"quic\""), "迁移必须写穿: {text}");
+        assert!(!text.contains("\"udt\""));
     }
 }

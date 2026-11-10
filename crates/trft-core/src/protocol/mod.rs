@@ -4,6 +4,7 @@
 pub mod frame;
 pub mod io;
 pub mod udp;
+pub mod udt;
 
 /// 协议版本号（单向 UDP 公共头第 1 字节）。
 pub const PROTO_VERSION: u8 = 2;

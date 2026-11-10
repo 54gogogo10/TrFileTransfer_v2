@@ -39,7 +39,15 @@ fn recv_send_roundtrip_via_real_processes() {
 
     // 接收端：收满 1 个文件自退（--count 1）。
     let mut recv = trft()
-        .args(["recv", "--port", &port, "--out", out.to_str().unwrap(), "--count", "1"])
+        .args([
+            "recv",
+            "--port",
+            &port,
+            "--out",
+            out.to_str().unwrap(),
+            "--count",
+            "1",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -71,7 +79,10 @@ fn recv_send_roundtrip_via_real_processes() {
     assert!(sent_ok, "send 20s 内未成功（接收器未就绪或传输失败）");
 
     let rx = recv.wait().expect("wait recv");
-    assert!(rx.success(), "recv 必须以 0 退出（--count 1 收满即退），实际 {rx}");
+    assert!(
+        rx.success(),
+        "recv 必须以 0 退出（--count 1 收满即退），实际 {rx}"
+    );
     assert_eq!(
         std::fs::read(out.join("cli 传输 测试.bin")).unwrap(),
         data,

@@ -422,3 +422,22 @@ release 全 workspace 构建。
   布局差异、GUI SrcPort、TCP 4MB 缓冲（详见 TECH-STACK §7.13–§7.18）。
 - 仍延后：FEC 吞吐基准、多平台发布矩阵、自更新公钥占位（发布检查单硬项）、
   Win11 Mica。
+
+## UDT/QUIC 槽位拆分交付记录（2026-11-10）
+
+**决策**（用户拍板）：原「UDT」模式恢复 UDT 语义（原生 Rust 自研可靠 UDP 流，`transfer::udt`——
+ARQ+SACK+固定窗口，与 UDT4/C# 不做包级互通，规格 §4.3 口径不变）；原「UDT (QUIC)」实现
+（quinn）改名 **QUIC** 独立成第四模式。本轮随行排障修复四处自研传输层缺陷（实现坑实录见
+TECH-STACK §7.28）：
+
+1. **tokio `Notify` 丢唤醒**（自研 UDT shutdown 永挂）：`Notified` future 逐 poll 重建、drop 即
+   注销——`notify_waiters` 触发时队列已空。改 FIN_ACK 走 mpsc 通道（waker 挂 Receiver 常驻）。
+2. **watch 无接收者静默丢值**（RST 误读为干净 EOF）：`err_tx.send` 在 `err_rx` 被丢弃时不存值，
+   `error()` 恒 None——「结果未知 ≠ 成功」红线被绕过。`err_rx` 随状态机持有。
+3. **current-thread runtime 自旋饥饿**：`recv_from/recv` 有积压即同步 Ready，demux/泵/驱动互饿
+   （表现为 loopback ~55KB/s 与偶发重传超限）——所有包处理循环逐包 `yield_now()`。
+4. **std Mutex 临时守卫重入死锁**（本轮诊断打印自伤）：同语句两个 `.lock()` 临时 guard = 死锁。
+
+**判别**：`tests/e2e_udt.rs` 真 socket 四测（单文件 SHA-256 一致 / 配对门三态 / 0x09 加密路径 /
+握手版本门 fail-closed）+ 引擎对偶注入四测（无损双向 FIN/EOF / 25% 丢包恢复 / RST 传播 /
+重复 DATA 不重复投递）+ 发现帧新旧兼容 + devices 迁移幂等；全量回归绿。

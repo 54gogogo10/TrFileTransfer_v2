@@ -10,10 +10,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use trft_core::config::{ConfirmMode, DuplicatePolicy};
-use trft_core::devices::{DeviceStore, DeviceInfo};
-use trft_core::transfer::receiver::{ConfirmRequest, RecvOptions, serve_on};
+use trft_core::devices::{DeviceInfo, DeviceStore};
+use trft_core::transfer::receiver::{serve_on, ConfirmRequest, RecvOptions};
 use trft_core::transfer::resume::{send_file_auto, send_folder_resume, stable_session_id};
-use trft_core::transfer::sender::{SendOptions, send_file};
+use trft_core::transfer::sender::{send_file, SendOptions};
 
 fn dev(ip: &str, name: &str) -> DeviceInfo {
     DeviceInfo {
@@ -46,9 +46,15 @@ fn recv_base(save: std::path::PathBuf) -> RecvOptions {
 }
 
 /// 回答下一个确认请求。
-async fn answer_next(rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<ConfirmRequest>>>, allow: bool) {
+async fn answer_next(
+    rx: &Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<ConfirmRequest>>>,
+    allow: bool,
+) {
     let mut g = rx.lock().await;
-    let req = timeout(Duration::from_secs(5), g.recv()).await.unwrap().expect("应有确认请求");
+    let req = timeout(Duration::from_secs(5), g.recv())
+        .await
+        .unwrap()
+        .expect("应有确认请求");
     let _ = req.reply.send(allow);
 }
 
@@ -96,8 +102,13 @@ async fn confirm_all_accepts_after_reply() {
     let server = tokio::spawn(serve_on(listener, ro));
     let answerer = spawn_answerer(crx.clone(), true);
 
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
-    timeout(Duration::from_secs(5), answerer).await.unwrap().unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), answerer)
+        .await
+        .unwrap()
+        .unwrap();
     wait_server(server).await;
     assert!(out.join("ok.bin").exists(), "确认通过后必须落盘");
 }
@@ -117,7 +128,10 @@ async fn confirm_all_rejects_denial_and_silence() {
         let server = tokio::spawn(serve_on(listener, ro));
         let answerer = spawn_answerer(crx.clone(), false);
         let r = send_file(addr, &src, &SendOptions::default()).await;
-        timeout(Duration::from_secs(5), answerer).await.unwrap().unwrap();
+        timeout(Duration::from_secs(5), answerer)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.is_err(), "拒绝应答必须使发送失败");
         settle_rejected(server).await;
         assert!(!out.join("no.bin").exists(), "拒绝后不得落盘");
@@ -133,7 +147,10 @@ async fn confirm_all_rejects_denial_and_silence() {
         let server = tokio::spawn(serve_on(listener, ro));
         let dropper = spawn_dropper(crx.clone());
         let r = send_file(addr, &src, &SendOptions::default()).await;
-        timeout(Duration::from_secs(5), dropper).await.unwrap().unwrap();
+        timeout(Duration::from_secs(5), dropper)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(r.is_err(), "无应答必须判拒绝（fail-closed）");
         settle_rejected(server).await;
         assert!(!out.join("silent.bin").exists());
@@ -150,7 +167,9 @@ async fn confirm_all_without_channel_fails_closed() {
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, ro));
     assert!(
-        send_file(addr, &src, &SendOptions::default()).await.is_err(),
+        send_file(addr, &src, &SendOptions::default())
+            .await
+            .is_err(),
         "mode≠off 而通道缺省必须拒绝（fail-closed）"
     );
     settle_rejected(server).await;
@@ -171,7 +190,9 @@ async fn confirm_unknown_passes_known_device_without_dialog() {
     ro.devices = Some(store);
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, ro));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     wait_server(server).await;
     assert!(out.join("known.bin").exists());
     assert!(
@@ -195,11 +216,18 @@ async fn confirm_same_ip_remembered_within_window() {
         let server = tokio::spawn(serve_on(listener, ro.clone()));
         if i == 0 {
             let answerer = spawn_answerer(crx.clone(), true);
-            send_file(addr, &src, &SendOptions::default()).await.unwrap();
-            timeout(Duration::from_secs(5), answerer).await.unwrap().unwrap();
+            send_file(addr, &src, &SendOptions::default())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), answerer)
+                .await
+                .unwrap()
+                .unwrap();
         } else {
             // 窗口内第二次：不挂应答者——窗口失效（重弹确认）则 send_file 必失败。
-            send_file(addr, &src, &SendOptions::default()).await.unwrap();
+            send_file(addr, &src, &SendOptions::default())
+                .await
+                .unwrap();
         }
         wait_server(server).await;
     }
@@ -224,7 +252,9 @@ async fn per_device_folder_routes_by_remembered_name() {
     ro.devices = Some(store);
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, ro));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     wait_server(server).await;
 
     let today = trft_core::transfer::receiver::today_component();
@@ -244,7 +274,9 @@ async fn per_device_unknown_falls_back_to_ip() {
     ro.per_device_folder = true; // 无 DeviceStore
     let (listener, addr) = ephemeral_listener().await;
     let server = tokio::spawn(serve_on(listener, ro));
-    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    send_file(addr, &src, &SendOptions::default())
+        .await
+        .unwrap();
     wait_server(server).await;
     assert!(
         out.join("127.0.0.1").join("anon.bin").exists(),
@@ -264,9 +296,14 @@ async fn auto_archive_alone_and_combined_ordering() {
         ro.auto_archive = true;
         let (listener, addr) = ephemeral_listener().await;
         let server = tokio::spawn(serve_on(listener, ro));
-        send_file(addr, &src, &SendOptions::default()).await.unwrap();
+        send_file(addr, &src, &SendOptions::default())
+            .await
+            .unwrap();
         wait_server(server).await;
-        assert!(out.join(&today).join("arch.bin").exists(), "仅归档：<日期>/ 一层");
+        assert!(
+            out.join(&today).join("arch.bin").exists(),
+            "仅归档：<日期>/ 一层"
+        );
         assert_eq!(
             out.join(&today).read_dir().unwrap().count(),
             1,
@@ -285,7 +322,9 @@ async fn auto_archive_alone_and_combined_ordering() {
         ro.devices = Some(store);
         let (listener, addr) = ephemeral_listener().await;
         let server = tokio::spawn(serve_on(listener, ro));
-        send_file(addr, &src, &SendOptions::default()).await.unwrap();
+        send_file(addr, &src, &SendOptions::default())
+            .await
+            .unwrap();
         wait_server(server).await;
         assert!(
             out.join("设备乙").join(&today).join("both.bin").exists(),
@@ -325,18 +364,27 @@ async fn sync_per_device_bitmap_skip_consistent() {
     };
 
     // 发送端缓存：首跑传输中免费回填，次跑清单携带哈希 → 服务端位图判跳过。
-    let cache = Arc::new(tokio::sync::Mutex::new(trft_core::hashcache::HashCache::load(
-        &trft_core::hashcache::cache_file_for(&src_root),
-        7,
-    )));
+    let cache = Arc::new(tokio::sync::Mutex::new(
+        trft_core::hashcache::HashCache::load(&trft_core::hashcache::cache_file_for(&src_root), 7),
+    ));
 
     // 第一次同步（清单无哈希 → 全发；发送端缓存回填）。
     let (l1, a1) = ephemeral_listener().await;
     let s1 = tokio::spawn(serve_on(l1, make_ro(false)));
-    send_folder_resume(a1, &src_root, &SendOptions::default(), stable_session_id(&src_root, "t"), Some(&cache))
+    send_folder_resume(
+        a1,
+        &src_root,
+        &SendOptions::default(),
+        stable_session_id(&src_root, "t"),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), s1)
         .await
+        .unwrap()
+        .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(10), s1).await.unwrap().unwrap().unwrap();
     assert!(
         out.join("同步机").join("proj").join("a.txt").exists(),
         "分目录下 0x04 根目录落点"
@@ -345,18 +393,40 @@ async fn sync_per_device_bitmap_skip_consistent() {
     // 第二次同步（清单携带缓存哈希 → 位图全跳过，总传输量 0）。
     let (stx, mut srx) = mpsc::unbounded_channel();
     let shub = trft_core::progress::ProgressHub::new(stx);
-    let sopts = SendOptions { progress: Some(shub.register("send", "sync2", 0)), ..Default::default() };
+    let sopts = SendOptions {
+        progress: Some(shub.register("send", "sync2", 0)),
+        ..Default::default()
+    };
     let (l2, a2) = ephemeral_listener().await;
     let s2 = tokio::spawn(serve_on(l2, make_ro(true)));
-    send_folder_resume(a2, &src_root, &sopts, stable_session_id(&src_root, "t"), Some(&cache))
+    send_folder_resume(
+        a2,
+        &src_root,
+        &sopts,
+        stable_session_id(&src_root, "t"),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), s2)
         .await
+        .unwrap()
+        .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(10), s2).await.unwrap().unwrap().unwrap();
     let sent: u64 = std::iter::from_fn(|| srx.try_recv().ok())
-        .filter_map(|ev| if ev.state == "done" { Some(ev.done) } else { None })
+        .filter_map(|ev| {
+            if ev.state == "done" {
+                Some(ev.done)
+            } else {
+                None
+            }
+        })
         .last()
         .unwrap_or(0);
-    assert_eq!(sent, 0, "分目录下二次同步必须全跳过（缓存键与落盘键同口径）");
+    assert_eq!(
+        sent, 0,
+        "分目录下二次同步必须全跳过（缓存键与落盘键同口径）"
+    );
 }
 
 /// 轮 1 P1 判别：0x03 冲突改名后缓存键必须跟最终路径——
@@ -391,16 +461,32 @@ async fn resume_conflict_no_cache_poisoning() {
     std::fs::write(&f1, &new).unwrap();
     let (l1, a1) = common::ephemeral_listener().await;
     let s1 = tokio::spawn(serve_on(l1, make_ro()));
-    send_file_auto(a1, &f1, &SendOptions::default()).await.unwrap();
-    timeout(Duration::from_secs(10), s1).await.unwrap().unwrap().unwrap();
+    send_file_auto(a1, &f1, &SendOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), s1)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(out.join("same_1.bin").exists());
-    assert_eq!(std::fs::read(out.join("same.bin")).unwrap(), old, "旧文件不得被覆盖");
+    assert_eq!(
+        std::fs::read(out.join("same.bin")).unwrap(),
+        old,
+        "旧文件不得被覆盖"
+    );
 
     // 第二次：再发同一 new 内容 → skip 判定若命中投毒条目会零传输（假成功）。
     let (l2, a2) = common::ephemeral_listener().await;
     let s2 = tokio::spawn(serve_on(l2, make_ro()));
-    send_file_auto(a2, &f1, &SendOptions::default()).await.unwrap();
-    timeout(Duration::from_secs(10), s2).await.unwrap().unwrap().unwrap();
+    send_file_auto(a2, &f1, &SendOptions::default())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), s2)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 
     // 修复后：磁盘 same.bin 仍是旧内容 → 不得判 skip → 必须真收 → same_2.bin。
     assert!(
@@ -418,7 +504,9 @@ async fn resume_conflict_no_cache_poisoning() {
 async fn resume_offset_authority_is_server_disk() {
     use trft_core::hash::sha256;
     use trft_core::protocol::frame::{R_RESUME_NEGO, STATUS_OK, T_RESUME_FILE};
-    use trft_core::protocol::io::{read_u8, read_u64, write_all, write_str_u16, write_u64, write_u8};
+    use trft_core::protocol::io::{
+        read_u64, read_u8, write_all, write_str_u16, write_u64, write_u8,
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");

@@ -1,7 +1,7 @@
 //! 配置持久化（规格 §3.8：键值文件；.tmp → .bak → 原子换入自愈；
 //! 主文件缺失视为用户重置，不回退 .bak）。
 
-use crate::error::{Error, Result, config_err};
+use crate::error::{config_err, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -53,9 +53,11 @@ pub struct Config {
     pub theme: String,
     pub server_port_tcp: u16,
     pub server_port_quic: u16,
+    pub server_port_udt: u16,
     pub server_port_udp: u16,
     pub save_dir_tcp: PathBuf,
     pub save_dir_quic: PathBuf,
+    pub save_dir_udt: PathBuf,
     pub save_dir_udp: PathBuf,
     pub http_port: u16,
     pub discovery_port: u16,
@@ -99,9 +101,11 @@ impl Default for Config {
             theme: "system".into(),
             server_port_tcp: 8080,
             server_port_quic: 8080,
+            server_port_udt: 8080,
             server_port_udp: 8080,
             save_dir_tcp: default_save_dir("tcp"),
             save_dir_quic: default_save_dir("quic"),
+            save_dir_udt: default_save_dir("udt"),
             save_dir_udp: default_save_dir("udp"),
             http_port: 8090,
             discovery_port: 45000,
@@ -144,9 +148,7 @@ impl Config {
         }
         let main: Result<Self> = match std::fs::read_to_string(path) {
             // 解析为空（规格 §3.8）：保存中途截断的典型形态，视为损坏。
-            Ok(text) if text.trim().is_empty() => {
-                Err(config_err("主文件为空（疑似保存中途截断）"))
-            }
+            Ok(text) if text.trim().is_empty() => Err(config_err("主文件为空（疑似保存中途截断）")),
             Ok(text) => toml::from_str::<Config>(&text)
                 .map_err(|e| config_err(format!("config 解析失败: {e}")))
                 .and_then(|c| c.validate()),
@@ -221,7 +223,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(p) = parent {
         std::fs::create_dir_all(p)?;
     }
-    let dir = parent.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let dir = parent
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
     tmp.write_all(data)?;
     tmp.flush()?;
@@ -296,7 +300,10 @@ mod tests {
         c.save(&p).unwrap(); // .bak = 9100
         std::fs::write(&p, "").unwrap(); // 截断为空
         let c2 = Config::load(&p).unwrap();
-        assert_eq!(c2.server_port_tcp, 9100, "空主文件必须回退 .bak（不得静默重置为默认）");
+        assert_eq!(
+            c2.server_port_tcp, 9100,
+            "空主文件必须回退 .bak（不得静默重置为默认）"
+        );
 
         // 纯空白同理。
         std::fs::write(&p, "   \n\t\n").unwrap();

@@ -21,15 +21,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use trft_core::hash::sha256_file;
 use trft_core::protocol::frame::{
-    CAP_CHUNKED, CAP_COVERAGE, CAP_COMPRESS, CAP_RESUME_FILE, CAP_RESUME_FOLDER, R_CAPABILITY,
-    T_CHUNKED, T_CAPABILITY,
+    CAP_CHUNKED, CAP_COMPRESS, CAP_COVERAGE, CAP_RESUME_FILE, CAP_RESUME_FOLDER, R_CAPABILITY,
+    T_CAPABILITY, T_CHUNKED,
 };
 use trft_core::protocol::io::{read_u8, write_all, write_str_u16, write_u32, write_u64, write_u8};
+use trft_core::transfer::chunked::send_file_chunked;
 use trft_core::transfer::receiver::RecvOptions;
 use trft_core::transfer::resume::send_file_auto;
-use trft_core::transfer::sender::SendOptions;
-use trft_core::transfer::chunked::send_file_chunked;
 use trft_core::transfer::resume::send_folder_resume;
+use trft_core::transfer::sender::SendOptions;
 
 fn old_server_opts(save: std::path::PathBuf) -> RecvOptions {
     // 「旧对端」模拟：关闭全部扩展特性（未知帧 fail-closed 行为与旧版本一致）。
@@ -45,7 +45,10 @@ fn old_server_opts(save: std::path::PathBuf) -> RecvOptions {
 }
 
 fn new_client_opts() -> SendOptions {
-    SendOptions { compress: true, ..Default::default() }
+    SendOptions {
+        compress: true,
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -55,12 +58,20 @@ async fn matrix_new_client_vs_old_server_falls_back_to_00() {
     let out = dir.path().join("out");
 
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(trft_core::transfer::receiver::serve_on(listener, old_server_opts(out.clone())));
+    let server = tokio::spawn(trft_core::transfer::receiver::serve_on(
+        listener,
+        old_server_opts(out.clone()),
+    ));
 
     // 规格 §3.2：0x03 首选 → 旧对端 → 自动降级 0x00 → 成功。
-    send_file_auto(addr, &src, &new_client_opts()).await.unwrap();
+    send_file_auto(addr, &src, &new_client_opts())
+        .await
+        .unwrap();
     common::wait_server(server).await;
-    assert_eq!(sha256_file(&out.join("m.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("m.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     let _ = data;
 }
 
@@ -71,7 +82,10 @@ async fn matrix_chunked_vs_old_server_is_unsupported() {
     let out = dir.path().join("out");
 
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(trft_core::transfer::receiver::serve_on(listener, old_server_opts(out.clone())));
+    let server = tokio::spawn(trft_core::transfer::receiver::serve_on(
+        listener,
+        old_server_opts(out.clone()),
+    ));
 
     let r = send_file_chunked(addr, &src, &new_client_opts(), 4).await;
     assert!(
@@ -91,7 +105,10 @@ async fn matrix_sync_vs_old_server_is_unsupported() {
     let out = dir.path().join("out");
 
     let (listener, addr) = ephemeral_listener().await;
-    let server = tokio::spawn(trft_core::transfer::receiver::serve_on(listener, old_server_opts(out.clone())));
+    let server = tokio::spawn(trft_core::transfer::receiver::serve_on(
+        listener,
+        old_server_opts(out.clone()),
+    ));
 
     let r = send_folder_resume(addr, &root, &new_client_opts(), 42, None).await;
     assert!(
@@ -115,12 +132,20 @@ async fn matrix_compress_on_vs_off_still_transfers() {
 
     let (listener, addr) = ephemeral_listener().await;
     // 服务端关闭压缩（其余特性保留）。
-    let o = RecvOptions { compress: false, ..opts_resident(out.clone(), None) };
+    let o = RecvOptions {
+        compress: false,
+        ..opts_resident(out.clone(), None)
+    };
     let server = tokio::spawn(trft_core::transfer::receiver::serve_on(listener, o));
 
-    send_file_auto(addr, &src, &new_client_opts()).await.unwrap();
+    send_file_auto(addr, &src, &new_client_opts())
+        .await
+        .unwrap();
     server.abort();
-    assert_eq!(sha256_file(&out.join("comp.txt")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("comp.txt")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -136,9 +161,14 @@ async fn matrix_compress_full_stack_roundtrip() {
         opts(out.clone(), None, 1),
     ));
 
-    send_file_auto(addr, &src, &new_client_opts()).await.unwrap();
+    send_file_auto(addr, &src, &new_client_opts())
+        .await
+        .unwrap();
     common::wait_server(server).await;
-    assert_eq!(sha256_file(&out.join("z.bin")).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join("z.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
 }
 
@@ -173,7 +203,11 @@ async fn capability_frame_reports_feature_bits() {
             ..opts_resident(dir.path().join("o2"), None)
         },
     ));
-    assert_eq!(probe(a2).await, CAP_RESUME_FILE | CAP_RESUME_FOLDER, "位必须随选项收敛");
+    assert_eq!(
+        probe(a2).await,
+        CAP_RESUME_FILE | CAP_RESUME_FOLDER,
+        "位必须随选项收敛"
+    );
     s1.abort();
     s2.abort();
 }
@@ -196,14 +230,21 @@ async fn resume_survives_interrupted_transfer() {
     let name = "big.bin";
     {
         let mut s = TcpStream::connect(a1).await.unwrap();
-        write_u8(&mut s, trft_core::protocol::frame::T_RESUME_FILE).await.unwrap();
+        write_u8(&mut s, trft_core::protocol::frame::T_RESUME_FILE)
+            .await
+            .unwrap();
         write_str_u16(&mut s, name).await.unwrap();
         write_u64(&mut s, data.len() as u64).await.unwrap();
         write_u64(&mut s, 0).await.unwrap();
         write_u8(&mut s, 1).await.unwrap();
-        write_all(&mut s, &sha256_file(&src).unwrap()).await.unwrap();
+        write_all(&mut s, &sha256_file(&src).unwrap())
+            .await
+            .unwrap();
         // 协商应答。
-        assert_eq!(read_u8(&mut s).await.unwrap(), trft_core::protocol::frame::R_RESUME_NEGO);
+        assert_eq!(
+            read_u8(&mut s).await.unwrap(),
+            trft_core::protocol::frame::R_RESUME_NEGO
+        );
         assert_eq!(read_u8(&mut s).await.unwrap(), 0x01);
         let off = {
             let mut b = [0u8; 8];
@@ -222,7 +263,10 @@ async fn resume_survives_interrupted_transfer() {
     // 重连 → 服务端从半成品长度接续。
     send_file_auto(a1, &src, &new_client_opts()).await.unwrap();
     s1.abort();
-    assert_eq!(sha256_file(&out.join(name)).unwrap(), sha256_file(&src).unwrap());
+    assert_eq!(
+        sha256_file(&out.join(name)).unwrap(),
+        sha256_file(&src).unwrap()
+    );
     common::assert_no_leftovers(&out);
 }
 
@@ -262,7 +306,9 @@ async fn coverage_query_reports_written_ranges() {
 
     // 查询覆盖率。
     let mut s = TcpStream::connect(a1).await.unwrap();
-    write_u8(&mut s, trft_core::protocol::frame::T_COVERAGE_QUERY).await.unwrap();
+    write_u8(&mut s, trft_core::protocol::frame::T_COVERAGE_QUERY)
+        .await
+        .unwrap();
     write_all(&mut s, &gid).await.unwrap();
     assert_eq!(read_u8(&mut s).await.unwrap(), 0x01, "会话必须存活");
     let n = {
@@ -279,6 +325,9 @@ async fn coverage_query_reports_written_ranges() {
         let len = u64::from_le_bytes(b[8..].try_into().unwrap());
         ranges.push((off, len));
     }
-    assert_eq!(ranges, vec![(0, 1024 * 1024), (2 * 1024 * 1024, 1024 * 1024)]);
+    assert_eq!(
+        ranges,
+        vec![(0, 1024 * 1024), (2 * 1024 * 1024, 1024 * 1024)]
+    );
     s1.abort();
 }
