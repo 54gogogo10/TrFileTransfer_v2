@@ -12,6 +12,8 @@ toml.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 sha2 = "0.10"
+# UDT 槽位与原 C# 版 0x09 握手互通：PBKDF2-HMAC-SHA1（WireCrypto.cs 同算法）。
+sha1 = "0.10"
 hmac = "0.12"
 pbkdf2 = "0.12"
 aes = "0.8"

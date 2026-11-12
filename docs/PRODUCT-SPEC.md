@@ -45,8 +45,8 @@
 ### 1.3 核心价值主张
 
 1. **完整性优先** —— 每个文件带 SHA-256 并在接收端重算比对；服务端对续传偏移、完成判定拥有权威；对「结果未知却报成功」零容忍。
-2. **免安装单文件** —— 逻辑层 + UI 编译为单个 exe，**无原生库依赖**（QUIC = quinn 纯 Rust、RUDP = 原生 Rust 自研，运行时零提取零注册）；不写注册表（除可选的开机自启）、无服务、无驱动。
-3. **协议谱系完整** —— 同一套线协议跑在四种传输上：TCP（通用）、QUIC（加密 + 指纹钉扎）、RUDP（自研可靠 UDP 流，弱网；曾名 UDT）、裸 UDP 单向（多轮重发 + Reed-Solomon 前向纠错，无回传链路）。
+2. **免安装单文件** —— 逻辑层 + UI 编译为单个 exe，**无原生库依赖**（QUIC = quinn 纯 Rust、RUDP = 原生 Rust 自研、UDT4 = 原生 Rust 复刻 libudt 4.x——与原 C# 版的 udt.dll P/Invoke 不同，运行时零提取零注册）；不写注册表（除可选的开机自启）、无服务、无驱动。
+3. **协议谱系完整** —— 同一套线协议跑在四种传输上：TCP（通用）、QUIC（加密 + 指纹钉扎）、RUDP（自研可靠 UDP 流，弱网；曾名 UDT）、裸 UDP 单向（多轮重发 + Reed-Solomon 前向纠错，无回传链路）；另加第 5 槽位 **UDT**（原生 Rust 复刻 libudt 4.x + C# 方言应用层——与原 C# 版 2.14 直接互传，TECH-STACK §7.30）。
 4. **隐私与可控** —— 数据只在局域网内流动；更新源强制 https；接收侧具备认证、确认、过滤三层控制。
 
 ### 1.4 设计原则（产品工程宪法）
@@ -85,6 +85,7 @@
 | TCP | 可靠字节流 | 有 | 全部支持 | 0x03 / 0x04 / 分块覆盖率续传 | 通用、防火墙友好 |
 | QUIC | QUIC（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定） | 有 | 配对支持；机密性由 TLS 承担；压缩支持 | 同 TCP | 加密传输 / `--pin` 钉扎 |
 | RUDP | 自研可靠 UDP 流（`transfer::rudp`，ARQ+SACK+固定窗口；与 UDT4/任何外部协议不做包级互通，WIRE-PROTOCOL.md §7；曾名 UDT，见 §9.2 更名行） | 有 | 全部支持（线协议同 TCP，0x09 加密可选） | 同 TCP | 高丢包链路 |
+| UDT | 真 UDT4 协议（`transfer::udt` 引擎 + `transfer::cswire` C# 方言应用层；**唯一与原 C# 版 2.14 互通的槽位**——WIRE-PROTOCOL.md §9/§10，TECH-STACK §7.30） | 有 | 单文件/目录/文本收发 + 0x02 并发分块/0x03 断点/0x04 目录同步接收（C# 方言全帧集）；0x09 ECDH 加密（CNG blob + PBKDF2-HMAC-SHA1，与 C# 逐字节互通） | C# 方言（小端、CNG 公钥 blob、裸流 1B ACK） | 与原 C# 版安装互传 |
 | 单向 UDP | 裸 UDP 数据报 | **无** | **不支持**（无握手通道，帮助文案明示） | 「落盘即状态」：重发即续传 | 单向链路、极简接收端 |
 
 **通用传输行为**（四协议共用，除非注明）：
@@ -141,7 +142,7 @@
 
 ### 3.3 接收侧功能
 
-- **四协议标签页**（v2.14+ 三页；UDT/QUIC 拆分后四页，更名批定名 RUDP）：TCP / QUIC / RUDP / UDP 各自独立的绑定地址多选（族通配 + 具体网卡，每勾选地址一个监听器）、端口、**保存目录**（`SaveDirTCP/QUIC/RUDP/UDP`，旧单键 `SaveDir` 首启自动迁移、多页初始同值）；可同时运行、独立启停；标签头 `●` 标记运行态。注：拆分前的「UDT 页」实为 QUIC 槽位（TECH-STACK §7.28）。
+- **五协议标签页**（v2.14+ 三页；UDT/QUIC 拆分后四页（更名批定名 RUDP），UDT 批新增第 5 页）：TCP / QUIC / RUDP / UDT / UDP 各自独立的绑定地址多选（族通配 + 具体网卡，每勾选地址一个监听器）、端口、**保存目录**（`SaveDirTCP/QUIC/RUDP/UDP`，旧单键 `SaveDir` 首启自动迁移、多页初始同值）；可同时运行、独立启停；标签头 `●` 标记运行态。注：拆分前的「UDT 页」实为 QUIC 槽位（TECH-STACK §7.28）。
 - **运行中不锁配置**：某协议启动后仅该页的绑定/端口/目录冻结，其他协议页随时可改。
 - **端口冲突检测**（v2.14+）：启动前逐地址预检——进程内同传输监听（TCP 独立；QUIC/RUDP × 裸 UDP 同承载于 UDP，同端口互斥）+ OS 精确探测（族独立）；冲突弹窗逐地址列出，全被外部进程占用时保留「换下一可用端口」提议。
 - **接收选项**（对话框；目录类选项下次服务器启动生效，有提示）：
@@ -158,7 +159,7 @@
   | 配对码位数 | `PairingLength` | 4–12 位，默认 6 |
 
 - **接收文件管理**：「打开目录」（当前选中标签页的目录）/「最近接收」（内存 100 条）；按日期归档 `AutoArchive`。
-- **设备记忆与发现**：传输成功记入已知设备（`Name|Ip|Port|flags`，上限 10 条）；UDP 广播发现（`0xD1`→`0xD2`，默认端口 45000，响应含 TCP/QUIC/RUDP/需配对标志位（WIRE-PROTOCOL.md §6.2 向后兼容布局），仅 IPv4）；已知设备管理对话框（使用/删除/清空）。
+- **设备记忆与发现**：传输成功记入已知设备（`Name|Ip|Port|flags`，上限 10 条）；UDP 广播发现（`0xD1`→`0xD2`，默认端口 45000，响应含 TCP/QUIC/RUDP/UDT/需配对标志位（WIRE-PROTOCOL.md §6.2 向后兼容布局），仅 IPv4；与 C# 版发现双向兼容——裸 0xD1 探测回 C# 格式应答，C# 0xD2 帧可解析）；已知设备管理对话框（使用/删除/清空）。
 - **统计与历史**：`stats.log` 追加式（>2MB 重写保留末 5000 行）；今日/7 天/累计聚合 + 按设备明细；历史对话框按方向筛选、资源管理器定位、导出 CSV（UTF-8 BOM）；「全部清除」危险按钮双视图同步。
 
 ### 3.4 HTTP 共享
@@ -179,7 +180,7 @@
 | 动词 | 用途 | 关键参数 |
 |------|------|----------|
 | `send` | 发送单文件/文件夹/文本 | `--ip --port [--proto tcp\|quic\|rudp\|udp] --file/--folder/--text [--code] [--limit] [--srcport] [--nocompress] [--noencrypt] [--pin]`；`--pin`（QUIC 证书指纹钉扎）仅 `--proto quic`；单文件首选 0x03 断点续传（失败退避重试 3 次、旧对端自动降级 0x00，规格 §3.2 AutoRetry）；`--chunks 1-8` 走 0x02 并行分块（Unsupported 时回退自动续传）；`--udp` 仅单文件，`--passes 1-5`、`--fec-parity 1-8`、`--nofec` |
-| `recv` | 无人值守接收 | `--port [--out] [--proto tcp\|quic\|rudp\|udp] [--code] [--count N] [--noencrypt]`；TCP/QUIC/RUDP 侧维护接收摘要缓存（0x00/0x01/0x03/0x02 组装免费填充）；`--udp` 起裸 UDP 接收器 |
+| `recv` | 无人值守接收 | `--port [--out] [--proto tcp\|quic\|rudp\|udt\|udp] [--code] [--count N] [--noencrypt]`；TCP/QUIC/RUDP 侧维护接收摘要缓存（0x00/0x01/0x03/0x02 组装免费填充）；`--udp` 起裸 UDP 接收器；`--proto udt` 起 C# 方言 UDT4 接收器 |
 | `sync` | 一次性增量同步（0x04） | `--folder --ip --port [--proto tcp\|udt] [--code] [--limit] [--nocompress]`；位图差分只传差异；稳定会话 ID（(源路径, 目标地址) 派生，大小写/尾斜杠不敏感）与 GUI 同步互相接力；本地删除的文件服务端保留 |
 | `verify` | 文件库校验 | `--dir`；不一致退出码 1 |
 | `update` | 自更新 | `[--url]`（缺省读配置 UpdateUrl）`[--check] [--restart]`；ed25519 签名清单 + 换入前重校验；更新源强制 https（明文仅回环） |
@@ -241,7 +242,7 @@
 
 ### 4.3 版本互通矩阵
 
-`(Rust)` 本实现**与原 C# 版不做互通承诺**（独立实现，线协议帧语义同源但字节布局以 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md) 为准，且不实现 C# 版的 0x07/0x17 旧版加密通道）。互通正确性由自互通矩阵 e2e 钉住（`tests/e2e_interop.rs`）：新旧特性组合 × 降级路径全矩阵覆盖。
+`(Rust)` 本实现**与原 C# 版不做互通承诺——唯一例外：UDT 槽位**（TECH-STACK §7.30：原生 Rust 复刻 libudt 4.x + C# 方言应用层，与 C# 2.14 实机双向对打通过；见 WIRE-PROTOCOL.md §9/§10）。其余槽位（TCP/QUIC/RUDP/单向 UDP）线协议帧语义同源但字节布局以 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md) 为准，且不实现 C# 版的 0x07/0x17 旧版加密通道。自互通正确性由自互通矩阵 e2e 钉住（`tests/e2e_interop.rs`）：新旧特性组合 × 降级路径全矩阵覆盖；UDT 槽位的互通正确性由 `tests/e2e_udt.rs`（C# 方言测试客户端）+ C# 实机对打记录（REVIEW-LOG §7.30 交付记录）钉住。
 
 | 客户端 \ 服务器 | 同版本 | 旧特性集（能力协商未宣告） |
 |-----------------|--------|---------------------------|
@@ -374,6 +375,7 @@
 | QUIC 替代 UDT | **已落地（quinn）** | 原「长期观察项」随重写一并解决——无原生库分发负担，TLS 1.3 + 自签模型 |
 | UDT/QUIC 槽位拆分（2026-11-10） | **已落地** | 原版 C# 的「UDT」模式恢复为自研可靠 UDP 流语义（ARQ+SACK+固定窗口，WIRE-PROTOCOL.md §7，与 UDT4 不做包级互通——§4.3 口径不变）；原「UDT (QUIC)」改名 **QUIC** 独立成第四模式。存量 proto 串 `"udt"`（devices.json / queue.txt）一次性迁移为 `"quic"`；发现帧 0xD2 增 bit3+可选尾部端口（向后兼容） |
 | 自研流更名 **RUDP**（2026-11-12，TECH-STACK §7.29） | **已落地** | 拆分批顶用「UDT」之名会误导互通预期（实现并非 UDT4）——更名 **RUDP**：CLI `--proto rudp`、GUI 标签 RUDP、配置键 `ServerPortRUDP/SaveDirRUDP`（拆分批曾短暂用 `*UDT` 键，未发布无存量）、发现帧 bit3 字段名 `rudp_port`（线布局零变化）、devices/queue 存量 `"udt"` → `"rudp"`（queue 头升 v3，按头分档迁移） |
+| **真 UDT4 槽位与原 C# 版互通**（2026-11-13，TECH-STACK §7.30） | **已落地** | 新增第 5 传输槽位 **UDT**：原生 Rust 复刻 libudt 4.x（两段式 cookie 握手/ACK/NAK/流窗）+ C# 方言应用层（0x09 ECDH/0x05/0x08/0x0A/0x00/0x01/0x02/0x03/0x04/0x06/0x0B + 裸流 1B ACK）；CLI `--proto udt`、GUI 第 5 接收卡与发送选项、配置键 `ServerPortUDT/SaveDirUDT`、发现帧 bit4+`udt_port`（另与 C# 发现双向兼容）、devices.json v2 格式（存量 "udt"→"rudp" 一次性）、queue 头 v4；**C# 2.14 实机双向对打全 SHA-256 一致**（明文/加密/目录/压缩） |
 
 ### 9.3 里程碑
 
@@ -391,7 +393,7 @@
 
 ### 10.1 测试体系
 
-`(Rust)` 当前 **225 项自动化测试**（随版本增长，`cargo test --workspace`；225 = 拆分批新增 e2e_rudp 4 + RUDP 引擎单测 4 + 发现兼容/迁移判别 7，基线 210；更名批零新增）：
+`(Rust)` 当前 **254 项自动化测试**（随版本增长，`cargo test --workspace`；254 = UDT 批新增：引擎单测 6 + codec 6 + C# 方言 KAT 6 + e2e_udt 7 + CLI 跨进程 1 + 发现/devices/queue 判别 4，基线 225——含 §7.29 更名批零新增）：
 
 - 单元（L10N/Config/加密压缩往返/摘要缓存/QR/限速/绑定冲突/分块状态机/UDP 引擎丢包恢复/进度节流…）；
 - 端到端集成（TCP/QUIC/RUDP/UDP 单文件/文件夹/空文件/中文名/并发/续传/分块 0x02 专项/限速时间下界判别/加密回退/配对码锁定/同步 bitmap/互通降级矩阵/HTTP 共享/IPv6/CLI 跨进程真传输/RUDP 丢包注入与握手版本门…，`trft-core/tests/` + `trft-cli/tests/` + `trft-server/tests/web.rs`）；

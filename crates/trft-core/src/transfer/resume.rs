@@ -695,6 +695,10 @@ async fn send_resume_once(
 /// 0x03 自动重试（规格 §3.2 AutoRetry）：首次即走 0x03，退避重试共 3 次尝试，
 /// 跨尝试复用服务端会话续传；旧对端降级 0x00 全量；空文件走 0x00。
 pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Result<()> {
+    // UDT 槽位走 C# 方言 0x00（TECH-STACK §7.30）——断点续传由对端能力决定。
+    if opts.transport == crate::transfer::Transport::Udt {
+        return crate::transfer::cswire::send_file_cs(addr, path, opts).await;
+    }
     let meta = tokio::fs::metadata(path).await?;
     if !meta.is_file() {
         return Err(config_err("路径不是普通文件"));

@@ -26,6 +26,7 @@
 2. **可靠 UDP 流槽位选 QUIC（quinn）** 而非 SRT——无 FFI 负担、生态活跃；配对码体系走应用层（自签证书 + 指纹钉扎）。
 3. **UDT/QUIC 槽位拆分（2026-11-10，详见 §7.28）**——原「UDT」恢复自研可靠 UDP 流语义（原生 Rust，与 UDT4 不做包级互通）；QUIC 独立成第四模式。两槽位均为纯 Rust，零 FFI 口径不变。
 4. **自研流更名 RUDP（2026-11-12，详见 §7.29）**——「UDT」是 UDT4 协议专名，顶名误导互通预期；更名 RUDP（线格式/行为零变化，纯命名 + 迁移链改向）。
+5. **真 UDT4 槽位与原 C# 版互通（2026-11-13，详见 §7.30）**——新增第 5 传输槽位 UDT（原生 Rust 复刻 libudt 4.x + C# 方言应用层），全仓库唯一承诺外部互通的传输；C# 2.14 实机双向对打通过。
 
 ## 2. 分层选型
 
@@ -60,6 +61,7 @@
 |---|---|---|---|
 | TCP（通用） | tokio `TcpStream` + 0x09 加密装饰器（双向确认）+ 0x08 压缩装饰器（认证后协商） | 0x00 单文件 / 0x01 文件夹 / 0x02 分块 / 0x03/0x04 续传 / 0x05 配对 / 0x06 文本 / 0x08/0x09 加密压缩 / 0x0A–0x0C 能力覆盖收尾 / 0x10/0x11/0x1A 应答 | ✅ 已实现（0x07/0x17 旧版加密不实现——无旧版互通承诺） |
 | UDT（可靠 UDP 流） | **RUDP**（原生 Rust 自研：ARQ + SACK + 固定窗口 256×1200B，`transfer::rudp`；**与 UDT4 不做包级互通**——§4.3 口径不变；线格式 WIRE-PROTOCOL.md §7；曾名 UDT，§7.29） | 与 TCP 同帧（0x05/0x09/0x0A/0x08 全继承 TCP 路径） | ✅ 已实现（含丢包注入单测与真 socket e2e） |
+| ——（C# 版独有） | **UDT4**（原生 Rust 复刻 libudt 4.x，`transfer::udt` + `transfer::cswire` C# 方言应用层；**全仓库唯一与原 C# 版互通的槽位**——WIRE-PROTOCOL.md §9/§10；TECH-STACK §7.30） | C# 方言：0x09 ECDH（CNG blob/PBKDF2-HMAC-SHA1/SHA256(X) 材料）/0x05/0x08 deflate/0x0A/0x00/0x01/0x02/0x03/0x04/0x06/0x0B + 裸流 1B ACK | ✅ 已实现（e2e 7 项 + **C# 2.14.0.0 实机双向对打**：明文/加密/目录/压缩全 SHA-256 一致） |
 | QUIC（拆分新增槽位） | **QUIC**（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定；`--pin` 钉扎可选） | 与 TCP 同帧 + 1 字节版本握手 | ✅ 已实现（含全部新帧） |
 | 单向 UDP + RS-FEC | tokio `UdpSocket` + `reed-solomon-erasure` | 20 字节公共头 + 0x01/0x02/0x03/0x04 | ✅ 收发引擎全链路已实现 |
 
@@ -250,6 +252,15 @@
    - **迁移链改向**：devices.json 残余 `"udt"`（= 更名前自研 RUDP；拆分过渡期的 udt→quic 已由 112d940 构建首载写穿）→ `"rudp"`；queue.txt 升 `#trft-queue-v3` 头并**按头分档**——无头（拆分批前旧文件）`"udt"`→`"quic"`、v2/v3 头 `"udt"`→`"rudp"`，v2 读侧升级重写 v3（`migrate_queue_text` 分档判别 + 幂等测试钉住）；
    - **文档**：WIRE-PROTOCOL §7 改题「RUDP 传输」+ 命名沿革注记（线格式零差异）；PRODUCT-SPEC §3.1/§9.2/§12.1/§12.2/§3.6 同步；本批零新增测试（迁移判别改写不增量），全量 225/0 绿。
 
+30. **真 UDT4 槽位：与原 C# 版互通**（2026-11-13）：
+   - **决策**：§7.29 更名 RUDP 让出「UDT」名义；本批兑现互通承诺——新增第 5 传输槽位 **UDT**（`--proto udt` / GUI「UDT」/ `Transport::Udt` / 配置键 `ServerPortUDT`、`SaveDirUDT`——同名键在 112d940 未发布构建短暂存在，§7.29 移除后本次复用），在 UDP 上**原生 Rust 逐字节复刻 vendored libudt 4.x**（`D:\zcode\TrFileTransfer\udt-sdk\udt4\src` 为线格式权威）并在其上实现 C# 方言应用层。**全仓库唯一承诺外部互通的传输**（§4.3 口径修订：RUDP/TCP/QUIC/UDP 仍不与 C# 互通，UDT 槽位专通 C# 2.14）；
+   - **实现分层**：`protocol/udt.rs`（包/握手/NAK 编解码 + seq 回绕算术，头与控制载荷大端、数据载荷 1456B）→ `transfer/udt.rs`（连接引擎：两段式 cookie 握手、ACK/NAK/ACK2/EXP/keepalive/SHUTDOWN、流窗 + 慢启动近似、**单 socket 按 dst socket id 多路复用**——与 RUDP 每连接独立 socket 不同；客户端 `connect_udt`、服务端 `serve_udt_on`）→ `transfer/cswire.rs`（C# 方言：0x09 ECDH/0x05/0x08/0x0A 前奏栈 + 0x00/0x01/0x02/0x03/0x04/0x06/0x0B 全帧集 + 裸流 1B ACK；层叠 encrypt(compress(plain))，ACK 在装饰器之外）；
+   - **互通钉死的实测偏差**（推断 vs .NET 实机）：(1) **CNG blob magic = "ECK1"（0x45434b31）按大端 FourCC 落盘**——"ECC5" 系把 ECDSA 族前缀误推给 ECDH，`to_le_bytes` 反转成 "1KCE"，CNG 拒收 → 对端哑材料 → confirm 失配（实机首跑暴露）；(2) **材料 = SHA256(共享点 X 大端 32B)**（ECDiffieHellmanCng.DeriveKeyMaterial 默认 Hash/SHA256 KDF，dotnet 实机逐字节确认）；(3) PBKDF2-HMAC-SHA1（Rfc2898DeriveBytes）与 AES-256-CTR（计数器 0 起全 16B 大端递增、跨段持续）由 .NET 实机已知答案向量固化进单测；
+   - **Windows 陷阱**：向已关 UDP 端口发包后 ICMP port-unreachable 毒化 socket——下一次 recv 报 WSAECONNRESET(10054)。UDT 服务端/客户端泵把 10054 按瞬态继续（C# 版 DeviceDiscovery.cs 同款问题的同款对策），出包泵 send 失败重试而非退出（否则服务端整体退出 → 后续连接全部静默失败——resume e2e 排障实录）；
+   - **迁移**：devices.json 升 v2 格式（version:2 + devices 数组）——v1 裸数组的存量 "udt"（= 更名前自研 RUDP）首载一次性改写 "rudp"，v2 格式内 "udt" = 真 UDT4 永不改写（判别测试锁定）；队列文件升 **v4** 头：v2/v3 头的 "udt" → "rudp"，v4 起 "udt" = 真 UDT4；发现帧 0xD2 增 **bit4 + 尾部可选 udt_port**（仿 bit3 先例）；另与 C# 发现**双向兼容**（裸 0xD1 探测回 C# 大端格式应答、C# 0xD2 帧按帧长互斥兜底解析——结果只落 udt_port）；
+   - **C# 方言实现要点**（WireProtocol.cs/WireCrypto.cs/WireCompress.cs 逐字对照）：0x03 尾哈希 = **增量哈希**（本次连接发送字节）而非全文件；0x02 组会话 + 0x0B 覆盖查询（区间合并组装，单区间 [0,total) 才判完整——首尾判据会被中段洞骗过）；0x09 前奏 8s 响应窗（客户端）/30s（服务端）；重名 `name_1.ext`；GUID 线上 16B 不透明；认证前 0x08/0x0A 拒收（配对必需的服务端）；
+   - **测试与实机**：引擎单测 6（丢包对偶注入/乱序重排/超界 ACK 断连/窗口限流/SHUTDOWN EOF）+ codec 6 + C# 方言 KAT 6（PBKDF2/AES-CTR .NET 向量、blob、密钥调度对称、净化、区间合并）+ e2e 7（真实 socket：单文件 SHA-256、配对三态、文本/目录、C# 方言测试客户端钉 0x00/0x02 组会话/0x03 续传、版本门 1002）+ CLI 跨进程 --proto udt；**实机对打**（C# 2.14.0.0 exe CLI）：v2→C# 明文/0x09 加密/目录 0x01、C#→v2 明文（含 0x08 压缩协商）/0x09 加密——全部 SHA-256 一致；
+   - **文件清单**：新增 `protocol/udt.rs`、`transfer/udt.rs`、`transfer/cswire.rs`、`tests/e2e_udt.rs`；修改 transfer/mod.rs（Transport::Udt）/sender.rs/folder.rs/resume.rs（Udt 分支转 cswire）/monitor.rs（MonitorProto::Udt）/config.rs（udt 键）/discovery.rs（bit4 + C# 双向兼容）/devices.rs（v2 格式）/trft-cli/main.rs（--proto udt）/trft-gui（Proto::Udt、第 5 接收卡、queue v4、发现应答 5 元组、设备映射 udt_port）/dist 前端（UDT 下拉/接收卡/设置行/端口跟随）；docs 四册。
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

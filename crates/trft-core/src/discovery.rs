@@ -31,6 +31,14 @@ pub const FLAG_QUIC: u8 = 2;
 pub const FLAG_PAIRING: u8 = 4;
 /// bit3：RUDP 槽位（原生自研可靠 UDP 流；曾名 UDT，TECH-STACK §7.29）监听中。
 pub const FLAG_RUDP: u8 = 8;
+/// bit4：UDT4 槽位（真 UDT，与原 C# 版互通，TECH-STACK §7.30）监听中。
+pub const FLAG_UDT: u8 = 16;
+
+/// C# 版发现协议的 flags 位（DeviceDiscovery.cs：bit1=UDT bit2=配对）——
+/// 裸 0xD1 探测的应答与 C# 响应解析共用。
+pub const CS_FLAG_TCP: u8 = 1;
+pub const CS_FLAG_UDT: u8 = 2;
+pub const CS_FLAG_PAIRING: u8 = 4;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredDevice {
@@ -39,6 +47,8 @@ pub struct DiscoveredDevice {
     pub tcp_port: Option<u16>,
     pub quic_port: Option<u16>,
     pub rudp_port: Option<u16>,
+    /// UDT4 槽位端口（bit4）；C# 设备（旧格式解析）仅填此字段。
+    pub udt_port: Option<u16>,
     pub needs_pairing: bool,
 }
 
@@ -67,6 +77,18 @@ pub fn encode_response(
     rudp_port: Option<u16>,
     needs_pairing: bool,
 ) -> Option<Vec<u8>> {
+    encode_response_ext(name, tcp_port, quic_port, rudp_port, None, needs_pairing)
+}
+
+/// 扩展编码（UDT4 槽位追加第四端口字段，仿 bit3/rudp_port 先例）。
+pub fn encode_response_ext(
+    name: &str,
+    tcp_port: Option<u16>,
+    quic_port: Option<u16>,
+    rudp_port: Option<u16>,
+    udt_port: Option<u16>,
+    needs_pairing: bool,
+) -> Option<Vec<u8>> {
     let mut out = vec![FRAME_RESP];
     if !write_name(&mut out, name) {
         return None;
@@ -84,6 +106,9 @@ pub fn encode_response(
     if rudp_port.is_some() {
         flags |= FLAG_RUDP;
     }
+    if udt_port.is_some() {
+        flags |= FLAG_UDT;
+    }
     out.push(flags);
     out.extend_from_slice(&tcp_port.unwrap_or(0).to_le_bytes());
     out.extend_from_slice(&quic_port.unwrap_or(0).to_le_bytes());
@@ -92,6 +117,32 @@ pub fn encode_response(
     if rudp_port.is_some() {
         out.extend_from_slice(&rudp_port.unwrap_or(0).to_le_bytes());
     }
+    // 第四端口字段同理仅在 UDT4 槽位启用时追加。
+    if udt_port.is_some() {
+        out.extend_from_slice(&udt_port.unwrap_or(0).to_le_bytes());
+    }
+    Some(out)
+}
+
+/// C# 版发现应答（DeviceDiscovery.cs BuildResponse 同构）：
+/// `[0xD2][nameLen u8][name][port u16 大端][flags u8]`（bit1=UDT bit2=配对）。
+/// 回给 C# 设备的探测应答——只报 UDT 槽位端口（C# 的 flags bit0=TCP 与端口
+/// 单字段绑定，报 TCP 会把 C# 的 UDT 发送引到错误端口）。
+pub fn encode_cs_response(name: &str, udt_port: u16, needs_pairing: bool) -> Option<Vec<u8>> {
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(5 + name_bytes.len());
+    out.push(FRAME_RESP);
+    out.push(name_bytes.len() as u8);
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(&udt_port.to_be_bytes());
+    let mut flags = CS_FLAG_UDT;
+    if needs_pairing {
+        flags |= CS_FLAG_PAIRING;
+    }
+    out.push(flags);
     Some(out)
 }
 
@@ -105,6 +156,8 @@ pub enum DiscoveryMsg {
         tcp_port: Option<u16>,
         quic_port: Option<u16>,
         rudp_port: Option<u16>,
+        /// UDT4 槽位（bit4 或 C# 旧格式解析填充）。
+        udt_port: Option<u16>,
         needs_pairing: bool,
     },
 }
@@ -124,6 +177,9 @@ fn read_name(buf: &[u8], pos: &mut usize) -> Option<String> {
 }
 
 /// 解码一包；非法/超限/未知帧 → None（fail-closed）。
+/// 0xD2 应答先按 v2 严格格式解析；失败后回退 C# 旧格式（`[0xD2][nameLen u8][name]
+/// [port BE][flags]`，总长恰为 4+nameLen——v2 帧长度恒为 7/9+name，二者互斥，
+/// 不存在误判面）。C# 帧解析结果仅填 `udt_port`（其 bit1 即 UDT 槽位）。
 pub fn decode(buf: &[u8]) -> Option<DiscoveryMsg> {
     if buf.len() > MAX_PACKET {
         return None;
@@ -132,53 +188,105 @@ pub fn decode(buf: &[u8]) -> Option<DiscoveryMsg> {
     let mut pos = 1;
     match frame {
         FRAME_REQ => {
+            // 裸 0xD1 单字节探测 = C# 版请求（无名字段）——本函数仍按 v2 解析，
+            // C# 探测由 serve_answer 直接识别（长度 1 分支）。
             let name = read_name(buf, &mut pos)?;
             Some(DiscoveryMsg::Request { name })
         }
         FRAME_RESP => {
-            let name = read_name(buf, &mut pos)?;
-            let flags = *buf.get(pos)?;
-            pos += 1;
-            if buf.len() < pos + 4 {
-                return None;
+            if let Some(resp) = decode_v2_response(buf) {
+                return Some(resp);
             }
-            let tcp = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
-            let quic = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
-            pos += 4;
-            // 第三端口字段可选（旧版应答无此字段）。
-            let rudp = if flags & FLAG_RUDP != 0 {
-                if buf.len() < pos + 2 {
-                    return None;
-                }
-                Some(u16::from_le_bytes([buf[pos], buf[pos + 1]]))
-            } else {
-                None
-            };
-            Some(DiscoveryMsg::Response {
-                name,
-                tcp_port: if flags & FLAG_TCP != 0 {
-                    Some(tcp)
-                } else {
-                    None
-                },
-                quic_port: if flags & FLAG_QUIC != 0 {
-                    Some(quic)
-                } else {
-                    None
-                },
-                rudp_port: rudp,
-                needs_pairing: flags & FLAG_PAIRING != 0,
-            })
+            decode_cs_response(buf)
         }
         _ => None,
     }
 }
 
-/// 实时 flags 闭包：(TCP 端口, QUIC 端口, UDT 端口, 需配对)。
-pub type DiscoveryFlagsFn =
-    Arc<dyn Fn() -> (Option<u16>, Option<u16>, Option<u16>, bool) + Send + Sync>;
+fn decode_v2_response(buf: &[u8]) -> Option<DiscoveryMsg> {
+    let mut pos = 1;
+    let name = read_name(buf, &mut pos)?;
+    let flags = *buf.get(pos)?;
+    pos += 1;
+    if buf.len() < pos + 4 {
+        return None;
+    }
+    let tcp = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+    let quic = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
+    pos += 4;
+    // 第三端口字段可选（旧版应答无此字段）。
+    let mut rudp = None;
+    if flags & FLAG_RUDP != 0 {
+        if buf.len() < pos + 2 {
+            return None;
+        }
+        rudp = Some(u16::from_le_bytes([buf[pos], buf[pos + 1]]));
+        pos += 2;
+    }
+    // 第四端口字段可选（UDT4 槽位，TECH-STACK §7.30）。
+    let mut udt = None;
+    if flags & FLAG_UDT != 0 {
+        if buf.len() < pos + 2 {
+            return None;
+        }
+        udt = Some(u16::from_le_bytes([buf[pos], buf[pos + 1]]));
+    }
+    Some(DiscoveryMsg::Response {
+        name,
+        tcp_port: if flags & FLAG_TCP != 0 {
+            Some(tcp)
+        } else {
+            None
+        },
+        quic_port: if flags & FLAG_QUIC != 0 {
+            Some(quic)
+        } else {
+            None
+        },
+        rudp_port: rudp,
+        udt_port: udt,
+        needs_pairing: flags & FLAG_PAIRING != 0,
+    })
+}
 
-/// 应答服务：收到 0xD1 → 按实时 flags 回 0xD2（单播）。返回的 closure 供 GUI abort。
+/// C# 旧格式 0xD2 解析（DeviceDiscovery.cs ParseResponse 同构）：
+/// 总长恰为 5+nameLen（与 v2 帧长 8/10/12+name 互斥——无误判面）、port 大端。
+fn decode_cs_response(buf: &[u8]) -> Option<DiscoveryMsg> {
+    if buf.len() < 5 {
+        return None;
+    }
+    let name_len = buf[1] as usize;
+    if buf.len() != 5 + name_len {
+        return None;
+    }
+    let name = String::from_utf8(buf[2..2 + name_len].to_vec()).ok()?;
+    let port = u16::from_be_bytes([buf[2 + name_len], buf[3 + name_len]]);
+    let flags = buf[4 + name_len];
+    if port == 0 {
+        return None;
+    }
+    Some(DiscoveryMsg::Response {
+        name,
+        tcp_port: None,
+        quic_port: None,
+        rudp_port: None,
+        udt_port: if flags & CS_FLAG_UDT != 0 {
+            Some(port)
+        } else {
+            None
+        },
+        needs_pairing: flags & CS_FLAG_PAIRING != 0,
+    })
+}
+
+/// 实时 flags 闭包：(TCP 端口, QUIC 端口, RUDP 端口, UDT4 端口, 需配对)。
+pub type DiscoveryFlagsFn =
+    Arc<dyn Fn() -> (Option<u16>, Option<u16>, Option<u16>, Option<u16>, bool) + Send + Sync>;
+
+/// 应答服务：收到 0xD1 → 按实时 flags 回 0xD2（单播）。
+/// 双协议兼容（TECH-STACK §7.30）：
+/// - 裸 `[0xD1]` 单字节探测 = C# 版请求 → 回 **C# 旧格式**应答（只报 UDT 端口）；
+/// - 带 name 的 v2 探测 → 回 v2 格式（含全部槽位端口）。
 pub async fn serve_answer(
     socket: UdpSocket,
     name: String,
@@ -190,9 +298,20 @@ pub async fn serve_answer(
         if n > MAX_PACKET {
             continue;
         }
+        if n == 1 && buf[0] == FRAME_REQ {
+            // C# 探测（裸 0xD1）→ C# 格式应答。
+            let (tcp, _quic, _rudp, udt, pairing) = flags();
+            if let Some(udt_port) = udt {
+                if let Some(resp) = encode_cs_response(&name, udt_port, pairing) {
+                    let _ = socket.send_to(&resp, peer).await;
+                }
+            }
+            let _ = tcp;
+            continue;
+        }
         if matches!(decode(&buf[..n]), Some(DiscoveryMsg::Request { .. })) {
-            let (tcp, quic, rudp, pairing) = flags();
-            if let Some(resp) = encode_response(&name, tcp, quic, rudp, pairing) {
+            let (tcp, quic, rudp, udt, pairing) = flags();
+            if let Some(resp) = encode_response_ext(&name, tcp, quic, rudp, udt, pairing) {
                 let _ = socket.send_to(&resp, peer).await;
             }
         }
@@ -230,6 +349,7 @@ pub async fn discover_on(
                     tcp_port,
                     quic_port,
                     rudp_port,
+                    udt_port,
                     needs_pairing,
                 }) = decode(&buf[..n])
                 {
@@ -240,6 +360,7 @@ pub async fn discover_on(
                         d.tcp_port = tcp_port;
                         d.quic_port = quic_port;
                         d.rudp_port = rudp_port;
+                        d.udt_port = udt_port;
                         d.needs_pairing = needs_pairing;
                     } else {
                         out.push(DiscoveredDevice {
@@ -248,6 +369,7 @@ pub async fn discover_on(
                             tcp_port,
                             quic_port,
                             rudp_port,
+                            udt_port,
                             needs_pairing,
                         });
                     }
@@ -273,7 +395,9 @@ mod tests {
         let req = encode_request("主机A").unwrap();
         assert!(matches!(decode(&req), Some(DiscoveryMsg::Request { name }) if name == "主机A"));
 
-        let resp = encode_response("PC-1", Some(8080), Some(8081), Some(8082), true).unwrap();
+        let resp =
+            encode_response_ext("PC-1", Some(8080), Some(8081), Some(8082), Some(8083), true)
+                .unwrap();
         assert!(matches!(
             decode(&resp),
             Some(DiscoveryMsg::Response {
@@ -281,6 +405,7 @@ mod tests {
                 tcp_port: Some(8080),
                 quic_port: Some(8081),
                 rudp_port: Some(8082),
+                udt_port: Some(8083),
                 needs_pairing: true,
             }) if name == "PC-1"
         ));
@@ -324,12 +449,95 @@ mod tests {
         }
     }
 
+    /// C# 旧格式 0xD2（裸 nameLen u8 + 大端端口 + bit1=UDT）必须可解析且只落
+    /// udt_port——v2 与 C# 帧长互斥（7/9+name vs 4+name），无误判面（TECH-STACK §7.30）。
+    #[test]
+    fn cs_response_parses_to_udt_port() {
+        // DeviceDiscovery.cs BuildResponse("cs-box", 9090, tcp=false, udt=true, pairing=true)
+        let mut out = vec![0xD2u8, 6];
+        out.extend_from_slice(b"cs-box");
+        out.extend_from_slice(&9090u16.to_be_bytes());
+        out.push(CS_FLAG_UDT | CS_FLAG_PAIRING);
+        match decode(&out) {
+            Some(DiscoveryMsg::Response {
+                name,
+                tcp_port,
+                quic_port,
+                rudp_port,
+                udt_port,
+                needs_pairing,
+            }) => {
+                assert_eq!(name, "cs-box");
+                assert_eq!(tcp_port, None);
+                assert_eq!(quic_port, None);
+                assert_eq!(rudp_port, None);
+                assert_eq!(udt_port, Some(9090), "C# 设备端口必须落 UDT4 槽位");
+                assert!(needs_pairing);
+            }
+            other => panic!("C# 帧必须可解码: {other:?}"),
+        }
+        // 端口为 0 的 C# 帧拒收（防伪造）。
+        let mut zero = vec![0xD2u8, 2];
+        zero.extend_from_slice(b"pc");
+        zero.extend_from_slice(&0u16.to_be_bytes());
+        zero.push(CS_FLAG_UDT);
+        assert!(decode(&zero).is_none());
+        // v2 帧绝不误判为 C# 格式（长度互斥兜底）。
+        let v2 = encode_response("PC-1", Some(8080), None, None, false).unwrap();
+        assert!(matches!(
+            decode(&v2),
+            Some(DiscoveryMsg::Response { tcp_port: Some(8080), .. })
+        ));
+    }
+
+    /// 裸 0xD1（C# 探测）→ C# 格式应答（大端端口 + bit1=UDT）；v2 探测 → v2 格式应答。
+    #[tokio::test]
+    async fn answer_serves_both_probe_dialects() {
+        use std::net::SocketAddr;
+        let ans = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ans_addr: SocketAddr = ans.local_addr().unwrap();
+        let flags: DiscoveryFlagsFn =
+            Arc::new(|| (Some(8080), None, None, Some(9090), true));
+        let server = tokio::spawn(serve_answer(ans, "cs-pc".into(), flags));
+
+        // C# 探测：裸 0xD1 单字节。
+        let cs = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cs.send_to(&[0xD1u8], ans_addr).await.unwrap();
+        let mut buf = vec![0u8; MAX_PACKET];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), cs.recv_from(&mut buf))
+            .await
+            .expect("C# 探测必须有应答")
+            .unwrap();
+        assert_eq!(buf[0], 0xD2);
+        let name_len = buf[1] as usize;
+        assert_eq!(&buf[2..2 + name_len], b"cs-pc");
+        let port = u16::from_be_bytes([buf[2 + name_len], buf[3 + name_len]]);
+        assert_eq!(port, 9090, "C# 应答报 UDT 端口");
+        assert_eq!(buf[4 + name_len], CS_FLAG_UDT | CS_FLAG_PAIRING);
+
+        // v2 探测（带名字）。
+        let v2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        v2.send_to(&encode_request("probe").unwrap(), ans_addr)
+            .await
+            .unwrap();
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(3), v2.recv_from(&mut buf))
+            .await
+            .expect("v2 探测必须有应答")
+            .unwrap();
+        assert!(matches!(
+            decode(&buf[..n2]),
+            Some(DiscoveryMsg::Response { udt_port: Some(9090), needs_pairing: true, .. })
+        ));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn answer_service_replies_to_discovery() {
         // 应答方绑回环端口；发现方单播查询（回环上广播不可靠——与生产广播同代码路径 discover_on）。
         let ans = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ans_addr = ans.local_addr().unwrap();
-        let flags: DiscoveryFlagsFn = Arc::new(|| (Some(8080), Some(8081), Some(8082), true));
+        let flags: DiscoveryFlagsFn =
+            Arc::new(|| (Some(8080), Some(8081), Some(8082), Some(8083), true));
         let server = tokio::spawn(serve_answer(ans, "测试机".into(), flags));
 
         let disc = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -343,6 +551,7 @@ mod tests {
         assert_eq!(d.tcp_port, Some(8080));
         assert_eq!(d.quic_port, Some(8081));
         assert_eq!(d.rudp_port, Some(8082));
+        assert_eq!(d.udt_port, Some(8083));
         assert!(d.needs_pairing);
         assert_eq!(d.ip, "127.0.0.1");
     }

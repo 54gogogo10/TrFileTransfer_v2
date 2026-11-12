@@ -348,7 +348,7 @@ $$("#kind-seg .seg-btn").forEach((b) => {
 $("#send-proto").addEventListener("change", () => {
   // 对齐原版 v2.14「协议↔端口跟随」：切协议时端口框自动跟随对应接收页端口
   // （否则 UDP 发到 TCP 端口是零反馈黑洞）。
-  const key = { tcp: "server_port_tcp", quic: "server_port_quic", rudp: "server_port_rudp", udp: "server_port_udp" }[$("#send-proto").value];
+  const key = { tcp: "server_port_tcp", quic: "server_port_quic", rudp: "server_port_rudp", udt: "server_port_udt", udp: "server_port_udp" }[$("#send-proto").value];
   if (appState && appState.config[key]) $("#send-port").value = appState.config[key];
   updateKindRows();
 });
@@ -726,7 +726,7 @@ function renderDevices(devices) {
       $("#send-ip").value = d.ip;
       $("#send-port").value = d.port;
       // 流式协议记忆名直填（"tcp"/"quic"/"udt" 与发送下拉值一致）；udp 单发无此语义。
-      if (["tcp", "quic", "rudp"].includes(d.proto)) $("#send-proto").value = d.proto;
+      if (["tcp", "quic", "rudp", "udt"].includes(d.proto)) $("#send-proto").value = d.proto;
     });
     const toGroup = document.createElement("button");
     toGroup.className = "btn small";
@@ -1195,7 +1195,7 @@ $("#btn-verify-stop").addEventListener("click", () => invoke("verify_stop"));
 function fillShareDirOptions() {
   const sel = $("#share-dir-sel");
   sel.textContent = "";
-  [["save_dir_tcp", "TCP"], ["save_dir_quic", "QUIC"], ["save_dir_rudp", "RUDP"], ["save_dir_udp", "UDP"]].forEach(([k, label]) => {
+  [["save_dir_tcp", "TCP"], ["save_dir_quic", "QUIC"], ["save_dir_rudp", "RUDP"], ["save_dir_udt", "UDT"], ["save_dir_udp", "UDP"]].forEach(([k, label]) => {
     const opt = document.createElement("option");
     opt.value = k;
     opt.textContent = label + " — " + (appState.config[k] || "");
@@ -1228,11 +1228,11 @@ function fillSettings() {
   $("#version-line").textContent = "v" + appState.version;
   $$(".recv-card").forEach((card) => {
     const key = {
-      tcp: "save_dir_tcp", quic: "save_dir_quic", rudp: "save_dir_rudp", udp: "save_dir_udp",
+      tcp: "save_dir_tcp", quic: "save_dir_quic", rudp: "save_dir_rudp", udt: "save_dir_udt", udp: "save_dir_udp",
     }[card.dataset.proto];
     card.querySelector(".recv-dir").value = c[key] || "";
     card.querySelector(".recv-port").value = {
-      tcp: c.server_port_tcp, quic: c.server_port_quic, rudp: c.server_port_rudp, udp: c.server_port_udp,
+      tcp: c.server_port_tcp, quic: c.server_port_quic, rudp: c.server_port_rudp, udt: c.server_port_udt, udp: c.server_port_udp,
     }[card.dataset.proto];
   });
 }

@@ -385,7 +385,7 @@ pub fn today_component() -> String {
 
 /// 每连接确认一次（规格 §3.3）：首个文件帧前判定；通过后连接内不再重复。
 /// off / 窗口内 / unknown 且已知 → 直接过；其余走确认框，30s 超时或拒绝即失败。
-async fn confirm_once(peer: SocketAddr, opts: &RecvOptions, confirmed: &mut bool) -> Result<()> {
+pub(crate) async fn confirm_once(peer: SocketAddr, opts: &RecvOptions, confirmed: &mut bool) -> Result<()> {
     if *confirmed || opts.confirm_mode == ConfirmMode::Off {
         return Ok(());
     }

@@ -3,7 +3,7 @@
 | 项 | 内容 |
 |------|------|
 | 文档性质 | **字节级协议权威**（产品级语义见 [PRODUCT-SPEC.md](PRODUCT-SPEC.md) §4；实现以 `trft-core::protocol` 与本文为准，二者由判别测试互锁） |
-| 适用范围 | 本 Rust 实现自互通；**与原 C# 版不做互通承诺**（TECH-STACK §4） |
+| 适用范围 | 本 Rust 实现自互通；**与原 C# 版不做互通承诺——唯一例外：UDT 槽位**（§9，与原 C# 2.14 的 libudt 4.x + 其 TCP 同构应用协议互通，TECH-STACK §7.30） |
 | 字节序 | 多字节整数一律**小端（LE）** |
 | 字符串 | UTF-8；`u16 长度 + 字节` 前缀式（下记 `str16`）；路径段以 `/` 分隔 |
 | 抽取基线 | M3'（2026-10-31）：0x00–0x06、0x08–0x0C、0x10/0x11/0x1A 全量落地 |
@@ -242,10 +242,11 @@ PARITY 对旧接收端无需协商（静默忽略）。
 | frame | 1 B | `0xD2` |
 | name_len | 2 B | 应答方本机名字节数 |
 | name | name_len | UTF-8（≤ 64 B） |
-| flags | 1 B | bit0 = TCP 监听中；bit1 = QUIC 监听中；bit2 = 需配对码；bit3 = RUDP 监听中 |
+| flags | 1 B | bit0 = TCP 监听中；bit1 = QUIC 监听中；bit2 = 需配对码；bit3 = RUDP 监听中；bit4 = UDT4 监听中 |
 | tcp_port | 2 B | TCP 监听端口（flags bit0=0 时为 0） |
 | quic_port | 2 B | QUIC 监听端口（flags bit1=0 时为 0） |
 | rudp_port | 2 B | RUDP 监听端口（**可选字段**——仅 flags bit3=1 时存在） |
+| udt_port | 2 B | UDT4 监听端口（**可选字段**——仅 flags bit4=1 时存在） |
 
 - 守卫：整包 > 512 B、name > 64 B、截断/坏帧 → **整包忽略**（fail-closed）。
 - 应答方仅在有流式监听器（TCP/QUIC/RUDP）时运行，flags 实时读取；请求方按应答源 IP 去重。
@@ -254,7 +255,13 @@ PARITY 对旧接收端无需协商（静默忽略）。
   尾部可选端口。②更名批（TECH-STACK §7.29）——bit3 槽位定名 **RUDP**，字段名
   `udt_port` → `rudp_port`（线布局/比特位零变化，纯命名）。旧版解码器读新帧：多出的
   尾部字节不影响其定长读取，其读到的端口即 quic_port——语义与其一致，天然向后兼容；
-  新版解码器对无尾字段的旧帧回 `rudp_port = None`。
+  新版解码器对无尾字段的旧帧回 `rudp_port = None`。③UDT 批（TECH-STACK §7.30）——
+  新增 bit4 + 尾部可选 `udt_port` 字段（真 UDT4 槽位，与 bit3 同一追加先例）。
+- **C# 版双向兼容**（§7.30）：C# 的发现协议与本协议不兼容（裸 `0xD1` 单字节探测；
+  应答 `[0xD2][nameLen u8][name][port 2B **大端**][flags u8]`，bit1=UDT bit2=配对）。
+  本实现双向兼容：应答服务收到**裸 0xD1** → 回 C# 格式（只报 UDT4 端口——其 bit0
+  与端口字段绑定，报 TCP 会引错端口）；v2 解码器对 0xD2 严格解析失败后按 C# 格式
+  解析（帧长互斥：v2 = 8/10/12+name，C# = 5+name——无误判面），结果只落 `udt_port`。
 - 语义锚点：`trft-core::discovery`（编码/解码/发现/应答由单元与回环 e2e 互锁）。
 
 ## 7. RUDP 传输（自研可靠 UDP 流；拆分新增，更名批定名）
@@ -326,3 +333,97 @@ magic "TU"(2B) | ver(1B) = 0x02 | type(1B) | conn_id(u32) | seq(u32) | payload_l
 | 配对码 | 4–12 位数字，PBKDF2-HMAC-SHA256 50k | 规格 §6.1 |
 | 控制读超时 / 载荷读超时 | 30 s / 5 min | 规格 §6.1 |
 | 续传孤儿清理 | 7 天 | 规格 §6.1 |
+
+## 9. UDT4 传输（与原 C# 版互通；TECH-STACK §7.30）
+
+UDT 槽位是**逐字节复刻原 C# 版内嵌 libudt 4.x** 的第二条 UDP 可靠流（与 §7 RUDP
+完全独立、互不相通）。线格式与定时器以 vendored 源码为权威
+（`udt-sdk/udt4/src`——packet.h / channel.cpp / core.cpp / ccc.cpp），本节记录互通
+实现的关键锚点；实机对打以 C# 2.14.0.0 exe CLI 验证（2026-11-13，见 REVIEW-LOG）。
+
+### 9.1 包头（16 B，头与控制载荷一律**大端**，数据载荷原样）
+
+```text
+数据包: [0]=0|seq(31b)  [1]=ff|o|msgno(29b)  [2]=timestamp(µs)  [3]=dst socket id
+控制包: [0]=1|type(15b)|ext(16b) [1]=add.info  [2]=timestamp(µs)  [3]=dst socket id
+```
+
+- 控制类型：0=握手 / 1=keepalive / 2=ACK（轻量 ACK = 4B 载荷仅 cum）/
+  3=NAK / 4=拥塞告警 / 5=SHUTDOWN / 6=ACK2 / 7=消息丢弃 / 8=对端错误。
+- 常量（libudt 默认）：MSS=1500 → UDP 载荷 1472B → 数据载荷 **1456B**；
+  流窗 25600；收缓冲 8192 包；SYN=10ms（ACK 周期）；light-ACK 每 64 包；
+  seq 空间 0..=0x7FFFFFFF 回绕（阈值 0x3FFFFFFF）；ACK 子序列号 0x7FFFFFFF 回绕。
+- NAK 载荷 = 损失列表：单包 1 字；连续 ≥3 包编码为 `(首|0x80000000, 尾)` 两字
+  （差 1 的两包按两个单字）。ACK 载荷 = `[cum, rtt, rttvar, buf]`（可选 +2 字
+  speed/bw），buf = 可用收缓冲包数（下限 2）。
+- 超前 ACK（cum > 已发 seq+1）→ 断连（对端 attack/bug 防线，libudt 同语义）。
+
+### 9.2 握手（两段式，C# 客户端对监听端口）
+
+1. 客户端 → `dst=0`，`CHandShake{ver=4, type=1(STREAM), ISN, MSS=1500,
+   flight=min(收缓冲,流窗)=8192, req=1, id=客户端 socket id, cookie=0, peer_ip}`；
+2. 服务端（监听 socket id）→ **回显请求 + 填 SYN cookie**（req 仍为 1，
+   dst=客户端 id）；
+3. 客户端 → `req=-1` + 挑战 cookie（立即重发，不等 250ms）；
+4. 服务端校验 cookie/版本/IP 过滤 → **新建连接**（新 socket id）：响应
+   `{req=-1, id=服务端新 id, ISN=客户端 ISN（回显——安全校验用）, MSS=min(两端),
+   flight=8192, cookie=回显}`；**服务端发送 seq 从客户端 ISN 起计**（两端同值，
+   libudt 非 rendezvous 语义）。
+- 拒绝 = 回显 + `req=1002`（版本/类型不符、IP 过滤、连接表满）；客户端 250ms
+  重发、30s 超时；已建立连接收到 `req>0` 的重发握手 → 幂等重发响应。
+- 服务端多连接**共享监听 UDP 端口**（按 dst socket id 多路分解 + 对端地址校验），
+  与 §7 RUDP 的每连接独立 socket 不同。
+
+### 9.3 可靠性与拥塞（互通正确性由 ACK/NAK/流窗承担）
+
+- 发送：流窗（对端 ACK 载荷 word3 持续刷新）+ 拥塞窗近似（慢启动倍增、
+  丢包 0.875 收缩、超时重置 16）；重传 = NAK 即发 + 50ms 兜底 + EXP 全量重传；
+  light-ACK 使流窗反向递减。
+- 接收：乱序缓冲 8192 包；NAK 于抬高水位时即席发送（全表）；到达即记入损失表；
+  不规则包长（写批次末段）触发即席 ACK；ACK2 回应 ACK（SYN 节流）供对端测 RTT。
+- EXP：`count×(RTT+4RTTVar)+SYN`（下限 count×300ms）；>16 次且 >5s 无响应 → 断连；
+  空闲 30s 硬超时（对齐原版 UDT_RCVTIMEO/SNDTIMEO 口径）；keepalive 15s 兜底；
+  SHUTDOWN 限次重发（3 次 500ms）。
+- 收尾：任一端 `poll_shutdown`/drop → SHUTDOWN 控制包 → 对端排空后读侧 EOF；
+  无 RST 概念（中止 = 直接关）。
+
+## 10. C# 方言应用层（UDT 槽位专用；与 C# 版 TCP 协议同构）
+
+C# 版 UDT 槽位复用其 TCP 应用协议：**整数一律小端、UTF-8 名、每文件尾随
+32B SHA-256**，与 §3 的 v2 帧布局**不同**（字段顺序/长度编码均异——勿混用）。
+实现在 `trft-core::transfer::cswire`，权威参考 C# 版 `WireProtocol.cs`/
+`WireCrypto.cs`/`WireCompress.cs`。
+
+### 10.1 前奏帧（挂传输类型前，≤8 帧任意顺序；客户端响应读超时 8s）
+
+| 帧 | 线格式 | 应答 | 说明 |
+|---|---|---|---|
+| 0x09 ECDH | `[09][SHA256(code) 32][clientPub 72]` | `[19][st][serverPub 72][confirmS 32]` → 客户端 `[confirmC 32]` | st：0=加密 / 1=码错（拒） / 2=对端未配对（同连接明文续用）；P-256 ECDH，公钥 = CNG ECCPUBLICBLOB 72B `[magic "ECK1" **大端** FourCC][cbKey 32 LE][X 32 BE][Y 32 BE]`；材料 = SHA256(共享点 X)；authKey = SHA256(`"tf-ecdh-auth"`‖材料‖PBKDF2-HMAC-SHA1(code, SHA256(clientPub‖serverPub), 50000, 32B))；confirm = HMAC-SHA256(authKey, 标签‖clientPub‖serverPub)（标签 `s2c-confirm`/`c2s-confirm`）；会话密钥 = SHA256(SHA256(0x00×16‖authKey)‖purpose)（purpose `c2s-enc/c2s-mac/s2c-enc/s2c-mac`）；段 = `[seq i64 LE][len i32 LE][HMAC-SHA256 截 16][AES-256-CTR]`（计数器 0 起全 16B 大端递增、跨段持续、seq 逐方向递增，段 ≤256KB） |
+| 0x05 配对 | `[05][SHA256(code) 32]` | `[15][st]` | st 0=过 / 1=拒；服务端无码时 lenient 接受 |
+| 0x08 压缩 | `[08][随机 16]` | `[18][st]` | st 0=收 / 非 0=婉拒（同连接明文续用，不重连）；**认证前不得协商**（配对必需的服务端拒收） |
+| 0x0A 能力 | `[0A][caps]` | `[1A][0x03]` | bit0=0x04 每文件跳过清单、bit1=0x02 分块组会话 + 0x0B |
+
+层叠顺序：应用字节 → 0x08 deflate 段 → 0x09 加密段 → 裸流；
+**结尾 1 字节 ACK 走裸流**（装饰器之外——UDT 特有）。段格式（0x08）：
+`[len u32 LE | 0x80000000=stored][payload]`（raw deflate，≤64MB）。
+
+### 10.2 传输帧（v2 服务端收发全实现；v2 客户端发 0x00/0x01/0x06）
+
+| 帧 | 布局（LE） | 应答 |
+|---|---|---|
+| 0x00 单文件 | `[00][size i64][nameLen i32][name][data][sha256 32]` | 裸 ACK 0x01/0x00 |
+| 0x01 目录 | `[01][folderNameLen i16][folderName][fileCount i32]` + 每文件 `[size i64][pathLen i16][relPath][data][sha256 32]` | 裸 ACK |
+| 0x02 分块 | `[02][totalSize i64][chunkOffset i64][chunkSize i64][nameLen i32][name][groupFlag u8][groupId 16B ×flag=1][data][sha256 32]` | 每连接裸 ACK（组会话经 0x0A bit1 协商；范围合并组装，完成即 Complete） |
+| 0x03 断点 | `[03][sessionId 16B][totalSize i64][resumeOffset i64][nameLen i32][name][verifyFlag u8][fullHash 32 ×flag=1]` | `[10][offset i64][st]`（0 新传/1 续传/2 已完整/3 全哈希不符——**服务端权威 offset**）；收增量 + **增量 sha256** 后 `[10][total][2]`；0x03 不发裸 ACK |
+| 0x04 目录续传 | `[04][sessionId 16][folderNameLen i16][folderName][fileCount i32][totalBytes i64]` + 清单 `[size i64][pathLen i16][relPath][fullHash 32]` | `[11][resumeFileIndex i64][resumeOffset i64][st]`；bit0 协商时客户端再发每文件声明 + 服务端逐个回 1B（0 跳过/1 发送）；落盘目录 `<folder>.<guid8>` |
+| 0x06 文本 | `[06][len i32][utf8 ≤1MB]` | 裸 ACK |
+| 0x0B 覆盖查询 | `[0B][groupId 16B]` | `[1B][count i32]` + count×`[start i64][endExclusive i64]` |
+
+- 名称/路径净化与 C# 同构：`SafeName`（裸名 + 尾点空格 + 保留名前缀）、
+  `SanitizeRelativePath`（`/` 归一 + `..`/`.`/空段 → `_` + `:` → `_` + 尾点空格）、
+  重名 `name_1.ext`；GUID 在线上为 16B 不透明字节。
+- 帧非法/未知类型：显式拒收；被拒流量经裸 NACK（0x00）快速失败；
+  0x03 的终态应答即判决（无裸 ACK，与 C# 同）。
+- 语义锚点：`trft-core::transfer::udt`（引擎）+ `trft-core::transfer::cswire`
+  （方言；加密原语由 .NET 实机已知答案向量钉死——PBKDF2-HMAC-SHA1 与
+  AES-256-CTR 密钥流逐字节对照 Rfc2898DeriveBytes/AesCtrTransform）。

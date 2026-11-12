@@ -456,3 +456,70 @@ RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 
   （无头 udt→quic 拆分前语义；v2/v3 头 udt→rudp）——`migrate_queue_text` 分档 + 幂等测试；
 - **判别**：e2e_rudp 4 测（真 socket 全链路）+ 引擎单测 + 迁移判别 + 全量 225/0 绿；
   线格式与更名前零差异（WIRE-PROTOCOL §7 命名沿革注记）。
+## 真 UDT4 槽位交付记录（2026-11-13，TECH-STACK §7.30）
+
+**决策**：兑现 §7.29 让出的「UDT」名义——新增第 5 传输槽位 **UDT**，原生 Rust 逐字节
+复刻 vendored libudt 4.x（C# 2.14 内嵌的同款协议），并在其上实现 **C# 方言应用层**。
+全仓库唯一承诺外部互通的传输（§4.3 口径修订：UDT 槽位专通 C# 2.14，其余槽位不变）。
+范围 = 用户拍板的「完整集 + 双向发现兼容」。
+
+**范围**：
+
+- 传输层 `protocol/udt.rs` + `transfer/udt.rs`：16B 包头（头/控制载荷大端、数据载荷
+  1456B）、两段式 cookie 握手（响应 ISN 回显客户端 ISN——libudt 安全校验语义）、
+  ACK（cum/rtt/rttvar/buf 6 词载荷 + 轻量 ACK）/NAK（区间编码）/ACK2/EXP/keepalive/
+  SHUTDOWN、流窗 + 慢启动近似、服务端单 socket 按 dst socket id 多路复用、
+  1002 拒绝门（版本/IP 过滤/连接表满）、30s 空闲 + EXP 断连。
+- 应用层 `transfer/cswire.rs`：0x09 ECDH（CNG blob/PBKDF2-HMAC-SHA1/SHA256(X) 材料/
+  seq 绑定 HMAC 段）/0x05/0x08 deflate/0x0A 前奏栈（8s 响应窗 + 认证前拒收 0x08/0x0A）
+  + 0x00/0x01/0x02 组会话/0x03 断点（服务端权威 offset + 增量哈希）/0x04 目录同步
+  （0x11 + 每文件跳过清单）/0x06/0x0B 覆盖查询；**裸流 1B ACK**（装饰器之外）；
+  C# 净化语义（SafeName/SanitizeRelativePath/name_1.ext）+ v2 确认门/重复策略/
+  进度/统计复用。
+- 集成：`Transport::Udt` 全链（sender/folder/resume 顶层拦截转 cswire、monitor、
+  CLI `--proto udt`、GUI 第 5 接收卡 + 发送选项 + 端口跟随 + 设置行 + dist 前端）、
+  配置键 `server_port_udt`/`save_dir_udt`、发现帧 bit4+udt_port + **C# 双向兼容**、
+  devices.json v2 格式迁移、queue v4 头按头分档迁移。
+
+**迁移**：v1 裸数组 devices.json 的存量 "udt"（= 更名前 RUDP）首载一次性改写
+"rudp" 并升级 v2 格式；v2 格式 "udt" = 真 UDT4 永不改写。queue v2/v3 头 "udt" →
+"rudp"、v4 起 "udt" = 真 UDT4（判别测试锁定两侧语义）。
+
+**实机钉死的偏差**（推断 vs .NET 实机——互通互锁的关键产出）：
+
+1. CNG ECCPUBLICBLOB magic = **"ECK1" 大端 FourCC**（"ECC5" 系 ECDSA 族前缀误推；
+   `to_le_bytes` 反转成 "1KCE" 被 CNG 拒收 → 对端哑材料 → confirm 失配）。
+2. ECDH 材料 = **SHA256(共享点 X 大端 32B)**（DeriveKeyMaterial 默认 Hash/SHA256 KDF）。
+3. PBKDF2-HMAC-SHA1（Rfc2898DeriveBytes）与 AES-256-CTR（计数器全 16B 大端递增、
+   跨段持续）按 .NET 实机向量固化单测。
+4. Windows ICMP 毒化（对已关端口发包 → recv 报 10054）：泵按瞬态继续 + send 重试，
+   否则服务端整体退出（resume e2e 排障实录）。
+5. C# 0x03 尾哈希 = **增量哈希**（本次连接字节），全文件哈希走可选 verifyFlag 字段。
+
+**判别测试**（移除对应实现必须转红）：
+
+- `protocol::udt` 6 项：seq 回绕/包编解码/握手编解码/NAK 区间（含伪造巨型区间
+  内存炸弹防护）/非法包 fail-closed。
+- `transfer::udt` 引擎 6 项：无损双向 + SHUTDOWN EOF、25% 确定性丢包 NAK 重传恢复、
+  提前 drop 的 EOF 语义、重复 DATA 去重 + 乱序重排、超前 ACK 断连、窗口限流。
+- `transfer::cswire` 6 项 KAT：PBKDF2-HMAC-SHA1（RFC 6070 + .NET Rfc2898DeriveBytes
+  双源向量）、AES-256-CTR 密钥流（.NET AesCtrTransform 实机向量）、CNG blob 往返 +
+  魔数、0x09 密钥调度对称（含跨段计数器持续）、C# 净化语义、区间合并。
+- `tests/e2e_udt.rs` 7 项（真实 UDP socket）：单文件 SHA-256 回环、配对三态
+  （无码/错码拒 + 对码 0x09 加密成功）、文本/目录、**C# 方言测试客户端**单文件/
+  0x02 组会话并发分块组装/0x03 断点续传（服务端权威续点）、版本门 1002。
+- CLI 跨进程 `--proto udt` recv×send 真实子进程；发现 C# 双向兼容判别 2 项；
+  devices v2 格式迁移判别（v1 "udt" 改写 + v2 "udt" 保真）；queue v4 分档判别。
+
+**实机对打**（C# 2.14.0.0 exe CLI，2026-11-13，全部 SHA-256 逐字节一致）：v2→C#
+明文单文件（700KB）/0x09 加密单文件/目录 0x01（相对路径 2 文件）；C#→v2 明文单文件
+（含 0x08 压缩协商，47 MB/s）/0x09 加密单文件；重命名策略（interop_1.bin）。
+
+**测试基线**：225 → **254**（+29 = 引擎 6 + codec 6 + KAT 6 + e2e 7 + CLI 1 +
+发现/devices/queue 判别 4，其中 §7.29 批零新增），`cargo test --workspace` 全绿。
+
+**文件清单**：新增 `crates/trft-core/src/protocol/udt.rs`、`src/transfer/udt.rs`、
+`src/transfer/cswire.rs`、`tests/e2e_udt.rs`；修改 `protocol/mod.rs`、`transfer/mod.rs`、
+`transfer/{sender,folder,resume}.rs`、`monitor.rs`、`config.rs`、`discovery.rs`、
+`devices.rs`、`Cargo.toml`（sha1）、`trft-cli/src/main.rs`、`trft-gui/src/{state,commands}.rs`、
+`trft-gui/dist/{app.js,index.html}`、docs 四册。

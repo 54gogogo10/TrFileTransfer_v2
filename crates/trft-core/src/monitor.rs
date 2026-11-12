@@ -46,6 +46,8 @@ pub enum MonitorProto {
     Quic,
     /// RUDP 槽位（原生自研可靠 UDP 流；曾名 UDT，TECH-STACK §7.29）。
     Rudp,
+    /// UDT4 槽位（与原 C# 版互通，TECH-STACK §7.30）。
+    Udt,
     Udp,
 }
 
@@ -241,6 +243,11 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
             MonitorProto::Rudp => {
                 let mut o = cfg.send_opts.clone();
                 o.transport = Transport::Rudp;
+                send_file_auto(cfg.addr, &front, &o).await
+            }
+            MonitorProto::Udt => {
+                let mut o = cfg.send_opts.clone();
+                o.transport = Transport::Udt;
                 send_file_auto(cfg.addr, &front, &o).await
             }
         };

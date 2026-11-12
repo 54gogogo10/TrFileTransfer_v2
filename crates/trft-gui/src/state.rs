@@ -19,6 +19,10 @@ pub enum Proto {
     Quic,
     /// RUDP（自研可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议；曾名 UDT）。
     Rudp,
+    /// UDT4 槽位（真 UDT 协议，与原 C# 版互通——TECH-STACK §7.30）。
+    /// serde 值 "udt" 曾先后是 QUIC（拆分前）/RUDP（拆分后）的旧名；v4 队列头起
+    /// 本变体独占该值（旧头文件由 migrate_queue_text 按头分档迁移）。
+    Udt,
     Udp,
 }
 
@@ -28,6 +32,7 @@ impl Proto {
             Proto::Tcp => "TCP",
             Proto::Quic => "QUIC",
             Proto::Rudp => "RUDP",
+            Proto::Udt => "UDT",
             Proto::Udp => "UDP",
         }
     }

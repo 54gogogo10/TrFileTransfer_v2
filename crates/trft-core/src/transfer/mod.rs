@@ -11,7 +11,11 @@ pub mod receiver;
 pub mod resume;
 pub mod rudp;
 pub mod sender;
+/// UDT4 传输（真 UDT 协议；与原 C# 版 libudt 4.x 互通——TECH-STACK §7.30）。
+pub mod udt;
 pub mod udp;
+/// C# 方言应用层（跑在 `transfer::udt` 之上；帧集与 C# 版 TCP 协议同构）。
+pub mod cswire;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -32,6 +36,9 @@ pub enum Transport {
     /// 曾名「UDT」——因与 UDT4 重名更名，TECH-STACK §7.29）。
     /// 与 TCP 同帧协议，线格式为本仓库自定义（不与 UDT4/任何外部协议互通，规格 §4.3）。
     Rudp,
+    /// UDT4 槽位（原生 Rust 复刻 libudt 4.x，`transfer::udt` + `transfer::cswire`
+    /// C# 方言应用层）——全仓库唯一与原 C# 版互通的槽位（TECH-STACK §7.30）。
+    Udt,
 }
 
 /// 统一读写 trait：客户端栈装箱用（Tcp / Encrypted<Tcp> / QuicStream / Compressed<…>）。

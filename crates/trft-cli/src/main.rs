@@ -42,6 +42,8 @@ enum Proto {
     Quic,
     /// RUDP（自研可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议；曾名 UDT）
     Rudp,
+    /// UDT4（真 UDT 协议，与原 C# 版互通——TECH-STACK §7.30）
+    Udt,
     /// 单向 UDP + FEC（仅单文件，无配对码/加密）
     Udp,
 }
@@ -197,6 +199,7 @@ fn transport_of(p: Proto) -> Transport {
         Proto::Tcp => Transport::Tcp,
         Proto::Quic => Transport::Quic,
         Proto::Rudp => Transport::Rudp,
+        Proto::Udt => Transport::Udt,
         Proto::Udp => Transport::Tcp, // 不会走到：UDP 分支单独处理
     }
 }
@@ -479,6 +482,7 @@ async fn run() -> i32 {
                     let label = match proto {
                         Proto::Tcp => "TCP",
                         Proto::Quic => "QUIC",
+                        Proto::Udt => "UDT",
                         _ => "RUDP",
                     };
                     eprintln!(
@@ -488,6 +492,7 @@ async fn run() -> i32 {
                     let server = match proto {
                         Proto::Quic => tokio::spawn(serve_quic(addr, o)),
                         Proto::Rudp => tokio::spawn(serve_rudp(addr, o)),
+                        Proto::Udt => tokio::spawn(trft_core::transfer::udt::serve_udt(addr, o)),
                         _ => tokio::spawn(receiver::serve(addr, o)),
                     };
                     tokio::select! {

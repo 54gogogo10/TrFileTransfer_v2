@@ -76,6 +76,10 @@ pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> R
 /// 在 0x04 重试轮由服务端逐项核对跳过，半途中断的那个不匹配、必发）。
 /// 用法/配置/认证/不支持类错误重试无意义，直接上抛。
 pub async fn send_folder_auto(addr: SocketAddr, root: &Path, opts: &SendOptions) -> Result<()> {
+    // UDT 槽位走 C# 方言 0x01（TECH-STACK §7.30）。
+    if opts.transport == crate::transfer::Transport::Udt {
+        return crate::transfer::cswire::send_folder_cs(addr, root, opts).await;
+    }
     // 纯内存缓存（不可写路径 → degraded；TTL 0 = 永不过期——只活本次调用）。
     let ephemeral = std::env::temp_dir()
         .join("trft-no-such-ephemeral-dir")
@@ -143,6 +147,8 @@ async fn send_folder_inner(
             let (mut s, _) = connect_stack(addr, opts, StackPlan::default()).await?;
             send_folder_over(&mut s, &root_name, &files, opts, cache).await
         }
+        // UDT 槽位不跑 v2 帧协议（已由 send_folder_auto 顶层拦截）。
+        Transport::Udt => Err(crate::error::Error::Unsupported("UDT 槽位不使用 v2 帧协议".into())),
     };
     match &res {
         Ok((bytes, count)) => {

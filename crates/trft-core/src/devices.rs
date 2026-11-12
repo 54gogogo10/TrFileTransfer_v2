@@ -46,6 +46,16 @@ pub fn devices_path() -> PathBuf {
     crate::config::app_data_dir().join("devices.json")
 }
 
+/// 设备文件格式版本（TECH-STACK §7.30）：v1 = 裸数组（遗留 "udt"=RUDP），
+/// v2 = 版本化对象（"udt"=真 UDT4）。写入恒为当前版本。
+pub const DEVICES_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DevicesFileV2 {
+    version: u32,
+    devices: Vec<DeviceInfo>,
+}
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,31 +109,45 @@ impl std::fmt::Debug for DeviceStore {
 
 impl DeviceStore {
     /// 从磁盘加载（文件缺失/损坏 = 空表——记忆属可再生数据）。
-    /// 存量迁移（TECH-STACK §7.28/§7.29）：拆分批曾把拆分前的 `"udt"`（实为 QUIC
-    /// 槽位）首载改写为 `"quic"` 并写穿；更名批（§7.29）把残余 `"udt"`（= 更名前的
-    /// 自研 RUDP）首载一次性改写为 `"rudp"` 并落盘。两步各自幂等；此后 `"udt"` 不是
-    /// 合法值（外部手改视为 RUDP 处理，展示层字段，误判无害）。
+    /// 文件格式版本化（TECH-STACK §7.30）：
+    /// - v2（当前）：`{"version":2,"devices":[…]}`——`"udt"` 是合法 proto（真 UDT4 槽位）；
+    /// - v1（裸数组，§7.29 及以前）：裸数组 → 存量 `"udt"` 首载一次性改写为 `"rudp"`
+    ///   （旧值语义 = 更名前的自研 RUDP）并写穿为 v2 格式。两代语义靠**文件格式版本**
+    ///   隔离，改写只发生在裸数组文件上，永不误伤新格式的真 UDT 记录。
     pub fn load(path: PathBuf) -> Self {
-        let list: Vec<DeviceInfo> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        let mut migrated = false;
-        let list: Vec<DeviceInfo> = list
-            .into_iter()
-            .map(|mut d| {
-                if d.proto == "udt" {
-                    d.proto = "rudp".into();
-                    migrated = true;
+        let text = std::fs::read_to_string(&path).ok();
+        let is_v2 = text
+            .as_deref()
+            .and_then(|t| serde_json::from_str::<DevicesFileV2>(t).ok())
+            .is_some();
+        let list: Vec<DeviceInfo> = match &text {
+            Some(t) => {
+                // v2 优先。
+                if let Ok(f) = serde_json::from_str::<DevicesFileV2>(t) {
+                    f.devices
+                } else if let Ok(list) = serde_json::from_str::<Vec<DeviceInfo>>(t) {
+                    // v1 裸数组：遗留 "udt" 一次性改写（拆分期 udt→quic 已由 112d940
+                    // 构建首载写穿完成；此处残余 = 更名前的自研 RUDP）。
+                    list.into_iter()
+                        .map(|mut d| {
+                            if d.proto == "udt" {
+                                d.proto = "rudp".into();
+                            }
+                            d
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
                 }
-                d
-            })
-            .collect();
+            }
+            None => Vec::new(),
+        };
         let store = Self {
             inner: Mutex::new(list),
             path: Some(path.clone()),
         };
-        if migrated {
+        // 裸数组文件改写后必须落盘升级为 v2 格式（幂等判据 = 磁盘已是 v2）。
+        if !is_v2 && !store.snapshot().is_empty() {
             store.persist(&store.snapshot());
         }
         store
@@ -139,7 +163,10 @@ impl DeviceStore {
 
     fn persist(&self, list: &[DeviceInfo]) {
         if let Some(p) = &self.path {
-            if let Ok(text) = serde_json::to_string_pretty(list) {
+            if let Ok(text) = serde_json::to_string_pretty(&DevicesFileV2 {
+                version: DEVICES_FORMAT_VERSION,
+                devices: list.to_vec(),
+            }) {
                 let _ = crate::config::atomic_write(p, text.as_bytes());
             }
         }
@@ -312,9 +339,9 @@ mod tests {
         );
     }
 
-    /// 迁移判别（TECH-STACK §7.28/§7.29）：存量 "udt" 首载一次性改写为 "rudp"
-    /// 并落盘（拆分过渡期的 udt→quic 步骤已由 112d940 构建首载写穿完成）；改写后
-    /// 再载入不得二次迁移。
+    /// 迁移判别（TECH-STACK §7.28/§7.29/§7.30）：v1 裸数组里的遗留 "udt"（= 更名前的
+    /// 自研 RUDP）首载一次性改写为 "rudp" 并升级落盘为 v2 格式；改写后再载入不得
+    /// 二次迁移。v2 格式中的 "udt"（真 UDT4）**永不改写**。
     #[test]
     fn legacy_udt_proto_migrates_to_rudp_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -332,9 +359,27 @@ mod tests {
             "存量 udt 必须迁移为 rudp（更名批 §7.29；拆分期 udt→quic 已由前批写穿）"
         );
         drop(st);
-        // 落盘后文件里已是 "rudp"。
+        // 落盘后文件升级为 v2 格式且无 "udt" 残留。
         let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"version\": 2") || text.contains("\"version\":2"), "必须升级为 v2: {text}");
         assert!(text.contains("\"rudp\""), "迁移必须写穿: {text}");
         assert!(!text.contains("\"udt\""));
+
+        // v2 格式中的 "udt"（真 UDT4）永不改写。
+        let v2 = r#"{"version": 2, "devices": [{
+            "name": "cs-box", "ip": "10.0.0.10", "port": 8080,
+            "proto": "udt", "needs_pairing": false, "last_seen": 2,
+            "source": "Discovery"
+        }]}"#;
+        std::fs::write(&p, v2).unwrap();
+        let st2 = DeviceStore::load(p.clone());
+        assert_eq!(
+            st2.snapshot()[0].proto,
+            "udt",
+            "v2 格式的真 UDT4 记录不得被迁移吞掉"
+        );
+        drop(st2);
+        let text2 = std::fs::read_to_string(&p).unwrap();
+        assert!(text2.contains("\"udt\""), "v2 格式保真: {text2}");
     }
 }

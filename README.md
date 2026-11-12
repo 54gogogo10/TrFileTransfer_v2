@@ -2,7 +2,7 @@
 
 **面向局域网的点对点文件传输工具**：单文件免安装、全程 SHA-256 完整性校验，覆盖「日常互传 → 增量备份 → 弱网 / 无回传链路 → 无头自动化」全谱系场景。
 
-> **English** — LAN peer-to-peer file transfer in a single executable: no install, end-to-end SHA-256 verification, four transports (TCP / QUIC / RUDP / one-way UDP + Reed-Solomon FEC), GUI + CLI + web share. This README is primarily in Chinese; see [Docs](#文档) for design documents.
+> **English** — LAN peer-to-peer file transfer in a single executable: no install, end-to-end SHA-256 verification, five transports (TCP / QUIC / RUDP / **UDT (interop with the original C# edition)** / one-way UDP + Reed-Solomon FEC), GUI + CLI + web share. This README is primarily in Chinese; see [Docs](#文档) for design documents.
 
 ---
 
@@ -12,6 +12,7 @@
   - **TCP** —— 通用、防火墙友好；
   - **QUIC**（quinn）—— 传输层 TLS 1.3 加密 + 可选证书指纹钉扎（`--pin`）；
   - **RUDP** —— 原生 Rust 实现的自研可靠 UDP 流（ARQ + SACK 重传），高丢包 Wi-Fi 更稳；线协议与 TCP 完全一致，0x09 加密可选（曾名 UDT——因与 UDT4 协议重名更名，不做包级互通）；
+  - **UDT** —— 原生 Rust 复刻 libudt 4.x + C# 方言应用层，**与原 C# 版 2.14 直接互传**（实机双向验证：明文/0x09 加密/目录/压缩，SHA-256 逐字节一致；TECH-STACK §7.30）；
   - **单向 UDP + Reed-Solomon 前向纠错** —— 只有单向可达的链路也能传（多轮重发 + 纠错，无回传握手）。
 - **完整性优先**：每个文件计算 SHA-256 并在接收端重算比对；半成品先落临时文件、校验通过后原子改名；「结果未知绝不报成功」。
 - **断点续传与增量同步**：单文件 / 文件夹续传；`sync` 差量同步只传差异，本地删除的文件服务端保留（增量备份语义）；GUI 与 CLI 会话互相接力。
@@ -42,7 +43,7 @@
 ### 图形界面
 
 1. 两台电脑都运行 `TrFileTransfer-GUI-0.2.0.exe`；
-2. 接收方在「接收」页启动监听（TCP / QUIC / RUDP / UDP 四协议可同时运行，2×2 卡片各自独立端口与目录），首次启动按提示放行防火墙；
+2. 接收方在「接收」页启动监听（TCP / QUIC / RUDP / UDT / UDP 五协议可同时运行，各卡片独立端口与目录），首次启动按提示放行防火墙；
 3. 发送方在「发送」页拖入文件 / 文件夹，填对方 IP 与端口，点「发送」；
 4. 对方若启用了配对码，发送时填入相同配对码即可（可在设置页生成 4–12 位强配对码）；
 5. 「共享」页一键开启 HTTP 共享，手机扫码即可浏览 / 上传 / 下载。
@@ -76,7 +77,7 @@ trft verify --dir D:\recv
 
 | 服务 | 默认端口 | 说明 |
 |---|---|---|
-| TCP / QUIC / RUDP / 单向 UDP 接收 | 各 8080 | 可独立配置、同时运行（QUIC/RUDP 与单向 UDP 同承载于 UDP，同端口需错开） |
+| TCP / QUIC / RUDP / UDT / 单向 UDP 接收 | 各 8080 | 可独立配置、同时运行（QUIC/RUDP/UDT 与单向 UDP 同承载于 UDP，同端口需错开） |
 | HTTP 共享 | 8090 | 手机浏览器访问 |
 | 设备发现 | 45000/udp | 仅 IPv4 广播 |
 

@@ -271,6 +271,11 @@ pub(crate) async fn connect_stack(
                 Box::new(u)
             }
         }
+        // UDT 槽位不跑 v2 帧协议（C# 方言走 cswire，已在 send_file/send_text/
+        // send_file_auto/send_folder_auto 顶层拦截）——防御性短路。
+        Transport::Udt => {
+            return Err(Error::Unsupported("UDT 槽位不使用 v2 帧协议".into()));
+        }
     };
     let mut caps = 0u8;
     if plan.probe_caps {
@@ -367,6 +372,10 @@ where
 
 pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Result<()> {
     let outcome = crate::progress::Outcome::new(opts.progress.clone());
+    if opts.transport == Transport::Udt {
+        // UDT 槽位走 C# 方言（0x00）——与原 C# 版互通（TECH-STACK §7.30）。
+        return crate::transfer::cswire::send_file_cs(addr, path, opts).await;
+    }
     let res = match opts.transport {
         Transport::Tcp => {
             let s = connect(addr, opts.src_port).await?;
@@ -398,6 +407,7 @@ pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Res
                 stream_send_file(&mut s, path, opts).await
             }
         }
+        Transport::Udt => unreachable!("Udt 分支已在函数顶部拦截"),
     };
     if res.is_ok() {
         outcome.finish();
@@ -407,6 +417,9 @@ pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Res
 
 pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Result<()> {
     let started = std::time::Instant::now();
+    if opts.transport == Transport::Udt {
+        return crate::transfer::cswire::send_text_cs(addr, text, opts).await;
+    }
     let res = match opts.transport {
         Transport::Tcp => {
             let s = connect(addr, opts.src_port).await?;
@@ -437,6 +450,7 @@ pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Resu
                 stream_send_text(&mut s, text).await
             }
         }
+        Transport::Udt => unreachable!("Udt 分支已在函数顶部拦截"),
     };
     if res.is_ok() {
         record_stats(

@@ -5,6 +5,8 @@ pub mod frame;
 pub mod io;
 pub mod rudp;
 pub mod udp;
+/// UDT4 传输线格式（与原 C# 版 libudt 4.x 互通；独立于自研 RUDP）。
+pub mod udt;
 
 /// 协议版本号（单向 UDP 公共头第 1 字节）。
 pub const PROTO_VERSION: u8 = 2;

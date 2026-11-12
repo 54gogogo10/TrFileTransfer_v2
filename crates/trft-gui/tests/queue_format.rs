@@ -185,24 +185,27 @@ fn parse_takes_first_500_and_ignores_junk_lines() {
     );
 }
 
-/// 迁移判别（TECH-STACK §7.28/§7.29）：proto `"udt"` 语义按文件头分档——
-/// 无头（拆分批前）udt=QUIC 槽位 → "quic"；带 v2/v3 头（拆分批后）udt=更名前
-/// 自研 RUDP → "rudp"；v2 头升级 v3；幂等。
+/// 迁移判别（TECH-STACK §7.28/§7.29/§7.30）：proto `"udt"` 语义按文件头分档——
+/// 无头（拆分批前）udt=QUIC 槽位 → "quic"；带 v2/v3 头（拆分批后、真 UDT 批前）
+/// udt=更名前自研 RUDP → "rudp"；v2/v3 头升级 v4；v4 头起 "udt"=真 UDT4
+/// 原样保留（幂等）。
 #[test]
 fn legacy_udt_proto_migrates_by_header() {
     let row_quic = "file|old.bin|192.168.1.5|8080|udt||1024|1|0|2|2|0|50000
 ";
     let row_rudp = "file|new.bin|192.168.1.6|8080|udt||1024|1|0|2|2|0|50000
 ";
+    let row_udt = "file|cs.bin|192.168.1.8|8080|udt||1024|1|0|2|2|0|50000
+";
 
-    // 无头：udt → quic（拆分前语义）+ v3 头。
+    // 无头：udt → quic（拆分前语义）+ v4 头。
     let m1 = migrate_queue_text(row_quic);
     assert!(
         m1.starts_with(
-            "#trft-queue-v3
+            "#trft-queue-v4
 "
         ),
-        "迁移必须加 v3 头"
+        "迁移必须加 v4 头"
     );
     assert_eq!(
         parse_queue_text(&m1)[0]["proto"],
@@ -210,7 +213,7 @@ fn legacy_udt_proto_migrates_by_header() {
         "无头文件的 udt 实为 QUIC 槽位"
     );
 
-    // v2 头：udt → rudp（更名批语义），头升级 v3。
+    // v2 头：udt → rudp（更名批语义），头升级 v4。
     let v2 = format!(
         "#trft-queue-v2
 {}
@@ -220,10 +223,10 @@ fn legacy_udt_proto_migrates_by_header() {
     let m2 = migrate_queue_text(&v2);
     assert!(
         m2.starts_with(
-            "#trft-queue-v3
+            "#trft-queue-v4
 "
         ),
-        "v2 头必须升级 v3"
+        "v2 头必须升级 v4"
     );
     assert_eq!(
         parse_queue_text(&m2)[0]["proto"],
@@ -231,14 +234,40 @@ fn legacy_udt_proto_migrates_by_header() {
         "v2 文件的 udt 为更名前 RUDP"
     );
 
-    // v3 头：原样返回（幂等），udt 不得再被改写。
+    // v3 头：udt → rudp（更名批语义），头升级 v4。
     let v3 = format!(
         "#trft-queue-v3
 {}
 ",
         row_rudp
     );
-    assert_eq!(migrate_queue_text(&v3), v3, "v3 文件幂等");
+    let m3 = migrate_queue_text(&v3);
+    assert!(
+        m3.starts_with(
+            "#trft-queue-v4
+"
+        ),
+        "v3 头必须升级 v4"
+    );
+    assert_eq!(
+        parse_queue_text(&m3)[0]["proto"],
+        "rudp",
+        "v3 文件的 udt 为更名前 RUDP"
+    );
+
+    // v4 头：原样返回（幂等），"udt" = 真 UDT4，不得再被改写。
+    let v4 = format!(
+        "#trft-queue-v4
+{}
+",
+        row_udt
+    );
+    assert_eq!(migrate_queue_text(&v4), v4, "v4 文件幂等");
+    assert_eq!(
+        parse_queue_text(&migrate_queue_text(&v4))[0]["proto"],
+        "udt",
+        "v4 文件的 udt 为真 UDT4 槽位"
+    );
 
     // 无头但 proto 非 udt 不误伤。
     let tcp = "file|a.bin|192.168.1.7|8080|tcp||1024|1|0|2|2|0|50000
