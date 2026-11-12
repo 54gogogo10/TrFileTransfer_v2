@@ -1,4 +1,4 @@
-//! 发送端（TCP / QUIC 共用逻辑）：单文件 0x00（流式哈希 + 完成确认）、文本 0x06、配对 0x05、
+//! 发送端（TCP / QUIC / UDT 共用逻辑）：单文件 0x00（流式哈希 + 完成确认）、文本 0x06、配对 0x05、
 //! 前导栈协商（0x0A 能力探询 + 0x08 压缩，WIRE-PROTOCOL.md §2）。
 //! 失败必须上抛（规格 §7.1），不得把失败吞成成功。
 
@@ -19,7 +19,7 @@ use crate::protocol::io::{
 use crate::transfer::compress::Compressed;
 use crate::transfer::encrypted;
 use crate::transfer::quic::{connect_quic, connect_quic_full, QuicStream};
-use crate::transfer::udt::connect_udt;
+use crate::transfer::rudp::connect_rudp;
 use crate::transfer::{BoxStream, Transport, CHUNK};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -32,11 +32,11 @@ pub struct SendOptions {
     pub pairing_code: Option<String>,
     /// 发送限速（字节/秒，0=不限）。
     pub speed_limit_bps: u64,
-    /// 源端口绑定；绑定失败属可重试错误（规格 §3.1）。仅 TCP。
+    /// 源端口绑定；绑定失败属可重试错误（规格 §3.1）。TCP/UDT 可绑（单向 UDP 无连接语义）。
     pub src_port: Option<u16>,
-    /// 流式通道选择（TCP / QUIC）。
+    /// 流式通道选择（TCP / QUIC / RUDP）。
     pub transport: Transport,
-    /// TCP 走 0x09 加密握手（规格 §5.1 被动窃听防线）；QUIC 由 TLS 承担。
+    /// TCP/UDT 走 0x09 加密握手（规格 §5.1 被动窃听防线）；QUIC 由 TLS 承担。
     pub encrypt: bool,
     /// QUIC 服务端证书 SHA-256 指纹钉扎（可选；None = 信任任何自签证书）。
     pub quic_pin: Option<[u8; 32]>,
@@ -257,10 +257,10 @@ pub(crate) async fn connect_stack(
             let q = connect_quic_auth(addr, opts).await?;
             Box::new(q)
         }
-        Transport::Udt => {
+        Transport::Rudp => {
             // 与 TCP 同口径：可选 0x09 加密 / 明文 0x05 配对
-            // （UDT 无证书体系，无 0x0D 通道绑定）。
-            let u = connect_udt(addr, opts.src_port).await?;
+            // （RUDP 无证书体系，无 0x0D 通道绑定）。
+            let u = connect_rudp(addr, opts.src_port).await?;
             if opts.encrypt {
                 let (enc, _authed) =
                     encrypted::client_wrap(u, opts.pairing_code.as_deref()).await?;
@@ -386,8 +386,8 @@ pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Res
             let mut s = connect_quic_auth(addr, opts).await?;
             stream_send_file(&mut s, path, opts).await
         }
-        Transport::Udt => {
-            let s = connect_udt(addr, opts.src_port).await?;
+        Transport::Rudp => {
+            let s = connect_rudp(addr, opts.src_port).await?;
             if opts.encrypt {
                 let (mut enc, _authed) =
                     encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
@@ -425,8 +425,8 @@ pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Resu
             let mut s = connect_quic_auth(addr, opts).await?;
             stream_send_text(&mut s, text).await
         }
-        Transport::Udt => {
-            let s = connect_udt(addr, opts.src_port).await?;
+        Transport::Rudp => {
+            let s = connect_rudp(addr, opts.src_port).await?;
             if opts.encrypt {
                 let (mut enc, _authed) =
                     encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;

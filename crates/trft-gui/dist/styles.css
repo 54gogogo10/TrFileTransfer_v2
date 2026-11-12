@@ -219,8 +219,8 @@ input[type="text"].invalid, textarea.invalid {
 /* phead 内 pmeta 已有 margin-left:auto 把 meta+按钮组一起推到右侧 */
 .pbtns { display: inline-flex; gap: 4px; }
 
-/* ============ 接收三卡 ============ */
-.recv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+/* ============ 接收四卡（2×2：TCP/QUIC 上排，UDT/UDP 下排——拆分后四槽位） ============ */
+.recv-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .recv-card { min-width: 0; }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dot-off); display: inline-block; transition: background-color 0.2s ease, box-shadow 0.2s ease; }
 .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }

@@ -64,7 +64,7 @@
           <select id="send-proto">
             <option value="tcp">TCP</option>
             <option value="quic">QUIC</option>
-            <option value="udt">UDT</option>
+            <option value="rudp">RUDP</option>
             <option value="udp">UDP (单向)</option>
           </select>
           <input type="text" id="send-srcport" class="mono w80" data-i18n-ph="srcport_ph" placeholder="源端口" />
@@ -129,7 +129,7 @@
           <select id="monitor-proto">
             <option value="tcp">TCP</option>
             <option value="quic">QUIC</option>
-            <option value="udt">UDT</option>
+            <option value="rudp">RUDP</option>
             <option value="udp">UDP (单向)</option>
           </select>
           <input type="text" id="monitor-code" class="mono w120" data-i18n-ph="code_ph_send" placeholder="对端配对码" />
@@ -209,13 +209,13 @@
             <button class="btn recv-open" data-i18n="open_dir">打开目录</button>
           </div>
         </div>
-        <div class="card recv-card" data-proto="udt">
-          <div class="card-title"><span class="dot" id="dot-udt"></span><span>UDT</span></div>
+        <div class="card recv-card" data-proto="rudp">
+          <div class="card-title"><span class="dot" id="dot-rudp"></span><span>RUDP</span></div>
           <div class="row"><label class="lbl" data-i18n="port">端口</label><input type="text" class="mono w80 recv-port" value="8080" /></div>
           <div class="row"><label class="lbl" data-i18n="save_dir">保存目录</label><input type="text" class="grow mono recv-dir" /><button class="btn recv-browse" data-i18n="browse">浏览…</button></div>
                     <div class="row">
             <label class="lbl" data-i18n="bind_addr">绑定地址</label>
-            <div class="dd grow" data-addr-proto="udt">
+            <div class="dd grow" data-addr-proto="rudp">
               <button type="button" class="dd-toggle btn grow"><span class="dd-label"></span><span class="dd-caret">▾</span></button>
               <div class="dd-panel hidden"></div>
             </div>
@@ -268,7 +268,7 @@
           <select id="share-dir-sel">
             <option value="save_dir_tcp">TCP</option>
             <option value="save_dir_quic">QUIC</option>
-            <option value="save_dir_udt">UDT</option>
+            <option value="save_dir_rudp">RUDP</option>
             <option value="save_dir_udp">UDP</option>
           </select>
           <button id="btn-http-start" class="btn primary" data-i18n="share_start">开启共享</button>
@@ -408,8 +408,8 @@
         </div>
         <div class="row">
           <span class="lbl"></span>
-          <span class="lbl-s mono">UDT</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_udt" />
-          <button class="btn cfg-dir-browse" data-key="save_dir_udt" data-i18n="browse">浏览…</button>
+          <span class="lbl-s mono">RUDP</span><input type="text" class="grow mono cfg-dir" data-key="save_dir_rudp" />
+          <button class="btn cfg-dir-browse" data-key="save_dir_rudp" data-i18n="browse">浏览…</button>
         </div>
         <div class="row">
           <span class="lbl"></span>

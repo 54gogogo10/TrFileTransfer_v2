@@ -200,7 +200,7 @@ impl SendRequest {
         match p {
             Proto::Tcp => "tcp",
             Proto::Quic => "quic",
-            Proto::Udt => "udt",
+            Proto::Rudp => "rudp",
             Proto::Udp => "udp",
         }
     }
@@ -233,7 +233,7 @@ impl SendRequest {
         let transport = match self.proto {
             Proto::Tcp | Proto::Udp => Transport::Tcp,
             Proto::Quic => Transport::Quic,
-            Proto::Udt => Transport::Udt,
+            Proto::Rudp => Transport::Rudp,
         };
         if self.proto != Proto::Quic && self.pin.is_some() {
             return Err("指纹钉扎仅用于 QUIC".into());
@@ -726,7 +726,7 @@ pub async fn sync_start(
     let opts = SendOptions {
         transport: match proto {
             Proto::Quic => Transport::Quic,
-            Proto::Udt => Transport::Udt,
+            Proto::Rudp => Transport::Rudp,
             _ => Transport::Tcp,
         },
         pairing_code: code.clone(),
@@ -822,7 +822,7 @@ fn next_free_port(proto: Proto, ip: std::net::IpAddr, port: u16) -> Option<u16> 
         let addr = SocketAddr::new(ip, p);
         let free = match proto {
             // QUIC/UDT 均走 UDP 传输（轮 7 P3：此前误用 TCP 探测）。
-            Proto::Udp | Proto::Quic | Proto::Udt => std::net::UdpSocket::bind(addr).is_ok(),
+            Proto::Udp | Proto::Quic | Proto::Rudp => std::net::UdpSocket::bind(addr).is_ok(),
             Proto::Tcp => std::net::TcpListener::bind(addr).is_ok(),
         };
         if free {
@@ -908,7 +908,7 @@ pub async fn recv_start(
         _ => match proto {
             Proto::Tcp => cfg.save_dir_tcp.clone(),
             Proto::Quic => cfg.save_dir_quic.clone(),
-            Proto::Udt => cfg.save_dir_udt.clone(),
+            Proto::Rudp => cfg.save_dir_rudp.clone(),
             Proto::Udp => cfg.save_dir_udp.clone(),
         },
     };
@@ -1054,15 +1054,15 @@ pub async fn recv_start(
                 Err(e) => failed.push((addr, e.to_string())),
             },
             // UDT 槽位：可靠 UDP 流（与单向 UDP 共用 bind_udp 的逐地址绑定/失败上报）。
-            Proto::Udt => match bind_udp(addr).await {
+            Proto::Rudp => match bind_udp(addr).await {
                 Ok(socket) => {
-                    let o = shared.as_ref().expect("UDT 选项已建").clone();
+                    let o = shared.as_ref().expect("RUDP 选项已建").clone();
                     let a2 = app2.clone();
                     let g2 = gen.clone();
                     let ex = exited.clone();
                     handles.push(tauri::async_runtime::spawn(async move {
-                        let r = trft_core::transfer::udt::serve_udt_on(socket, o).await;
-                        receiver_task_exit(a2, Proto::Udt, g2, ex, r);
+                        let r = trft_core::transfer::rudp::serve_rudp_on(socket, o).await;
+                        receiver_task_exit(a2, Proto::Rudp, g2, ex, r);
                     }));
                     bound.push(addr.to_string());
                 }
@@ -1163,7 +1163,7 @@ pub async fn recv_start(
         let (fw_proto, default_port) = match proto {
             Proto::Tcp => ("TCP", cfg.server_port_tcp),
             // QUIC/UDT 与单向 UDP 均承载于 UDP。
-            Proto::Quic | Proto::Udt | Proto::Udp => ("UDP", cfg.server_port_udp),
+            Proto::Quic | Proto::Rudp | Proto::Udp => ("UDP", cfg.server_port_udp),
         };
         let p = hint_port.unwrap_or(default_port);
         let _ = app.emit(
@@ -1374,7 +1374,7 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
     for d in [
         cfg.save_dir_tcp,
         cfg.save_dir_quic,
-        cfg.save_dir_udt,
+        cfg.save_dir_rudp,
         cfg.save_dir_udp,
     ] {
         if d.is_dir() && !roots.contains(&d) {
@@ -1749,7 +1749,7 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
     let core_proto = match req.proto {
         Proto::Tcp => MonitorProto::Tcp,
         Proto::Quic => MonitorProto::Quic,
-        Proto::Udt => MonitorProto::Udt,
+        Proto::Rudp => MonitorProto::Rudp,
         Proto::Udp => MonitorProto::Udp,
     };
     let (stx, srx) = tokio::sync::watch::channel(false);
@@ -1914,10 +1914,10 @@ pub async fn discover_devices(app: tauri::AppHandle) -> Result<Vec<DeviceInfo>, 
     let devices: Vec<DeviceInfo> = found
         .into_iter()
         .map(|d| {
-            let (port, proto) = match (d.tcp_port, d.quic_port, d.udt_port) {
+            let (port, proto) = match (d.tcp_port, d.quic_port, d.rudp_port) {
                 (Some(p), _, _) => (p, "tcp"),
                 (_, Some(p), _) => (p, "quic"),
-                (_, _, Some(p)) => (p, "udt"),
+                (_, _, Some(p)) => (p, "rudp"),
                 _ => (cfg.discovery_port, "tcp"),
             };
             DeviceInfo {
@@ -1948,7 +1948,7 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
         .lock()
         .expect("接收器锁")
         .keys()
-        .any(|p| matches!(p, Proto::Tcp | Proto::Quic | Proto::Udt));
+        .any(|p| matches!(p, Proto::Tcp | Proto::Quic | Proto::Rudp));
     let mut slot = st.discovery_answer.lock().expect("应答锁");
     let dead = slot
         .as_ref()
@@ -1967,7 +1967,7 @@ fn update_discovery_answer(app: &tauri::AppHandle) {
             let map = st2.receivers.lock().expect("接收器锁");
             let tcp = map.get(&Proto::Tcp).map(|r| r.port);
             let quic = map.get(&Proto::Quic).map(|r| r.port);
-            let udt = map.get(&Proto::Udt).map(|r| r.port);
+            let udt = map.get(&Proto::Rudp).map(|r| r.port);
             let pairing = st2.config().pairing_code.is_some();
             (tcp, quic, udt, pairing)
         });
@@ -2186,36 +2186,39 @@ pub fn parse_queue_text(text: &str) -> Vec<serde_json::Value> {
 }
 
 /// 队列文件格式版本头（UDT/QUIC 拆分引入；`parse_queue_text` 天然跳过此行）。
-const QUEUE_HEADER: &str = "#trft-queue-v2";
+const QUEUE_HEADER: &str = "#trft-queue-v3";
+/// 上一版本头（更名批前的 v2；读侧识别后升级重写）。
+const QUEUE_HEADER_V2: &str = "#trft-queue-v2";
 
-/// 纯迁移（无副作用，供单测）：无版本头 → proto `"udt"`（拆分前=QUIC 槽位）
-/// 改写 `"quic"` 并加版本头；已带版本头原样返回。
+/// 纯迁移（无副作用，供单测）：proto `"udt"` 的语义按文件头分档——
+/// 无版本头（拆分批前的旧文件）→ `"udt"` 实为 QUIC 槽位 → 改写 `"quic"`；
+/// 带 v2/v3 头（拆分批之后）→ `"udt"` 为更名前的自研 RUDP → 改写 `"rudp"`。
+/// v2 头升级为 v3，已带 v3 原样返回（幂等）。
 pub fn migrate_queue_text(text: &str) -> String {
-    if text
-        .lines()
-        .next()
-        .is_some_and(|l| l.trim() == QUEUE_HEADER)
-    {
+    let first = text.lines().next().map(|l| l.trim());
+    if first == Some(QUEUE_HEADER) {
         return text.to_string();
     }
-    let migrated: Vec<String> = text
+    let headered = first == Some(QUEUE_HEADER_V2);
+    let mapped: Vec<String> = text
         .lines()
+        .skip(if headered { 1 } else { 0 })
         .map(|l| {
             let f: Vec<&str> = l.split('|').collect();
             if f.len() >= 9 && f[4] == "udt" {
                 let mut f2 = f.clone();
-                f2[4] = "quic";
+                f2[4] = if headered { "rudp" } else { "quic" };
                 f2.join("|")
             } else {
                 l.to_string()
             }
         })
         .collect();
-    format!("{QUEUE_HEADER}\n{}\n", migrated.join("\n"))
+    format!("{QUEUE_HEADER}\n{}\n", mapped.join("\n"))
 }
 
-/// 存量迁移（TECH-STACK §7.28）：首载一次性改写并写回（带版本头，幂等）；
-/// 此后 `"udt"` 即真 UDT。写回失败不阻塞加载——按内存态迁移结果解析。
+/// 存量迁移（TECH-STACK §7.28/§7.29）：首载一次性改写并写回（带版本头，幂等）。
+/// 写回失败不阻塞加载——按内存态迁移结果解析。
 fn migrate_legacy_queue(text: String) -> String {
     let out = migrate_queue_text(&text);
     if out != text {

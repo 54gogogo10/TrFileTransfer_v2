@@ -2,15 +2,16 @@
 
 **面向局域网的点对点文件传输工具**：单文件免安装、全程 SHA-256 完整性校验，覆盖「日常互传 → 增量备份 → 弱网 / 无回传链路 → 无头自动化」全谱系场景。
 
-> **English** — LAN peer-to-peer file transfer in a single executable: no install, end-to-end SHA-256 verification, three transports (TCP / QUIC / one-way UDP + Reed-Solomon FEC), GUI + CLI + web share. This README is primarily in Chinese; see [Docs](#文档) for design documents.
+> **English** — LAN peer-to-peer file transfer in a single executable: no install, end-to-end SHA-256 verification, four transports (TCP / QUIC / RUDP / one-way UDP + Reed-Solomon FEC), GUI + CLI + web share. This README is primarily in Chinese; see [Docs](#文档) for design documents.
 
 ---
 
 ## 特性
 
-- **三种传输协议**，同一套校验与续传能力：
+- **四种传输协议**，同一套校验与续传能力：
   - **TCP** —— 通用、防火墙友好；
-  - **UDT 槽位（QUIC 实现）** —— 可靠 UDP 流 + 拥塞控制，高丢包 Wi-Fi 更稳，传输层 TLS 1.3 加密；
+  - **QUIC**（quinn）—— 传输层 TLS 1.3 加密 + 可选证书指纹钉扎（`--pin`）；
+  - **RUDP** —— 原生 Rust 实现的自研可靠 UDP 流（ARQ + SACK 重传），高丢包 Wi-Fi 更稳；线协议与 TCP 完全一致，0x09 加密可选（曾名 UDT——因与 UDT4 协议重名更名，不做包级互通）；
   - **单向 UDP + Reed-Solomon 前向纠错** —— 只有单向可达的链路也能传（多轮重发 + 纠错，无回传握手）。
 - **完整性优先**：每个文件计算 SHA-256 并在接收端重算比对；半成品先落临时文件、校验通过后原子改名；「结果未知绝不报成功」。
 - **断点续传与增量同步**：单文件 / 文件夹续传；`sync` 差量同步只传差异，本地删除的文件服务端保留（增量备份语义）；GUI 与 CLI 会话互相接力。
@@ -41,7 +42,7 @@
 ### 图形界面
 
 1. 两台电脑都运行 `TrFileTransfer-GUI-0.2.0.exe`；
-2. 接收方在「接收」页启动监听（TCP / UDT / UDP 三协议可同时运行），首次启动按提示放行防火墙；
+2. 接收方在「接收」页启动监听（TCP / QUIC / RUDP / UDP 四协议可同时运行，2×2 卡片各自独立端口与目录），首次启动按提示放行防火墙；
 3. 发送方在「发送」页拖入文件 / 文件夹，填对方 IP 与端口，点「发送」；
 4. 对方若启用了配对码，发送时填入相同配对码即可（可在设置页生成 4–12 位强配对码）；
 5. 「共享」页一键开启 HTTP 共享，手机扫码即可浏览 / 上传 / 下载。
@@ -62,20 +63,20 @@ trft recv --port 8080 --out D:\recv
 trft recv --udp --out D:\inbox
 trft send --ip 192.168.1.20 --port 8080 --file fw.bin --proto udp --fec-parity 2
 
-:: 并行分块（1-8 路，UDT 弱网链路）
-trft send --ip 192.168.1.20 --port 8080 --file big.zip --proto udt --chunks 4
+:: 并行分块（1-8 路，弱网链路选 RUDP / 加密链路选 QUIC）
+trft send --ip 192.168.1.20 --port 8080 --file big.zip --proto rudp --chunks 4
 
 :: 文件库完整性校验（发现不一致退出码 1，适合挂脚本）
 trft verify --dir D:\recv
 ```
 
-常用参数：`--proto tcp|udt|udp`、`--code <配对码>`、`--limit <KB/s>`、`--srcport <源端口>`、`--noencrypt`、`--nocompress`。完整参数见 `trft send --help`。
+常用参数：`--proto tcp|quic|rudp|udp`、`--code <配对码>`、`--limit <KB/s>`、`--srcport <源端口>`、`--noencrypt`、`--nocompress`。完整参数见 `trft send --help`。
 
 ## 默认端口
 
 | 服务 | 默认端口 | 说明 |
 |---|---|---|
-| TCP / UDT / 单向 UDP 接收 | 各 8080 | 可独立配置、同时运行 |
+| TCP / QUIC / RUDP / 单向 UDP 接收 | 各 8080 | 可独立配置、同时运行（QUIC/RUDP 与单向 UDP 同承载于 UDP，同端口需错开） |
 | HTTP 共享 | 8090 | 手机浏览器访问 |
 | 设备发现 | 45000/udp | 仅 IPv4 广播 |
 
@@ -98,7 +99,7 @@ build.bat                           :: 一键发布：release\ 三件套 + sha25
 
 ## 安全模型
 
-- 传输加密：TCP 默认 ECDH 会话密钥（P-256 + PBKDF2），QUIC 槽位由 TLS 1.3 承担；配对码用于双向认证（恒时比较 + 错误次数按 IP 锁定）。
+- 传输加密：TCP / RUDP 默认 ECDH 会话密钥（0x09，P-256 + PBKDF2），QUIC 由 TLS 1.3 承担（配对启用时强制 0x0D 通道绑定，防双臂中间人）；配对码用于双向认证（恒时比较 + 错误次数按 IP 锁定）。
 - 建议：配对码使用 8 位以上（6 位存在离线爆破空间，加长即可消除）。
 - 明确不做：公网直连 / NAT 穿透 / 中继；单向 UDP 模式的认证与加密（协议上不可行，仅限可信链路使用）。
 

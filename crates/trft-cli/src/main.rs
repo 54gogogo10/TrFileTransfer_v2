@@ -18,9 +18,9 @@ use trft_core::transfer::folder::send_folder_auto;
 use trft_core::transfer::quic::serve_quic;
 use trft_core::transfer::receiver::{self, RecvOptions};
 use trft_core::transfer::resume::{send_file_auto, send_folder_resume, stable_session_id};
+use trft_core::transfer::rudp::serve_rudp;
 use trft_core::transfer::sender::{send_text, SendOptions};
 use trft_core::transfer::udp::{send_file_udp, serve_udp, UdpRecvOptions, UdpSendOptions};
-use trft_core::transfer::udt::serve_udt;
 use trft_core::transfer::Transport;
 
 #[derive(Parser)]
@@ -40,8 +40,8 @@ enum Proto {
     Tcp,
     /// QUIC（quinn：TLS 1.3 + 自签证书 + 0x0D 通道绑定）
     Quic,
-    /// UDT（原生可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议）
-    Udt,
+    /// RUDP（自研可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议；曾名 UDT）
+    Rudp,
     /// 单向 UDP + FEC（仅单文件，无配对码/加密）
     Udp,
 }
@@ -106,7 +106,7 @@ enum Cmd {
         proto: Proto,
         #[arg(long)]
         code: Option<String>,
-        /// 收满 N 个文件（次传输）后退出（仅 tcp/quic/udt）
+        /// 收满 N 个文件（次传输）后退出（仅 tcp/quic/rudp）
         #[arg(long)]
         count: Option<u64>,
         /// 拒绝接收端的传输加密升级（默认接受）
@@ -196,7 +196,7 @@ fn transport_of(p: Proto) -> Transport {
     match p {
         Proto::Tcp => Transport::Tcp,
         Proto::Quic => Transport::Quic,
-        Proto::Udt => Transport::Udt,
+        Proto::Rudp => Transport::Rudp,
         Proto::Udp => Transport::Tcp, // 不会走到：UDP 分支单独处理
     }
 }
@@ -479,7 +479,7 @@ async fn run() -> i32 {
                     let label = match proto {
                         Proto::Tcp => "TCP",
                         Proto::Quic => "QUIC",
-                        _ => "UDT",
+                        _ => "RUDP",
                     };
                     eprintln!(
                         "接收中[{label}]: 0.0.0.0:{port} → {}（Ctrl+C 退出）",
@@ -487,7 +487,7 @@ async fn run() -> i32 {
                     );
                     let server = match proto {
                         Proto::Quic => tokio::spawn(serve_quic(addr, o)),
-                        Proto::Udt => tokio::spawn(serve_udt(addr, o)),
+                        Proto::Rudp => tokio::spawn(serve_rudp(addr, o)),
                         _ => tokio::spawn(receiver::serve(addr, o)),
                     };
                     tokio::select! {

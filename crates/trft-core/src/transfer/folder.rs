@@ -137,9 +137,9 @@ async fn send_folder_inner(
             let mut s = connect_quic_auth(addr, opts).await?;
             send_folder_over(&mut s, &root_name, &files, opts, cache).await
         }
-        Transport::Udt => {
+        Transport::Rudp => {
             // 与 TCP 同口径：0x05 配对 + 可选 0x09 加密在 connect_stack 内接线
-            // （UDT 无证书体系，无 0x0D 通道绑定）。
+            // （RUDP 无证书体系，无 0x0D 通道绑定）。
             let (mut s, _) = connect_stack(addr, opts, StackPlan::default()).await?;
             send_folder_over(&mut s, &root_name, &files, opts, cache).await
         }

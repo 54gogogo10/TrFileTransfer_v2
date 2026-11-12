@@ -1,5 +1,5 @@
 //! TCP 传输（Rust 版线协议）：单文件 0x00、文件夹 0x01、文本 0x06、配对 0x05、
-//! 分块 0x02/0x0B/0x0C、续传 0x03/0x04、压缩 0x08。QUIC 槽位复用同一套帧协议。
+//! 分块 0x02/0x0B/0x0C、续传 0x03/0x04、压缩 0x08。QUIC/RUDP 槽位复用同一套帧协议。
 //! 字节级布局见 docs/WIRE-PROTOCOL.md。
 
 pub mod chunked;
@@ -9,9 +9,9 @@ pub mod folder;
 pub mod quic;
 pub mod receiver;
 pub mod resume;
+pub mod rudp;
 pub mod sender;
 pub mod udp;
-pub mod udt;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -28,10 +28,10 @@ pub enum Transport {
     Tcp,
     /// QUIC（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定）。
     Quic,
-    /// UDT 槽位（原生 Rust：UDP 之上的可靠有序字节流，`transfer::udt`）。
-    /// 对齐原版 C# 的 UDT 模式语义（STREAM 可靠流 + 与 TCP 同帧协议），
-    /// 线格式为本仓库自定义（不与 UDT4 包级互通，规格 §4.3）。
-    Udt,
+    /// RUDP 槽位（原生 Rust：UDP 之上的自研可靠有序字节流，`transfer::rudp`；
+    /// 曾名「UDT」——因与 UDT4 重名更名，TECH-STACK §7.29）。
+    /// 与 TCP 同帧协议，线格式为本仓库自定义（不与 UDT4/任何外部协议互通，规格 §4.3）。
+    Rudp,
 }
 
 /// 统一读写 trait：客户端栈装箱用（Tcp / Encrypted<Tcp> / QuicStream / Compressed<…>）。

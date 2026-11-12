@@ -1,12 +1,14 @@
-//! UDT 槽位（原生 Rust 实现）：UDP 之上的可靠有序字节流，帧协议与 TCP 完全一致
-//! （规格 §4.3：与 UDT4/C# 不做包级互通，线格式见 WIRE-PROTOCOL.md「UDT 传输」）。
+//! RUDP 槽位（原生 Rust 实现）：UDP 之上的自研可靠有序字节流，帧协议与 TCP 完全一致
+//! （规格 §4.3：与 UDT4/C# 不做包级互通，线格式见 WIRE-PROTOCOL.md「RUDP 传输」）。
+//! 历史注记：曾以「UDT」为名——因与 UDT4 协议重名且实现并非 UDT4，2026-11-12 更名
+//! RUDP（TECH-STACK §7.29）；本次更名只改命名，线格式/行为与更名前零差异。
 //!
 //! 结构（对齐 `udp.rs` 的「引擎与 socket 解耦」纪律）：
-//! - `UdtConn`：连接状态机（发送窗口/重传/RTT 估计 + 接收重排/确认），纯逻辑，
+//! - `RudpConn`：连接状态机（发送窗口/重传/RTT 估计 + 接收重排/确认），纯逻辑，
 //!   经 `mpsc` 出入包，可绕过 socket 直接构造对偶做丢包注入单测；
-//! - `UdtStream`：`AsyncRead + AsyncWrite`，帧层零改动复用（0x05 配对、0x09 加密、
+//! - `RudpStream`：`AsyncRead + AsyncWrite`，帧层零改动复用（0x05 配对、0x09 加密、
 //!   分块/续传/文件夹/限速/进度全部继承 TCP 路径）；
-//! - 客户端 `connect_udt`（HS 握手 + 定时重发），服务端 `serve_udt_on`（单 socket
+//! - 客户端 `connect_rudp`（HS 握手 + 定时重发），服务端 `serve_rudp_on`（单 socket
 //!   按 conn_id 多路分解 → `receiver::handle_conn_quic` 复用入口：闸/锁/统计同口径）。
 //!
 //! 与 UDT4 的语义差异（TECH-STACK §3 登记）：固定窗口（64×1200B）无拥塞控制、
@@ -14,7 +16,7 @@
 //! （对齐原版 UDT_RCVTIMEO/UDT_SNDTIMEO）。
 
 use crate::error::{proto, Error, Result};
-use crate::protocol::udt as pw;
+use crate::protocol::rudp as pw;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -29,27 +31,27 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{watch, Semaphore};
 
 /// 在途包窗口（双向，256×1200B ≈ 300KB——RTT 50ms 时吞吐上限 ≈6MB/s）。
-const UDT_WINDOW: usize = 256;
+const RUDP_WINDOW: usize = 256;
 /// 乱序重排缓冲上限（超出丢弃，等发送端重传）。
-const UDT_PENDING_CAP: usize = 4 * UDT_WINDOW;
+const RUDP_PENDING_CAP: usize = 4 * RUDP_WINDOW;
 /// 重传扫描节拍。
-const UDT_TICK: Duration = Duration::from_millis(25);
+const RUDP_TICK: Duration = Duration::from_millis(25);
 /// RTO 下限/上限/初值（ms）。
-const UDT_RTO_MIN_MS: u64 = 200;
-const UDT_RTO_MAX_MS: u64 = 3000;
-const UDT_RTO_INIT_MS: u64 = 400;
+const RUDP_RTO_MIN_MS: u64 = 200;
+const RUDP_RTO_MAX_MS: u64 = 3000;
+const RUDP_RTO_INIT_MS: u64 = 400;
 /// 单包重传上限（超过判链路过差，断连——不无限重传放大）。
-const UDT_RETRIES_MAX: u32 = 12;
+const RUDP_RETRIES_MAX: u32 = 12;
 /// 空闲超时（对齐原版 UDT_RCVTIMEO/UDT_SNDTIMEO = 30 秒）。
-const UDT_IDLE: Duration = Duration::from_secs(30);
+const RUDP_IDLE: Duration = Duration::from_secs(30);
 /// 握手超时（原版 WaitForConnectionReady 30×200ms 同口径上限）。
-const UDT_HS_TIMEOUT: Duration = Duration::from_secs(30);
+const RUDP_HS_TIMEOUT: Duration = Duration::from_secs(30);
 /// 握手重发间隔。
-const UDT_HS_RESEND: Duration = Duration::from_millis(300);
+const RUDP_HS_RESEND: Duration = Duration::from_millis(300);
 /// FIN 等待 FIN_ACK 的兜底（超时按尽力收尾放行，与 TCP `let _ = shutdown()` 同口径）。
-const UDT_FIN_WAIT: Duration = Duration::from_secs(5);
+const RUDP_FIN_WAIT: Duration = Duration::from_secs(5);
 /// 服务端连接表上限。
-const UDT_CONN_CAP: usize = 256;
+const RUDP_CONN_CAP: usize = 256;
 
 type Pkt = (u8, u32, Vec<u8>); // (kind, seq, payload)
 
@@ -81,7 +83,7 @@ impl SendSide {
             sacked: HashSet::new(),
             srtt_ms: 0.0,
             rttvar_ms: 0.0,
-            rto: Duration::from_millis(UDT_RTO_INIT_MS),
+            rto: Duration::from_millis(RUDP_RTO_INIT_MS),
             shutdown_req: false,
             fin_sent_at: None,
         }
@@ -97,7 +99,7 @@ impl SendSide {
             self.srtt_ms = 0.875 * self.srtt_ms + 0.125 * sample_ms;
         }
         let rto = self.srtt_ms + 4.0 * self.rttvar_ms;
-        self.rto = Duration::from_millis((rto as u64).clamp(UDT_RTO_MIN_MS, UDT_RTO_MAX_MS));
+        self.rto = Duration::from_millis((rto as u64).clamp(RUDP_RTO_MIN_MS, RUDP_RTO_MAX_MS));
     }
 }
 
@@ -153,8 +155,8 @@ impl RecvSide {
 /// 已编码出包出口类型（socket 发送任务消费）。
 type OutTx = Mutex<Option<UnboundedSender<(SocketAddr, Vec<u8>)>>>;
 
-/// 连接状态机（收发双侧共享；驱动任务与 `UdtStream` 各持 Arc）。
-pub(crate) struct UdtConn {
+/// 连接状态机（收发双侧共享；驱动任务与 `RudpStream` 各持 Arc）。
+pub(crate) struct RudpConn {
     conn: u32,
     peer: SocketAddr,
     send: Mutex<SendSide>,
@@ -179,7 +181,7 @@ pub(crate) struct UdtConn {
     closed: AtomicBool,
 }
 
-impl UdtConn {
+impl RudpConn {
     fn outbound(&self, pkt: Vec<u8>) {
         let tx = self.out_tx.lock().expect("出包锁").clone();
         if let Some(tx) = tx {
@@ -227,7 +229,7 @@ impl UdtConn {
         let _ = self.out_tx.lock().expect("出包锁").take();
         // 摘除 FIN_ACK 通道：poll_shutdown 的 poll_recv 见 None → 尽力收尾放行。
         let _ = self.fin_tx.lock().expect("fin 锁").take();
-        self.window.add_permits(UDT_WINDOW);
+        self.window.add_permits(RUDP_WINDOW);
     }
 
     fn error(&self) -> Option<String> {
@@ -296,7 +298,7 @@ impl UdtConn {
                 Action::Deliver(eof_now)
             } else {
                 // 乱序：入缓存（超限丢弃，等发送端重传）。
-                if r.pending.len() < UDT_PENDING_CAP {
+                if r.pending.len() < RUDP_PENDING_CAP {
                     r.pending.insert(seq, payload.to_vec());
                 }
                 Action::Gap
@@ -393,7 +395,7 @@ impl UdtConn {
             return;
         }
         let now = Instant::now();
-        if now.duration_since(*self.last_rx.lock().expect("活性锁")) > UDT_IDLE {
+        if now.duration_since(*self.last_rx.lock().expect("活性锁")) > RUDP_IDLE {
             self.close(Some("连接超时（30s 无数据）".into()));
             return;
         }
@@ -406,13 +408,13 @@ impl UdtConn {
                 if now.duration_since(inf.last_send) >= rto {
                     inf.retries += 1;
                     inf.last_send = now;
-                    if inf.retries > UDT_RETRIES_MAX {
+                    if inf.retries > RUDP_RETRIES_MAX {
                         break;
                     }
                     resend.push((*seq, inf.data.clone()));
                 }
             }
-            let too_lossy = s.inflight.values().any(|i| i.retries > UDT_RETRIES_MAX);
+            let too_lossy = s.inflight.values().any(|i| i.retries > RUDP_RETRIES_MAX);
             // FIN 重发只在未被对端确认时进行（fin_flag 置位即停）。
             if !too_lossy
                 && s.shutdown_req
@@ -438,9 +440,9 @@ impl UdtConn {
     }
 }
 
-impl std::fmt::Debug for UdtConn {
+impl std::fmt::Debug for RudpConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UdtConn")
+        f.debug_struct("RudpConn")
             .field("conn", &self.conn)
             .field("peer", &self.peer)
             .finish()
@@ -448,8 +450,8 @@ impl std::fmt::Debug for UdtConn {
 }
 
 /// 可靠流句柄（帧层读写对象；同一连接在本端仅一个实例）。
-pub struct UdtStream {
-    conn: Arc<UdtConn>,
+pub struct RudpStream {
+    conn: Arc<RudpConn>,
     data_rx: UnboundedReceiver<Vec<u8>>,
     /// FIN_ACK 唤醒通道（waker 常驻注册在 Receiver 上；None 消息 = 关闭兜底放行）。
     fin_rx: UnboundedReceiver<()>,
@@ -461,8 +463,8 @@ pub struct UdtStream {
     read_buf: Vec<u8>,
 }
 
-impl UdtStream {
-    /// 等价 TCP 的 shutdown：发 FIN 并等 FIN_ACK（UDT_FIN_WAIT 兜底放行）。
+impl RudpStream {
+    /// 等价 TCP 的 shutdown：发 FIN 并等 FIN_ACK（RUDP_FIN_WAIT 兜底放行）。
     fn do_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         {
@@ -484,7 +486,7 @@ impl UdtStream {
             .lock()
             .expect("发送锁")
             .fin_sent_at
-            .map(|t| t + UDT_FIN_WAIT);
+            .map(|t| t + RUDP_FIN_WAIT);
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Poll::Ready(Ok(())); // 尽力收尾（对端失联等）
         }
@@ -498,7 +500,7 @@ impl UdtStream {
     }
 }
 
-impl AsyncRead for UdtStream {
+impl AsyncRead for RudpStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -529,7 +531,7 @@ impl AsyncRead for UdtStream {
     }
 }
 
-impl AsyncWrite for UdtStream {
+impl AsyncWrite for RudpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -562,7 +564,7 @@ impl AsyncWrite for UdtStream {
             }
         };
         permit.forget(); // 配额由 ACK 归还（add_permits）；close 兜底全量归还
-        let data = buf[..buf.len().min(pw::UDT_PAYLOAD_MAX)].to_vec();
+        let data = buf[..buf.len().min(pw::RUDP_PAYLOAD_MAX)].to_vec();
         let seq;
         {
             let mut s = self.conn.send.lock().expect("发送锁");
@@ -592,7 +594,7 @@ impl AsyncWrite for UdtStream {
     }
 }
 
-impl Drop for UdtStream {
+impl Drop for RudpStream {
     fn drop(&mut self) {
         if self.conn.closed.load(Ordering::SeqCst) {
             return;
@@ -613,8 +615,8 @@ impl Drop for UdtStream {
 /// `build_conn` 返回：(状态机, 流, 入包通道发送端, 出包通道接收端, 驱动句柄)。
 /// 入包通道发送端：客户端交给 socket 泵；服务端交给 demux；测试交给对偶注入。
 type BuiltConn = (
-    Arc<UdtConn>,
-    UdtStream,
+    Arc<RudpConn>,
+    RudpStream,
     UnboundedSender<Pkt>,
     UnboundedReceiver<(SocketAddr, Vec<u8>)>,
     tokio::task::JoinHandle<()>,
@@ -627,12 +629,12 @@ fn build_conn(conn: u32, peer: SocketAddr) -> BuiltConn {
     let (in_tx, in_rx) = unbounded_channel::<Pkt>();
     let (fin_tx, fin_rx) = unbounded_channel::<()>();
     let (err_tx, err_rx) = watch::channel(None);
-    let internal = Arc::new(UdtConn {
+    let internal = Arc::new(RudpConn {
         conn,
         peer,
         send: Mutex::new(SendSide::new()),
         recv: Mutex::new(RecvSide::new()),
-        window: Arc::new(Semaphore::new(UDT_WINDOW)),
+        window: Arc::new(Semaphore::new(RUDP_WINDOW)),
         out_tx: Mutex::new(Some(out_tx)),
         data_tx: Mutex::new(Some(data_tx)),
         fin_flag: AtomicBool::new(false),
@@ -642,7 +644,7 @@ fn build_conn(conn: u32, peer: SocketAddr) -> BuiltConn {
         last_rx: Mutex::new(Instant::now()),
         closed: AtomicBool::new(false),
     });
-    let stream = UdtStream {
+    let stream = RudpStream {
         conn: internal.clone(),
         data_rx,
         fin_rx,
@@ -654,8 +656,8 @@ fn build_conn(conn: u32, peer: SocketAddr) -> BuiltConn {
 }
 
 /// 驱动任务：入包处理 + 节拍扫描；连接关闭或入口关闭后退出并做连接级收尾。
-async fn run_driver(conn: Arc<UdtConn>, mut in_rx: UnboundedReceiver<Pkt>) {
-    let mut ticker = tokio::time::interval(UDT_TICK);
+async fn run_driver(conn: Arc<RudpConn>, mut in_rx: UnboundedReceiver<Pkt>) {
+    let mut ticker = tokio::time::interval(RUDP_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if conn.closed.load(Ordering::SeqCst) {
@@ -702,22 +704,22 @@ fn random_u32() -> u32 {
 
 /// 建立到 `addr` 的 UDT 连接（HS 握手 + 定时重发；30s 超时）。
 /// `src_port`：可选本地端口绑定（与 TCP/QUIC `--srcport` 同口径）。
-pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtStream> {
+pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<RudpStream> {
     let socket = UdpSocket::bind(local_bind_addr(addr, src_port))
         .await
         .map_err(Error::Io)?;
     let conn_id = random_u32();
     let nonce = random_bytes(16);
     let hs = pw::encode(pw::U_P_HS, conn_id, 0, &nonce).map_err(proto)?;
-    let deadline = Instant::now() + UDT_HS_TIMEOUT;
-    let mut buf = vec![0u8; pw::UDT_DATAGRAM_MAX + 64];
+    let deadline = Instant::now() + RUDP_HS_TIMEOUT;
+    let mut buf = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
     loop {
         if Instant::now() >= deadline {
-            return Err(proto("UDT 握手超时（30s）"));
+            return Err(proto("RUDP 握手超时（30s）"));
         }
         let _ = socket.send_to(&hs, addr).await;
         let remain = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remain.min(UDT_HS_RESEND), socket.recv_from(&mut buf)).await {
+        match tokio::time::timeout(remain.min(RUDP_HS_RESEND), socket.recv_from(&mut buf)).await {
             Err(_) => continue, // 重发窗口到点 → 再发 HS
             Ok(Err(e)) => return Err(Error::Io(e)),
             Ok(Ok((n, src))) => {
@@ -730,9 +732,9 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
                         pw::U_P_RST => {
                             let reason = String::from_utf8_lossy(payload);
                             return Err(proto(if reason.is_empty() {
-                                "UDT 连接被对端拒绝".into()
+                                "RUDP 连接被对端拒绝".into()
                             } else {
-                                format!("UDT 连接被对端拒绝: {reason}")
+                                format!("RUDP 连接被对端拒绝: {reason}")
                             }));
                         }
                         _ => continue,
@@ -750,7 +752,7 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
     let pump_sock = socket.clone();
     let pump_in = in_tx;
     tokio::spawn(async move {
-        let mut b = vec![0u8; pw::UDT_DATAGRAM_MAX + 64];
+        let mut b = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
         loop {
             if pump_conn.closed.load(Ordering::SeqCst) {
                 break;
@@ -802,7 +804,7 @@ fn rst_pkt(conn: u32, reason: &str) -> Option<Vec<u8>> {
 }
 
 /// 监听并服务 UDT 连接（socket2 收缓冲 4MB，对齐 `serve_udp` 口径）。
-pub async fn serve_udt(
+pub async fn serve_rudp(
     addr: SocketAddr,
     opts: crate::transfer::receiver::RecvOptions,
 ) -> Result<()> {
@@ -819,11 +821,11 @@ pub async fn serve_udt(
     }
     let std_sock: std::net::UdpSocket = sock.into();
     let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
-    serve_udt_on(socket, opts).await
+    serve_rudp_on(socket, opts).await
 }
 
 /// 在既有 UDP socket 上服务 UDT 连接（GUI 复用 `bind_udp` 的逐地址绑定/失败上报）。
-pub async fn serve_udt_on(
+pub async fn serve_rudp_on(
     socket: UdpSocket,
     opts: crate::transfer::receiver::RecvOptions,
 ) -> Result<()> {
@@ -852,7 +854,7 @@ pub async fn serve_udt_on(
     let mut finished = tokio::task::JoinSet::new();
     // 限量模式「收满即停」信号（demux 阻塞在 recv_from，无人再发包时需主动唤醒）。
     let (stop_tx, mut stop_rx) = watch::channel(false);
-    let mut buf = vec![0u8; pw::UDT_DATAGRAM_MAX + 64];
+    let mut buf = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
     loop {
         // 收割已结束的连接监督任务（摘表已在任务内完成）。
         while finished.try_join_next().is_some() {}
@@ -923,7 +925,7 @@ pub async fn serve_udt_on(
                 match t.get(&h.conn) {
                     Some(e) if e.peer == src => HsRoute::Dup,
                     Some(_) => HsRoute::Ignore, // conn 冲突（他端占用）→ 忽略
-                    None if t.len() >= UDT_CONN_CAP => HsRoute::CapFull,
+                    None if t.len() >= RUDP_CONN_CAP => HsRoute::CapFull,
                     None => HsRoute::Proceed,
                 }
             };
@@ -1008,7 +1010,7 @@ mod tests {
 
     /// 绕过 socket 的对偶装配：两条连接的出入包直接经转发任务对接。
     /// `lossy = true` 时按确定性伪随机序列丢弃约 25% 的包（重传路径注入）。
-    async fn pair(lossy: bool) -> (UdtStream, UdtStream) {
+    async fn pair(lossy: bool) -> (RudpStream, RudpStream) {
         let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
         let (c_conn, cs, c_in, mut c_out, c_drv) = build_conn(1, peer_s);

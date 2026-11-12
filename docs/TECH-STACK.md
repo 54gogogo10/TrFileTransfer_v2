@@ -15,7 +15,7 @@
 | 规格约束 | 推导出的技术要求 |
 |---|---|
 | 单文件免安装、无服务无驱动（§1.3） | 三平台自包含单二进制，≤ 数十 MB |
-| 自定义二进制线协议 + 三种传输（§3.1/§4） | 精细 socket 控制，无 GC 抖动的吞吐稳定性 |
+| 自定义二进制线协议 + 四种传输（§3.1/§4；拆分后 TCP/QUIC/RUDP/单向 UDP） | 精细 socket 控制，无 GC 抖动的吞吐稳定性 |
 | 跨平台桌面 GUI + 托盘 + 主题 + 双语（§3.7） | WebView 系 GUI 框架，平台集成为插件点 |
 | 内嵌加固 HTTP 服务器 + 手机浏览器（§3.4） | 内嵌 HTTP 服务，移动端零原生 App |
 | 内存封顶设计点（§6.2） | 可静态钉住内存边界的语言 |
@@ -24,6 +24,8 @@
 
 1. **Win7 支持延后**——主分支走 Tauri 2 / WebView2，不背 Win7 包袱；Win7 需求明确后开独立分支处理（预案见 §5）。
 2. **可靠 UDP 流槽位选 QUIC（quinn）** 而非 SRT——无 FFI 负担、生态活跃；配对码体系走应用层（自签证书 + 指纹钉扎）。
+3. **UDT/QUIC 槽位拆分（2026-11-10，详见 §7.28）**——原「UDT」恢复自研可靠 UDP 流语义（原生 Rust，与 UDT4 不做包级互通）；QUIC 独立成第四模式。两槽位均为纯 Rust，零 FFI 口径不变。
+4. **自研流更名 RUDP（2026-11-12，详见 §7.29）**——「UDT」是 UDT4 协议专名，顶名误导互通预期；更名 RUDP（线格式/行为零变化，纯命名 + 迁移链改向）。
 
 ## 2. 分层选型
 
@@ -52,12 +54,12 @@
 
 ## 3. 传输槽位映射
 
-规格 §3.1 的四种传输（UDT/QUIC 槽位拆分，2026-11-10——原「UDT」槽位恢复 UDT 语义，QUIC 独立成模式）→ 本实现的对应关系：
+规格 §3.1 的四种传输（UDT/QUIC 槽位拆分 2026-11-10；自研流曾名 UDT，2026-11-12 更名 RUDP，§7.29）→ 本实现的对应关系：
 
 | 规格协议 | 本实现 | 线协议帧 | 状态 |
 |---|---|---|---|
 | TCP（通用） | tokio `TcpStream` + 0x09 加密装饰器（双向确认）+ 0x08 压缩装饰器（认证后协商） | 0x00 单文件 / 0x01 文件夹 / 0x02 分块 / 0x03/0x04 续传 / 0x05 配对 / 0x06 文本 / 0x08/0x09 加密压缩 / 0x0A–0x0C 能力覆盖收尾 / 0x10/0x11/0x1A 应答 | ✅ 已实现（0x07/0x17 旧版加密不实现——无旧版互通承诺） |
-| UDT（可靠 UDP 流） | **UDT**（原生 Rust 自研：ARQ + SACK + 固定窗口 256×1200B，`transfer::udt`；**与 UDT4 不做包级互通**——§4.3 口径不变；线格式 WIRE-PROTOCOL.md §7） | 与 TCP 同帧（0x05/0x09/0x0A/0x08 全继承 TCP 路径） | ✅ 已实现（含丢包注入单测与真 socket e2e） |
+| UDT（可靠 UDP 流） | **RUDP**（原生 Rust 自研：ARQ + SACK + 固定窗口 256×1200B，`transfer::rudp`；**与 UDT4 不做包级互通**——§4.3 口径不变；线格式 WIRE-PROTOCOL.md §7；曾名 UDT，§7.29） | 与 TCP 同帧（0x05/0x09/0x0A/0x08 全继承 TCP 路径） | ✅ 已实现（含丢包注入单测与真 socket e2e） |
 | QUIC（拆分新增槽位） | **QUIC**（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定；`--pin` 钉扎可选） | 与 TCP 同帧 + 1 字节版本握手 | ✅ 已实现（含全部新帧） |
 | 单向 UDP + RS-FEC | tokio `UdpSocket` + `reed-solomon-erasure` | 20 字节公共头 + 0x01/0x02/0x03/0x04 | ✅ 收发引擎全链路已实现 |
 
@@ -242,6 +244,11 @@
    - **实现坑登记（本轮排障实录）**：(1) tokio `Notify::notified()` future 逐 poll 重建、**drop 即从等待队列注销**——`notify_waiters` 丢唤醒致 shutdown 永挂，FIN_ACK 改走 mpsc 通道（waker 挂 Receiver 上常驻存活）；(2) `watch::Sender::send` 在**无接收者时静默失败且不存值**——`error()` 所在对象必须持有 `err_rx`，否则 RST/超时被误读为干净 EOF（「结果未知 ≠ 成功」红线）；(3) current-thread runtime 上 `recv_from/recv` 有积压即同步 Ready——demux/泵/驱动循环**必须逐包 `yield_now()`**，否则互相饿死（loopback 上表现为 ~55KB/s 限速与偶发重传超限）；(4) std::sync::Mutex 不可重入——同语句两个临时 guard 同锁 = 死锁；
    - **性能登记**：loopback 实测 ~85KB/s（1MB 真传输）——每数据包跨 ~8 次任务调度 + Windows socket 事件唤醒（每包 ms 级）为主因；**优化项登记**（后续批次）：ACK 合批、批量收发（一次事件多包收集）、应用写聚合；真实高 RTT 链路上限由窗口给出（256×1200B/RTT，50ms ≈ 6MB/s）；
    - **测试**：`tests/e2e_udt.rs`（真 socket：单文件 SHA-256 一致、配对门三态、0x09 加密路径、握手版本门 fail-closed）+ 引擎单测（对偶注入：无损双向+FIN/EOF、25% 丢包重传恢复、RST 传播、重复 DATA 不重复投递）+ 发现帧新旧兼容 + devices 迁移幂等判别；全量回归绿。
+29. **自研可靠 UDP 流更名 RUDP**（2026-11-12，用户拍板：「UDT」是 UDT4 协议专名，顶名误导互通预期）：
+   - **更名范围**：`Transport::Udt`→`Rudp`、`MonitorProto::Udt`→`Rudp`、模块 `transfer/udt.rs`+`protocol/udt.rs`→`rudp.rs`（git mv 保史）、`connect_rudp`/`serve_rudp[_on]`/`RudpConn`/`RudpStream`、常量 `UDT_*`→`RUDP_*`（`U_P_*` 包类型前缀保留——"U"=UDP，中性）；错误串「UDT 握手超时」等→RUDP；CLI `--proto udt`→`rudp`；GUI serde 值 `"udt"`→`"rudp"`、标签/接收卡/设置目录行/下拉全改；发现帧 `FLAG_UDT`→`FLAG_RUDP`（线值 8 不变）、`DiscoveredDevice.udt_port`→`rudp_port`——**线格式/比特位零变化，纯命名**；
+   - **配置键**：拆分批曾新增 `server_port_udt`/`save_dir_udt`——更名批改 `server_port_rudp`/`save_dir_rudp`（两键仅存在于未发布的 112d940 构建本机，无存量用户，直接改名不做别名）；
+   - **迁移链改向**：devices.json 残余 `"udt"`（= 更名前自研 RUDP；拆分过渡期的 udt→quic 已由 112d940 构建首载写穿）→ `"rudp"`；queue.txt 升 `#trft-queue-v3` 头并**按头分档**——无头（拆分批前旧文件）`"udt"`→`"quic"`、v2/v3 头 `"udt"`→`"rudp"`，v2 读侧升级重写 v3（`migrate_queue_text` 分档判别 + 幂等测试钉住）；
+   - **文档**：WIRE-PROTOCOL §7 改题「RUDP 传输」+ 命名沿革注记（线格式零差异）；PRODUCT-SPEC §3.1/§9.2/§12.1/§12.2/§3.6 同步；本批零新增测试（迁移判别改写不增量），全量 225/0 绿。
 
 ## 8. 记录在案的否决项
 

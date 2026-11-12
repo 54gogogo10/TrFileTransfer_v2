@@ -99,8 +99,10 @@ impl std::fmt::Debug for DeviceStore {
 
 impl DeviceStore {
     /// 从磁盘加载（文件缺失/损坏 = 空表——记忆属可再生数据）。
-    /// 存量迁移（TECH-STACK §7.28）：UDT/QUIC 槽位拆分前写入的 `"udt"` 全部实为
-    /// QUIC 槽位 → 首次加载一次性改写为 `"quic"` 并落盘；此后 `"udt"` 即真 UDT。
+    /// 存量迁移（TECH-STACK §7.28/§7.29）：拆分批曾把拆分前的 `"udt"`（实为 QUIC
+    /// 槽位）首载改写为 `"quic"` 并写穿；更名批（§7.29）把残余 `"udt"`（= 更名前的
+    /// 自研 RUDP）首载一次性改写为 `"rudp"` 并落盘。两步各自幂等；此后 `"udt"` 不是
+    /// 合法值（外部手改视为 RUDP 处理，展示层字段，误判无害）。
     pub fn load(path: PathBuf) -> Self {
         let list: Vec<DeviceInfo> = std::fs::read_to_string(&path)
             .ok()
@@ -111,7 +113,7 @@ impl DeviceStore {
             .into_iter()
             .map(|mut d| {
                 if d.proto == "udt" {
-                    d.proto = "quic".into();
+                    d.proto = "rudp".into();
                     migrated = true;
                 }
                 d
@@ -310,10 +312,11 @@ mod tests {
         );
     }
 
-    /// 拆分迁移判别（TECH-STACK §7.28）：存量 "udt"（=QUIC 槽位）首载一次性改写
-    /// 为 "quic" 并落盘；改写后再载入不得二次迁移（"udt" 即真 UDT）。
+    /// 迁移判别（TECH-STACK §7.28/§7.29）：存量 "udt" 首载一次性改写为 "rudp"
+    /// 并落盘（拆分过渡期的 udt→quic 步骤已由 112d940 构建首载写穿完成）；改写后
+    /// 再载入不得二次迁移。
     #[test]
-    fn legacy_udt_proto_migrates_to_quic_once() {
+    fn legacy_udt_proto_migrates_to_rudp_once() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("devices.json");
         let legacy = r#"[{
@@ -325,13 +328,13 @@ mod tests {
         let st = DeviceStore::load(p.clone());
         assert_eq!(
             st.snapshot()[0].proto,
-            "quic",
-            "存量 udt 必须迁移为 quic（旧 UDT 实为 QUIC 槽位）"
+            "rudp",
+            "存量 udt 必须迁移为 rudp（更名批 §7.29；拆分期 udt→quic 已由前批写穿）"
         );
         drop(st);
-        // 落盘后文件里已是 "quic"。
+        // 落盘后文件里已是 "rudp"。
         let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.contains("\"quic\""), "迁移必须写穿: {text}");
+        assert!(text.contains("\"rudp\""), "迁移必须写穿: {text}");
         assert!(!text.contains("\"udt\""));
     }
 }

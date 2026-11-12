@@ -39,14 +39,14 @@
 | 家庭 / SOHO 多机用户 | 电脑之间快速互传大文件 | GUI 发送/接收、进度卡片、断点续传 |
 | 手机 ↔ 电脑 | 手机上传/下载电脑文件，无需装 App | HTTP 共享 + 二维码扫码 |
 | 开发者 / 运维 | 定时增量备份、脚本化收发、无人值守接收 | CLI `sync`/`send`/`recv`/`verify`、监控模式 |
-| 弱网 / 单向链路环境 | 高丢包 Wi-Fi、无回传链路（如单向网闸侧） | UDT（可靠 UDP 流）/QUIC 传输、单向 UDP + 多轮重发 + FEC |
+| 弱网 / 单向链路环境 | 高丢包 Wi-Fi、无回传链路（如单向网闸侧） | RUDP（自研可靠 UDP 流）/QUIC 传输、单向 UDP + 多轮重发 + FEC |
 | 离线内网 | 数据不出局域网、可控可审计 | 全程局域网内传输、配对码/加密/IP 过滤 |
 
 ### 1.3 核心价值主张
 
 1. **完整性优先** —— 每个文件带 SHA-256 并在接收端重算比对；服务端对续传偏移、完成判定拥有权威；对「结果未知却报成功」零容忍。
-2. **免安装单文件** —— 逻辑层 + UI 编译为单个 exe，UDT 原生库嵌入运行时提取；不写注册表（除可选的开机自启）、无服务、无驱动。
-3. **协议谱系完整** —— 同一套线协议跑在四种传输上：TCP（通用）、QUIC（加密 + 指纹钉扎）、UDT（原生可靠 UDP 流，弱网）、裸 UDP 单向（多轮重发 + Reed-Solomon 前向纠错，无回传链路）。
+2. **免安装单文件** —— 逻辑层 + UI 编译为单个 exe，**无原生库依赖**（QUIC = quinn 纯 Rust、RUDP = 原生 Rust 自研，运行时零提取零注册）；不写注册表（除可选的开机自启）、无服务、无驱动。
+3. **协议谱系完整** —— 同一套线协议跑在四种传输上：TCP（通用）、QUIC（加密 + 指纹钉扎）、RUDP（自研可靠 UDP 流，弱网；曾名 UDT）、裸 UDP 单向（多轮重发 + Reed-Solomon 前向纠错，无回传链路）。
 4. **隐私与可控** —— 数据只在局域网内流动；更新源强制 https；接收侧具备认证、确认、过滤三层控制。
 
 ### 1.4 设计原则（产品工程宪法）
@@ -68,7 +68,7 @@
 | S3 | 每晚把工作目录备份到家里的小主机 | CLI `sync`（任务计划程序/cron）或 GUI 同步模式——重复发送只传差异 |
 | S4 | 手机临时取电脑上的文件 / 上传照片 | HTTP 共享：浏览器列目录、上传、Range 断点下载、扫码直达 |
 | S5 | 监控一个「落料」目录，文件出现即自动发出 | 监控模式：拷贝完成检测 + 队列自动让位 |
-| S6 | 高丢包无线链路传大文件 | UDT 传输（可靠 UDP 流 + ARQ/SACK 重传） |
+| S6 | 高丢包无线链路传大文件 | RUDP 传输（可靠 UDP 流 + ARQ/SACK 重传） |
 | S7 | 只有单向可达的链路（回包到不了） | 单向 UDP 发送：多轮重发 + RS 前向纠错，接收方「落盘即状态」 |
 | S8 | 同一份文件发给多台设备 | 群发：并行多目标、逐目标进度、汇总通知 |
 | S9 | 核对接收库是否被事后篡改/损坏 | 文件库校验（scrub）或 CLI `verify` |
@@ -84,10 +84,10 @@
 |------|--------|----------|------------------|----------|------|
 | TCP | 可靠字节流 | 有 | 全部支持 | 0x03 / 0x04 / 分块覆盖率续传 | 通用、防火墙友好 |
 | QUIC | QUIC（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定） | 有 | 配对支持；机密性由 TLS 承担；压缩支持 | 同 TCP | 加密传输 / `--pin` 钉扎 |
-| UDT | 原生可靠 UDP 流（`transfer::udt`，自研 ARQ+SACK+固定窗口；与 UDT4 不做包级互通，WIRE-PROTOCOL.md §7） | 有 | 全部支持（线协议同 TCP，0x09 加密可选） | 同 TCP | 高丢包链路 |
+| RUDP | 自研可靠 UDP 流（`transfer::rudp`，ARQ+SACK+固定窗口；与 UDT4/任何外部协议不做包级互通，WIRE-PROTOCOL.md §7；曾名 UDT，见 §9.2 更名行） | 有 | 全部支持（线协议同 TCP，0x09 加密可选） | 同 TCP | 高丢包链路 |
 | 单向 UDP | 裸 UDP 数据报 | **无** | **不支持**（无握手通道，帮助文案明示） | 「落盘即状态」：重发即续传 | 单向链路、极简接收端 |
 
-**通用传输行为**（三协议共用，除非注明）：
+**通用传输行为**（四协议共用，除非注明）：
 
 - 发送端必须为载荷计算 SHA-256 并随包发送；接收端重算比对，不一致即判失败，不得落盘半成品到最终路径（临时文件 + 校验 + 原子改名，v2.12+）。
 - 文件名冲突处理：在扩展名前追加 `_1`、`_2`……；文件夹冲突对根目录名追加。
@@ -112,7 +112,7 @@
 - 完整校验（verifyFlag=1）：完整哈希必须在**建连之前**算完（大文件先算哈希再连接，否则对端接收超时掐断）；服务端收完重读比对，不一致删除文件回 status=3，客户端必须作废本地缓存摘要后重试（失配自愈）。
 - 0x04 清单在建连前构建；支持按文件跳过（客户端清单携带已知哈希——取自发送端摘要缓存命中，未命中必发；服务端经摘要缓存/现算逐项核对后以位图应答，详见 WIRE-PROTOCOL.md §3.7）：清单中段插入/改动文件不再把其后同内容文件整份重发。
 - 陈旧前缀保护：扫描遇到「大小相符但属旧版本完整文件」时不得拼接续传（用缓存已知摘要区分半截文件与旧完整文件）；校验失败的文件必须真删除并告知发送方。
-- 0x04 完成判决走带内 1 字节（TCP，v2.13+）或带外 ACK（UDT），杜绝「正文之后服务端才失败、客户端仍报成功」。
+- 0x04 完成判决走**带内 1 字节**（TCP / QUIC / RUDP 同一线协议——RUDP 为可靠流，无带外 ACK 语义），杜绝「正文之后服务端才失败、客户端仍报成功」。
 
 **同步模式（增量备份）**：
 
@@ -141,9 +141,9 @@
 
 ### 3.3 接收侧功能
 
-- **四协议标签页**（v2.14+ 三页；UDT/QUIC 拆分后四页）：TCP / QUIC / UDT / UDP 各自独立的绑定地址多选（族通配 + 具体网卡，每勾选地址一个监听器）、端口、**保存目录**（`SaveDirTCP/QUIC/UDT/UDP`，旧单键 `SaveDir` 首启自动迁移、多页初始同值）；可同时运行、独立启停；标签头 `●` 标记运行态。注：拆分前的「UDT 页」实为 QUIC 槽位（TECH-STACK §7.28）。
+- **四协议标签页**（v2.14+ 三页；UDT/QUIC 拆分后四页，更名批定名 RUDP）：TCP / QUIC / RUDP / UDP 各自独立的绑定地址多选（族通配 + 具体网卡，每勾选地址一个监听器）、端口、**保存目录**（`SaveDirTCP/QUIC/RUDP/UDP`，旧单键 `SaveDir` 首启自动迁移、多页初始同值）；可同时运行、独立启停；标签头 `●` 标记运行态。注：拆分前的「UDT 页」实为 QUIC 槽位（TECH-STACK §7.28）。
 - **运行中不锁配置**：某协议启动后仅该页的绑定/端口/目录冻结，其他协议页随时可改。
-- **端口冲突检测**（v2.14+）：启动前逐地址预检——进程内同传输监听（TCP 独立；QUIC/UDT × 裸 UDP 同承载于 UDP，同端口互斥）+ OS 精确探测（族独立）；冲突弹窗逐地址列出，全被外部进程占用时保留「换下一可用端口」提议。
+- **端口冲突检测**（v2.14+）：启动前逐地址预检——进程内同传输监听（TCP 独立；QUIC/RUDP × 裸 UDP 同承载于 UDP，同端口互斥）+ OS 精确探测（族独立）；冲突弹窗逐地址列出，全被外部进程占用时保留「换下一可用端口」提议。
 - **接收选项**（对话框；目录类选项下次服务器启动生效，有提示）：
 
   | 选项 | 键 | 规格 |
@@ -158,7 +158,7 @@
   | 配对码位数 | `PairingLength` | 4–12 位，默认 6 |
 
 - **接收文件管理**：「打开目录」（当前选中标签页的目录）/「最近接收」（内存 100 条）；按日期归档 `AutoArchive`。
-- **设备记忆与发现**：传输成功记入已知设备（`Name|Ip|Port|flags`，上限 10 条）；UDP 广播发现（`0xD1`→`0xD2`，默认端口 45000，响应含 TCP/QUIC/UDT/需配对标志位（WIRE-PROTOCOL.md §6.2 向后兼容布局），仅 IPv4）；已知设备管理对话框（使用/删除/清空）。
+- **设备记忆与发现**：传输成功记入已知设备（`Name|Ip|Port|flags`，上限 10 条）；UDP 广播发现（`0xD1`→`0xD2`，默认端口 45000，响应含 TCP/QUIC/RUDP/需配对标志位（WIRE-PROTOCOL.md §6.2 向后兼容布局），仅 IPv4）；已知设备管理对话框（使用/删除/清空）。
 - **统计与历史**：`stats.log` 追加式（>2MB 重写保留末 5000 行）；今日/7 天/累计聚合 + 按设备明细；历史对话框按方向筛选、资源管理器定位、导出 CSV（UTF-8 BOM）；「全部清除」危险按钮双视图同步。
 
 ### 3.4 HTTP 共享
@@ -178,8 +178,8 @@
 
 | 动词 | 用途 | 关键参数 |
 |------|------|----------|
-| `send` | 发送单文件/文件夹/文本 | `--ip --port [--proto tcp\|udt\|udp] --file/--folder/--text [--code] [--limit] [--srcport] [--nocompress] [--noencrypt] [--pin]`；单文件首选 0x03 断点续传（失败退避重试 3 次、旧对端自动降级 0x00，规格 §3.2 AutoRetry）；`--chunks 1-8` 走 0x02 并行分块（Unsupported 时回退自动续传）；`--udp` 仅单文件，`--passes 1-5`、`--fec-parity 1-8`、`--nofec` |
-| `recv` | 无人值守接收 | `--port [--out] [--proto tcp\|quic\|udt\|udp] [--code] [--count N] [--noencrypt]`；TCP/UDT 侧维护接收摘要缓存（0x00/0x01/0x03/0x02 组装免费填充）；`--udp` 起裸 UDP 接收器 |
+| `send` | 发送单文件/文件夹/文本 | `--ip --port [--proto tcp\|quic\|rudp\|udp] --file/--folder/--text [--code] [--limit] [--srcport] [--nocompress] [--noencrypt] [--pin]`；`--pin`（QUIC 证书指纹钉扎）仅 `--proto quic`；单文件首选 0x03 断点续传（失败退避重试 3 次、旧对端自动降级 0x00，规格 §3.2 AutoRetry）；`--chunks 1-8` 走 0x02 并行分块（Unsupported 时回退自动续传）；`--udp` 仅单文件，`--passes 1-5`、`--fec-parity 1-8`、`--nofec` |
+| `recv` | 无人值守接收 | `--port [--out] [--proto tcp\|quic\|rudp\|udp] [--code] [--count N] [--noencrypt]`；TCP/QUIC/RUDP 侧维护接收摘要缓存（0x00/0x01/0x03/0x02 组装免费填充）；`--udp` 起裸 UDP 接收器 |
 | `sync` | 一次性增量同步（0x04） | `--folder --ip --port [--proto tcp\|udt] [--code] [--limit] [--nocompress]`；位图差分只传差异；稳定会话 ID（(源路径, 目标地址) 派生，大小写/尾斜杠不敏感）与 GUI 同步互相接力；本地删除的文件服务端保留 |
 | `verify` | 文件库校验 | `--dir`；不一致退出码 1 |
 | `update` | 自更新 | `[--url]`（缺省读配置 UpdateUrl）`[--check] [--restart]`；ed25519 签名清单 + 换入前重校验；更新源强制 https（明文仅回环） |
@@ -224,7 +224,7 @@
 | `0x03` | 单文件续传 | 会话 ID(IP+文件名绑定) + 大小 + 声明偏移 + verifyFlag + 完整哈希；应答 `0x10`（status 0x01 续传 / 0x02 去重零传输 / 0x00 拒绝）；服务端偏移权威；陈旧前缀保护 | v2.x |
 | `0x04` | 文件夹续传/同步 | 清单（含可选哈希）+ `0x11` 位图协商（hasHash=0 必发）；带内完成判决；同步语义：差异覆盖、保留服务端删除 | v2.x |
 | `0x05` / `0x15` | 配对码认证 | 恒时比较；失败按来源 IP 计数锁定（10 次成功清零）；未启用时宽容接受 | v2.x |
-| `0x06` | 文本消息 | ≤1MB UTF-8；TCP 带内判决 / UDT 带外 ACK | v2.x |
+| `0x06` | 文本消息 | ≤1MB UTF-8；带内完成判决（TCP / QUIC / RUDP 同一线协议） | v2.x |
 | `0x07` / `0x17` | **旧版**加密认证 | 仅 ≤2.11 对端互通；密钥来自网线明文的码哈希（**无真正机密性**），服务端记弱加密警告 | v2.9 |
 | `0x08` / `0x18` | 压缩协商 | 分段 deflate 装饰器（rawLen+wireLen+mode；采样 30%、最小段 64B、段上限 64MB）；**仅在认证后接受**（防预认证内存放大）；拒绝宽容降级明文 | v2.11 |
 | `0x09` / `0x19` | 认证 ECDH 加密握手 | 临时 P-256 + PBKDF2(50k) + 双向 HMAC 确认；密钥只来自共享秘密 Z | v2.12 |
@@ -298,7 +298,7 @@
 
 ### 6.2 资源行为（设计要求）
 
-- 缓冲：TCP 收发缓冲 4 MB；UDT 为原生 Rust 实现（无库缓冲概念），收缓冲 4 MB（与单向 UDP 同口径）；QUIC 由 quinn 默认。
+- 缓冲：TCP 收发缓冲 4 MB；RUDP 为原生 Rust 实现（无库缓冲概念），收缓冲 4 MB（与单向 UDP 同口径）；QUIC 由 quinn 默认。
 - 内存封顶设计点：UDP 覆盖位集、FEC 超块、摘要缓存分代、进度节流——不得随传输时长/文件数无界增长。
 - 压缩策略：写前采样（≤64KB 试压，压后 ≤30% 才压整段），`Fastest` 级别；不可压缩数据**零膨胀**直传。内部实测参考：随机 64MB TCP 回环 1.4s → 0.3s；deflate 在半可压缩数据上最慢（≈16 MB/s）低于全随机（≈51 MB/s）——这就是采样阈值取保守值 0.30 的依据。
 - 每传输独立错误描述（并发传输间无共享可变状态）；UI 派发节流 100ms。
@@ -311,7 +311,7 @@
 
 | 风险 | 防护 |
 |------|------|
-| 接收方拒绝却报成功 | TCP 完成确认字节（0x00/0x01/0x03/0x06/0x04，与 §4.1 一致）；UDT/QUIC 断连严格化——EOF/错误/超时/RST 一律失败，结果未知 ≠ 成功 |
+| 接收方拒绝却报成功 | TCP 完成确认字节（0x00/0x01/0x03/0x06/0x04，与 §4.1 一致）；RUDP/QUIC 断连严格化——EOF/错误/超时/RST 一律失败，结果未知 ≠ 成功 |
 | 零填充文件被判完成 | 续传偏移服务端权威 + 覆盖判完成（非字节累加） |
 | 半截文件出门（监控模式） | 独占打开 + 大小稳定双重探测 |
 | 两个版本拼成一个文件 | 陈旧前缀不拼接（0x04）；源变化换新 groupId（0x02） |
@@ -346,7 +346,7 @@
 
 ### 8.2 运行时要求（当前 Windows 版）
 
-- `(Rust)` Windows 10/11 x64；Rust ≥ 1.85 构建；GUI 依赖 WebView2 运行时（Evergreen 自动更新为主，exe 旁 `WebView2Runtime\` 固定版为离线便携形态）；无原生库依赖（QUIC 槽位 = quinn 纯 Rust；UDT 槽位 = 原生 Rust 自研可靠 UDP 流，见 TECH-STACK.md §2/§3）。
+- `(Rust)` Windows 10/11 x64；Rust ≥ 1.85 构建；GUI 依赖 WebView2 运行时（Evergreen 自动更新为主，exe 旁 `WebView2Runtime\` 固定版为离线便携形态）；无原生库依赖（QUIC 槽位 = quinn 纯 Rust；RUDP 槽位 = 原生 Rust 自研可靠 UDP 流，见 TECH-STACK.md §2/§3）。
 
 ### 8.3 配置迁移政策
 
@@ -367,12 +367,13 @@
 
 | 路线 | 结论 | 理由 |
 |------|------|------|
-| **Rust / Go 整体重写** | **已实施（本仓库）** | 2026-10 用户拍板从功能出发重新选型：单文件免安装、内存封顶、无 GC 抖动吞吐；选型与里程碑见 [TECH-STACK.md](TECH-STACK.md)（原 C# 时代「暂不采纳」条目的顾虑——重赚实战正确性——由 206 项 Rust 测试 + 九轮审查 + 判别纪律承接） |
+| **Rust / Go 整体重写** | **已实施（本仓库）** | 2026-10 用户拍板从功能出发重新选型：单文件免安装、内存封顶、无 GC 抖动吞吐；选型与里程碑见 [TECH-STACK.md](TECH-STACK.md)（原 C# 时代「暂不采纳」条目的顾虑——重赚实战正确性——由全量 Rust 测试（当前 225 项，随版本增长）+ 十轮审查 + 判别纪律承接） |
 | **C. Web 管理面（无头 daemon + 浏览器管理）** | **已落地（trft-server + GUI 共享页）** | axum 复用 HTTP 安全基线；GUI 内嵌共享 + 二维码已交付手机浏览器闭环 |
-| A. 跨平台无头版（Linux/macOS CLI） | 规划中 | 逻辑层原样复用 + 全量测试护航；QUIC（quinn）与 UDT（纯 Rust）天然跨平台；待发布阶段排期 |
+| A. 跨平台无头版（Linux/macOS CLI） | 规划中 | 逻辑层原样复用 + 全量测试护航；QUIC（quinn）与 RUDP（纯 Rust）天然跨平台；待发布阶段排期 |
 | B. 跨平台桌面 GUI（egui/AppImage） | 评估后暂缓 | Tauri 2 已覆盖桌面 + 便携形态；Linux GUI 待需求明确 |
 | QUIC 替代 UDT | **已落地（quinn）** | 原「长期观察项」随重写一并解决——无原生库分发负担，TLS 1.3 + 自签模型 |
-| UDT/QUIC 槽位拆分（2026-11-10） | **已落地** | 原版 C# 的「UDT」模式恢复为真 UDT 语义：原生 Rust 自研可靠 UDP 流（ARQ+SACK+固定窗口，`transfer::udt`，WIRE-PROTOCOL.md §7，与 UDT4 不做包级互通——§4.3 口径不变）；原「UDT (QUIC)」改名 **QUIC** 独立成第四模式。存量 proto 串 `"udt"`（devices.json / queue.txt）一次性迁移为 `"quic"`；发现帧 0xD2 增 bit3+可选尾部端口（向后兼容） |
+| UDT/QUIC 槽位拆分（2026-11-10） | **已落地** | 原版 C# 的「UDT」模式恢复为自研可靠 UDP 流语义（ARQ+SACK+固定窗口，WIRE-PROTOCOL.md §7，与 UDT4 不做包级互通——§4.3 口径不变）；原「UDT (QUIC)」改名 **QUIC** 独立成第四模式。存量 proto 串 `"udt"`（devices.json / queue.txt）一次性迁移为 `"quic"`；发现帧 0xD2 增 bit3+可选尾部端口（向后兼容） |
+| 自研流更名 **RUDP**（2026-11-12，TECH-STACK §7.29） | **已落地** | 拆分批顶用「UDT」之名会误导互通预期（实现并非 UDT4）——更名 **RUDP**：CLI `--proto rudp`、GUI 标签 RUDP、配置键 `ServerPortRUDP/SaveDirRUDP`（拆分批曾短暂用 `*UDT` 键，未发布无存量）、发现帧 bit3 字段名 `rudp_port`（线布局零变化）、devices/queue 存量 `"udt"` → `"rudp"`（queue 头升 v3，按头分档迁移） |
 
 ### 9.3 里程碑
 
@@ -390,10 +391,10 @@
 
 ### 10.1 测试体系
 
-`(Rust)` 当前 **206 项自动化测试**（随版本增长，`cargo test --workspace`）：
+`(Rust)` 当前 **225 项自动化测试**（随版本增长，`cargo test --workspace`；225 = 拆分批新增 e2e_rudp 4 + RUDP 引擎单测 4 + 发现兼容/迁移判别 7，基线 210；更名批零新增）：
 
 - 单元（L10N/Config/加密压缩往返/摘要缓存/QR/限速/绑定冲突/分块状态机/UDP 引擎丢包恢复/进度节流…）；
-- 端到端集成（TCP/QUIC/UDT/UDP 单文件/文件夹/空文件/中文名/并发/续传/分块 0x02 专项/限速时间下界判别/加密回退/配对码锁定/同步 bitmap/互通降级矩阵/HTTP 共享/IPv6/CLI 跨进程真传输/UDT 丢包注入与握手版本门…，`trft-core/tests/` + `trft-cli/tests/` + `trft-server/tests/web.rs`）；
+- 端到端集成（TCP/QUIC/RUDP/UDP 单文件/文件夹/空文件/中文名/并发/续传/分块 0x02 专项/限速时间下界判别/加密回退/配对码锁定/同步 bitmap/互通降级矩阵/HTTP 共享/IPv6/CLI 跨进程真传输/RUDP 丢包注入与握手版本门…，`trft-core/tests/` + `trft-cli/tests/` + `trft-server/tests/web.rs`）；
 - GUI 命令层契约（queue.txt 格式互锁/SendRequest serde/便携探测/日志清理，`trft-gui/tests/`）；
 - GUI 实机：UIA 驱动真实窗口 + CLI/HTTP 联动（TECH-STACK §23 方法论），不入自动化套件。
 - **判别纪律**：行为修复必须有测试钉住，且验证过「去掉修复测试变红」。
@@ -429,7 +430,7 @@
 | 域 | 键 |
 |----|----|
 | 外观/语言 | `Language` `Theme` `Mica` `SoftwareRender` |
-| 服务器 | `ServerPortTCP/QUIC/UDT/UDP` `ServerBindTCP/UDP` `SaveDirTCP/QUIC/UDT/UDP`（Rust v2 命名；C# 版 `*UDT` 键=本版 QUIC 槽位——见 §12.1 注）`AutoArchive` |
+| 服务器 | `ServerPortTCP/QUIC/RUDP/UDP` `ServerBindTCP/UDP` `SaveDirTCP/QUIC/RUDP/UDP`（Rust v2 命名；注：C# 版的 `*UDT` 配置键承载的是 QUIC 槽位语义——拆分前本版同名键亦然，存量数据已迁移，见 §9.2 拆分行；拆分批曾短暂使用 `*UDT` 键承载自研流，更名批改 `*RUDP`，未发布无存量）`AutoArchive` |
 | 接收选项 | `ConfirmReceive` `IpFilterMode` `IpFilterList` `PerDeviceFolder` `DuplicateFiles` `RecvSpeedLimit` `HashCacheDays` `SyncVerifyContent` `PairingLength` |
 | 配对/加密 | `PairingCode` `Encrypt` `EncryptStrict` `Compress` |
 | 客户端 | `ClientIP` `ClientPort` `ClientProtocol` `LastPath` `FolderMode` `SyncMode` `MonitorMode` `VerifyHash` `Concurrency` `SrcPort` `SpeedLimit` |
@@ -443,7 +444,7 @@
 
 | 服务 | 默认 | 可配置 |
 |------|------|--------|
-| TCP / QUIC / UDT / 单向 UDP 服务器 | 各 8080（同端口号跨传输共存；UDP 族同端口互斥需错开） | `ServerPortTCP/QUIC/UDT/UDP` |
+| TCP / QUIC / RUDP / 单向 UDP 服务器 | 各 8080（同端口号跨传输共存；UDP 族同端口互斥需错开） | `ServerPortTCP/QUIC/RUDP/UDP` |
 | HTTP 共享 | 8090 | `HttpSharePort` |
 | 设备发现 | 45000 | `DiscoveryPort`（仅 IPv4 广播） |
 

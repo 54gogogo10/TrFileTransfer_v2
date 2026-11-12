@@ -17,8 +17,8 @@ pub enum Proto {
     /// 历史注记：UDT/QUIC 槽位拆分（TECH-STACK §7.28）前本变体的 serde 值为
     /// "udt"——存量 devices.json / queue.txt 由各自加载路径迁移为 "quic"。
     Quic,
-    /// UDT（原生可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议）。
-    Udt,
+    /// RUDP（自研可靠 UDP 流：UDP 之上的可靠有序字节流，与 TCP 同帧协议；曾名 UDT）。
+    Rudp,
     Udp,
 }
 
@@ -27,7 +27,7 @@ impl Proto {
         match self {
             Proto::Tcp => "TCP",
             Proto::Quic => "QUIC",
-            Proto::Udt => "UDT",
+            Proto::Rudp => "RUDP",
             Proto::Udp => "UDP",
         }
     }

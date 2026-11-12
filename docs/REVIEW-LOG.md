@@ -441,3 +441,18 @@ TECH-STACK §7.28）：
 **判别**：`tests/e2e_udt.rs` 真 socket 四测（单文件 SHA-256 一致 / 配对门三态 / 0x09 加密路径 /
 握手版本门 fail-closed）+ 引擎对偶注入四测（无损双向 FIN/EOF / 25% 丢包恢复 / RST 传播 /
 重复 DATA 不重复投递）+ 发现帧新旧兼容 + devices 迁移幂等；全量回归绿。
+
+## 自研流更名 RUDP 交付记录（2026-11-12）
+
+**决策**（用户拍板）：拆分批给自研可靠 UDP 流顶用「UDT」之名——UDT4 是既有协议专名，
+会误导互通预期且实现并非 UDT4。更名 **RUDP**（Reliable UDP，业界通用描述性缩写；
+RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 为权威、与任何
+外部协议不做包级互通——§4.3 口径不变）。
+
+- **范围**：Transport/MonitorProto/GUI Proto 变体、模块文件（git mv 保史）、函数与类型名、
+  常量 `UDT_*`→`RUDP_*`、错误串、CLI `--proto rudp`、GUI 前端全量、发现帧字段名
+  `rudp_port`（线值零变化）、配置键 `*RUDP`（未发布无存量，直接改名）；
+- **迁移链改向**：devices 残余 `"udt"`→`"rudp"`；queue 头升 v3 并按头分档
+  （无头 udt→quic 拆分前语义；v2/v3 头 udt→rudp）——`migrate_queue_text` 分档 + 幂等测试；
+- **判别**：e2e_rudp 4 测（真 socket 全链路）+ 引擎单测 + 迁移判别 + 全量 225/0 绿；
+  线格式与更名前零差异（WIRE-PROTOCOL §7 命名沿革注记）。

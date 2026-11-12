@@ -19,13 +19,13 @@ Compressed（可选，0x08 协商后）        ← 压缩装饰器在帧层之�
   ▲
 Encrypted（可选，0x09）或 QUIC TLS     ← 机密性/认证
   ▲
-TCP / UDT（可靠 UDP 流，§7）
+TCP / RUDP（自研可靠 UDP 流，§7）
 ```
 
 - 装饰器包裹顺序固定为 `encrypt(compress(plain))`——压缩内层、加密外层（规格 §4.1）。
 - QUIC 槽位：TLS 1.3 承担机密性，流上**先发 1 字节协议版本号 `0x02`** 再进帧层；
   TCP 槽位无版本前缀（未知帧 fail-closed 兜底）。
-- UDT 槽位（§7）：机密性由可选 0x09 承担（与 TCP 同口径），版本协商在 HS 包内完成
+- RUDP 槽位（§7）：机密性由可选 0x09 承担（与 TCP 同口径），版本协商在 HS 包内完成
   （公共头 ver 字节），流上无版本前缀。
 - 前导组合顺序：认证在前（`0x09` 首选 → `0x05` 明文门）、`0x0A` 能力协商、`0x08` 压缩协商次之，
   之后才允许业务帧。`0x0A`/`0x08` 各**至多一次**，顺序不限（本实现客户端固定先 `0x0A` 后 `0x08`）。
@@ -242,26 +242,30 @@ PARITY 对旧接收端无需协商（静默忽略）。
 | frame | 1 B | `0xD2` |
 | name_len | 2 B | 应答方本机名字节数 |
 | name | name_len | UTF-8（≤ 64 B） |
-| flags | 1 B | bit0 = TCP 监听中；bit1 = QUIC 监听中；bit2 = 需配对码；bit3 = UDT 监听中 |
+| flags | 1 B | bit0 = TCP 监听中；bit1 = QUIC 监听中；bit2 = 需配对码；bit3 = RUDP 监听中 |
 | tcp_port | 2 B | TCP 监听端口（flags bit0=0 时为 0） |
 | quic_port | 2 B | QUIC 监听端口（flags bit1=0 时为 0） |
-| udt_port | 2 B | UDT 监听端口（**可选字段**——仅 flags bit3=1 时存在） |
+| rudp_port | 2 B | RUDP 监听端口（**可选字段**——仅 flags bit3=1 时存在） |
 
 - 守卫：整包 > 512 B、name > 64 B、截断/坏帧 → **整包忽略**（fail-closed）。
-- 应答方仅在有流式监听器（TCP/QUIC/UDT）时运行，flags 实时读取；请求方按应答源 IP 去重。
-- 向后兼容（UDT/QUIC 拆分，TECH-STACK §7.28）：拆分前 bit1 = 「UDT 监听中」、
-  该端口字段名为 `udt_port`——其实现一直是 QUIC 槽位，本次拆分改名 `quic_port` 并新增
-  bit3 + 尾部可选 `udt_port`。旧版解码器读新帧：多出的尾部字节不影响其定长读取，
-  其读到的 "udt_port" 实为 quic_port——语义与其一致，天然向后兼容；新版解码器对
-  无尾字段的旧帧回 `udt_port = None`。
+- 应答方仅在有流式监听器（TCP/QUIC/RUDP）时运行，flags 实时读取；请求方按应答源 IP 去重。
+- 向后兼容（两段演进）：①拆分批（TECH-STACK §7.28）——拆分前 bit1 = 「UDT 监听中」、
+  该端口字段名为 `udt_port`，其实现一直是 QUIC 槽位；拆分改名 `quic_port` 并新增 bit3 +
+  尾部可选端口。②更名批（TECH-STACK §7.29）——bit3 槽位定名 **RUDP**，字段名
+  `udt_port` → `rudp_port`（线布局/比特位零变化，纯命名）。旧版解码器读新帧：多出的
+  尾部字节不影响其定长读取，其读到的端口即 quic_port——语义与其一致，天然向后兼容；
+  新版解码器对无尾字段的旧帧回 `rudp_port = None`。
 - 语义锚点：`trft-core::discovery`（编码/解码/发现/应答由单元与回环 e2e 互锁）。
 
-## 7. UDT 传输（可靠 UDP 流；拆分新增）
+## 7. RUDP 传输（自研可靠 UDP 流；拆分新增，更名批定名）
 
-UDT 槽位 = UDP 之上的**可靠有序双向字节流**，帧协议与 TCP 完全一致（§3 全部帧、
-0x05 配对、可选 0x09 加密、0x0A/0x08 协商全部适用）。**与 UDT4/C# 版不做包级互通**
-（规格 §4.3）——本节为线格式权威；实现锚点 `trft-core::transfer::udt` +
-`trft-core::protocol::udt`（判别测试互锁）。
+RUDP 槽位 = UDP 之上的**自研可靠有序双向字节流**，帧协议与 TCP 完全一致（§3 全部帧、
+0x05 配对、可选 0x09 加密、0x0A/0x08 协商全部适用）。**与 UDT4/C# 版及任何外部协议
+不做包级互通**（规格 §4.3）——本节为线格式权威；实现锚点 `trft-core::transfer::rudp` +
+`trft-core::protocol::rudp`（判别测试互锁）。
+
+> **命名沿革**：本传输曾以「UDT」为名（原 C# 版槽位名）——因实现并非 UDT4、顶名
+> 会误导互通预期，2026-11-12 更名 **RUDP**（TECH-STACK §7.29）。线格式与更名前零差异。
 
 ### 7.1 包头与包类型
 

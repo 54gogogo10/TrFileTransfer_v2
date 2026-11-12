@@ -44,8 +44,8 @@ pub enum MonitorEvent {
 pub enum MonitorProto {
     Tcp,
     Quic,
-    /// UDT 槽位（原生可靠 UDP 流）。
-    Udt,
+    /// RUDP 槽位（原生自研可靠 UDP 流；曾名 UDT，TECH-STACK §7.29）。
+    Rudp,
     Udp,
 }
 
@@ -53,7 +53,7 @@ pub struct MonitorConfig {
     pub watch_dir: PathBuf,
     pub addr: SocketAddr,
     pub proto: MonitorProto,
-    /// 流式发送选项（Tcp/Quic；Udp 模式忽略）。
+    /// 流式发送选项（Tcp/Quic/Udt；Udp 模式忽略）。
     pub send_opts: SendOptions,
     /// 单向 UDP 选项（Udp 模式必填）。
     pub udp_opts: UdpSendOptions,
@@ -238,9 +238,9 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
                 o.transport = Transport::Quic;
                 send_file_auto(cfg.addr, &front, &o).await
             }
-            MonitorProto::Udt => {
+            MonitorProto::Rudp => {
                 let mut o = cfg.send_opts.clone();
-                o.transport = Transport::Udt;
+                o.transport = Transport::Rudp;
                 send_file_auto(cfg.addr, &front, &o).await
             }
         };
