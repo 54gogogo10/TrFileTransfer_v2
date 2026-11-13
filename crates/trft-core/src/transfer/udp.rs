@@ -101,10 +101,12 @@ pub async fn build_plan(path: &Path, opts: &UdpSendOptions) -> Result<UdpPlan> {
     if size > MAX_TRANSFER_SIZE {
         return Err(config_err("文件超过 1 PiB 声明上限"));
     }
+    // 纳秒粒度（TECH-STACK §7.31）：秒粒度下同秒同长改写 = 同会话 ID，
+    // 接收方把新内容当旧会话重发去重 → 错误内容静默接受。
     let mtime = meta
         .modified()?
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let chunk_len = UDP_CHUNK as u32;
     let chunk_count = size.div_ceil(chunk_len as u64);
@@ -1008,24 +1010,12 @@ pub async fn serve_udp(
     opts: UdpRecvOptions,
     events: Option<mpsc::UnboundedSender<UdpEvent>>,
 ) -> Result<()> {
-    // 规格 §6.1：UDP 收缓冲 4 MB（设置失败仅告警不阻断）。
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock2 = socket2::Socket::new(domain, socket2::Type::DGRAM, None)
+    // 规格 §6.1：UDP 收缓冲 4 MB；通配 `::` 双栈（TECH-STACK §7.31）。
+    let std_sock = crate::transfer::std_udp_listener(addr)
         .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
-    sock2
+    std_sock
         .set_nonblocking(true)
         .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
-    sock2
-        .bind(&addr.into())
-        .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
-    if let Err(e) = sock2.set_recv_buffer_size(4 * 1024 * 1024) {
-        eprintln!("[警告] UDP 收缓冲设置失败: {e}");
-    }
-    let std_sock: std::net::UdpSocket = sock2.into();
     let socket = UdpSocket::from_std(std_sock)
         .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
     serve_udp_on(socket, opts, events).await
@@ -1186,7 +1176,7 @@ pub async fn serve_udp_on(
                         1,
                         start.elapsed().as_secs(),
                         "UDP 接收",
-                        &name,
+                        &path.display().to_string(),
                     );
                 }
                 if let Some(tx) = &events {

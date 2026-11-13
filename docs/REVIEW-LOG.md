@@ -523,3 +523,57 @@ RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 
 `transfer/{sender,folder,resume}.rs`、`monitor.rs`、`config.rs`、`discovery.rs`、
 `devices.rs`、`Cargo.toml`（sha1）、`trft-cli/src/main.rs`、`trft-gui/src/{state,commands}.rs`、
 `trft-gui/dist/{app.js,index.html}`、docs 四册。
+
+## 对齐批三交付记录（2026-11-13，TECH-STACK §7.31）
+
+**范围**：C# 版（D:\zcode\TrFileTransfer）剩余功能缺口收官——§7.27 G3 登记、IPv6 双栈、
+发送目标记忆、AutoUpdateCheck、监控参数快照；登记「不做」项维持（同步会话对话框、
+Mica、错误码架构 shim）。UDT 互通（§7.30）后续补实机验证见下节。
+
+- **A 接收行全路径**：判别 e2e 3 项（TCP 直接/跳过行 + UDT C# 方言行断言
+  detail=规范文案、path=最终落盘全路径；退回文件名口径必红）；
+- **B IPv6 双栈**：TCP/UDP/QUIC 三判别（通配 [::] 监听 + 127.0.0.1 对端），
+  去 `only_v6(false)` 实证必红（Windows v6only 默认）；
+- **C/D 配置**：config 单测（缺省 + round-trip）+ 前端回填/落盘；
+- **E 监控快照**：src_port 接线 + 前端快照传参；
+- **测试面**：a1c7b76 的 4 条告警清除，全量回归 0 告警。
+
+## UDT 互通补全 + 实机排障修复（2026-11-13/14，TECH-STACK §7.31）
+
+**实机验证轮**（C# 2.14.0.0，TECH-STACK §7.30 后续）抓到三个互通缺陷并当场修：
+
+1. **P1 加密路径压缩协商失效**：服务端 0x18/0x1A 应答裸写绕过加密装饰器——C# 客户端
+   经加密流读应答，段格式等不到合法段，干等 8s 响应窗后回退明文（传输成功但压缩静默
+   失效）。改走 write_all；判别 e2e 加密+压缩全栈回环（裸写版 8.75s 超时红，修复绿）。
+2. **P1 摘要缓存键 mtime 秒级粒度**：同秒同长改写 → 0x04 同步拿旧哈希误判「服务端
+   已有」→ 增量备份漏改（静默丢数据方向；v2 帧 0x04 同病，非 UDT 新增）。全缓存键位
+   改纳秒粒度（mtime_of/0x04 清单 ×2/scrub/0x01 回填/UDP session_id）；判别 e2e
+   `cs_dialect_sync_incremental_roundtrip` 首轮即红（秒粒度）→ 纳秒绿。
+3. **P2 本地摘要缓存当内容外发**：C# 方言 0x01/0x04 客户端 walk 未跳过
+   `.trft-hash-cache.txt`（v2 帧有过滤）——补 is_cache_artifact 过滤。
+
+**新功能**：UDT 槽位 0x04 差量同步客户端（此前 sync --proto udt 显式 Unsupported）——
+C# SendFolderResumableAsync keepState 同构（能力位/全哈希清单/0x11 长窗判决/跳过清单/
+增量哈希/带外 ACK），会话 GUID 与 C# DeriveSyncSession 同式互认；CLI/GUI sync UDT 分支
+接线；判别 e2e 全量→改文件→二轮只补差异。
+
+**实机对打**（全部 SHA-256 一致）：C#→v2 文件夹（压缩协商）/加密文件夹（P1 修复后
+压缩即时协商）/GUI 并发 4 = 0x02 组会话（UIA 驱动，24 MiB）/v2→C# 文本 + 压缩单文件/
+v2→C# 同步两轮（全量 → status=2 零传输）。发现互见维持字节级判别单测，GUI 级登记
+可选后续项。
+
+## 真机互通测试轮：UDT 吞吐塌陷修复（2026-11-14，TECH-STACK §7.32）
+
+**发现**（真机 80MB 插桩实测）：C#→v2 单连接 UDT 仅 1.0MB/s（752 pkt/s），而
+v2↔v2 112MB/s、C#↔C# 62.9MB/s；v2 接收侧零丢包零 NAK、流窗恒满、ACK 健康。
+瓶颈 = libudt 默认 CC 退出慢启动后 `cwnd = RcvRate/1e6×(RTT+RC)+16`——`RcvRate`
+读 ACK word4，v2 恒发 16B ACK（缺 word4/5）→ cwnd 恒钉 16 包。
+
+**修复**：接收端实现 libudt `CPktTimeWindow(16,16)` 同款（到达间隔窗 + seq&0xF
+探测对 + 中位数滤波），ACK 按 SYN 节流分档 24B/16B（逐字对齐 vendored core.cpp
+checkTimers ACK 分支）；`m_ullLastAckTime` 单字段语义同步。
+
+**实测**：C#→v2 80MB 0.6s（130.6MB/s，128 倍，超 C#↔C# 同口径）；真机矩阵
+15/15 SHA-256 全对（双向明文/加密/压缩/80MB/文件夹/文本/同步三轮/负例×2/GUI
+并发4=0x02）。登记：v2 发送端对 C# ~10MB/s（CC 近似 + 逐包调度，与 §7.28
+优化项同批）。测试床 `.zcode/scratch-interop/`（gitignored，非自动化套件）。

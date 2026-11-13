@@ -193,3 +193,58 @@ async fn oversized_datagram_does_not_kill_receiver() {
     assert_eq!(std::fs::read(out.join("after.bin")).unwrap(), data);
     server.abort();
 }
+
+/// §7.31 双栈判别：通配 [::] 的 UDP 族监听（serve_udp）必须收得到 IPv4 对端——
+/// 去掉 std_udp_listener 的 only_v6(false) 本测必红（Windows 默认 v6only）。
+#[tokio::test]
+async fn v6_wildcard_udp_accepts_v4_sender() {
+    use sha2::Digest;
+    let dir = tempfile::tempdir().unwrap();
+    let mut data = vec![0u8; 64_000];
+    rand_core::OsRng.fill_bytes(&mut data);
+    let src = dir.path().join("d6.bin");
+    std::fs::write(&src, &data).unwrap();
+    let out = dir.path().join("out");
+
+    let std_sock = trft_core::transfer::std_udp_listener("[::]:0".parse().unwrap()).unwrap();
+    std_sock.set_nonblocking(true).unwrap();
+    let socket = tokio::net::UdpSocket::from_std(std_sock).unwrap();
+    let v6port = socket.local_addr().unwrap().port();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let server = tokio::spawn(serve_udp_on(
+        socket,
+        UdpRecvOptions {
+            save_dir: out.clone(),
+            ..Default::default()
+        },
+        Some(tx),
+    ));
+
+    // IPv4 环回发往双栈监听（映射地址经 ::ffff: 进入）。
+    let v4: std::net::SocketAddr = format!("127.0.0.1:{v6port}").parse().unwrap();
+    send_file_udp(
+        v4,
+        &src,
+        &UdpSendOptions {
+            passes: 2,
+            fec: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let ev = tokio::time::timeout_at(deadline, rx.recv()).await.unwrap().unwrap();
+        if matches!(ev, UdpEvent::Completed { .. }) {
+            break;
+        }
+    }
+    server.abort();
+    let dest = out.join("d6.bin");
+    assert_eq!(
+        sha2::Sha256::digest(std::fs::read(&dest).unwrap()).as_slice(),
+        sha2::Sha256::digest(&data).as_slice()
+    );
+}

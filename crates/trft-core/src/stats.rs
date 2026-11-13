@@ -50,7 +50,8 @@ pub struct StatRecord {
     pub secs: u64,
     /// 模式说明（用户可见文案，如 "续传传输" / "UDP×2轮"；不得写帧码）。
     pub detail: String,
-    /// 文件/文件夹名（文本传输为 `<文本>`）。
+    /// 定位用全路径：发送=本地源路径；接收=最终落盘路径（文件夹=落盘目录）；
+    /// 文本等无落盘实体为空（对齐原版 WireSessionStats.Path 语义——TECH-STACK §7.31）。
     pub path: String,
 }
 

@@ -279,7 +279,7 @@ impl ChunkTracker {
     /// （assembling 恒真 + assembled 置位）：迟到的 0x0C 判 0x01、0x0B 回满覆盖、
     /// 重复块幂等跳过——重试收敛于成功而非二次发布。失败路径移除会话并唤醒
     /// 等待中的 0x0C（回 0x00，客户端整组重来——无假成功窗口）。
-    pub(crate) async fn finish(&self, gid: [u8; 16], opts: &RecvOptions) -> Result<()> {
+    pub(crate) async fn finish(&self, gid: [u8; 16], opts: &RecvOptions) -> Result<PathBuf> {
         let (part, name, report, notify) = {
             let map = self.sessions.lock().await;
             let Some(s) = map.get(&gid) else {
@@ -292,18 +292,21 @@ impl ChunkTracker {
                 s.notify.clone(),
             )
         };
-        if let Err(e) = self.assemble(&part, &name, opts).await {
-            {
-                let mut map = self.sessions.lock().await;
-                map.remove(&gid);
+        let final_dest = match self.assemble(&part, &name, opts).await {
+            Ok(p) => p,
+            Err(e) => {
+                {
+                    let mut map = self.sessions.lock().await;
+                    map.remove(&gid);
+                }
+                let _ = std::fs::remove_file(&part);
+                if let Some(r) = &report {
+                    r.fail();
+                }
+                notify.notify_waiters();
+                return Err(proto(format!("分块组装失败: {e}")));
             }
-            let _ = std::fs::remove_file(&part);
-            if let Some(r) = &report {
-                r.fail();
-            }
-            notify.notify_waiters();
-            return Err(proto(format!("分块组装失败: {e}")));
-        }
+        };
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&gid) {
@@ -314,10 +317,10 @@ impl ChunkTracker {
         if let Some(r) = &report {
             r.finish();
         }
-        Ok(())
+        Ok(final_dest)
     }
 
-    async fn assemble(&self, part: &Path, name: &str, opts: &RecvOptions) -> Result<()> {
+    async fn assemble(&self, part: &Path, name: &str, opts: &RecvOptions) -> Result<PathBuf> {
         let p = part.to_path_buf();
         let hash = tokio::task::spawn_blocking(move || sha256_file(&p))
             .await
@@ -336,7 +339,7 @@ impl ChunkTracker {
         // 免费填充：组装后现算的哈希即完整摘要（规格 §3.1 缓存免费填充路径）。
         resume::fill_cache_at(opts, &final_dest, size, hash).await;
         eprintln!("[接收] 分块组装 {name} → {}", final_dest.display());
-        Ok(())
+        Ok(final_dest)
     }
 
     /// 0x0B：合并区间（None = 会话不存在）。
@@ -450,10 +453,10 @@ where
         left -= want as u64;
     }
     if completed {
-        opts.chunk_sessions.finish(gid, opts).await?;
+        let final_dest = opts.chunk_sessions.finish(gid, opts).await?;
         // 组装发布即成功记账（0x02 无独立应答帧；重试收敛于成功不重复入账——
         // 组装后会话保留完成态，重复块/迟到 0x0C 不再触发 finish）。
-        crate::transfer::receiver::record_recv(opts, peer, total, 1, started, "分块传输", &name);
+        crate::transfer::receiver::record_recv(opts, peer, total, 1, started, "分块传输", &final_dest);
     }
     Ok(())
 }

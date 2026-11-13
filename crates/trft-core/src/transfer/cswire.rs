@@ -50,6 +50,9 @@ pub const CS_MAX_CHUNK_RANGES: usize = 8192;
 const PRELUDE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 结尾 ACK 等待超时（C# UDT_RCVTIMEO 30s 口径）。
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// 判决读窗口（C# LongReadWindowMs 同值 300s）：0x11 判决与跳过清单应答前，
+/// 服务端可能对冷文件整盘现算哈希（规格 §6.1），30s 普通窗口不够。
+const LONG_READ_WINDOW: Duration = Duration::from_secs(300);
 
 pub const F_SINGLE: u8 = 0x00;
 pub const F_FOLDER: u8 = 0x01;
@@ -496,6 +499,8 @@ pub struct CsWire<S> {
     enc_w: Option<CsEncWrite>,
     comp_r: Option<CsCompRead>,
     comp_w: Option<CsCompWrite>,
+    /// 0x0A 能力探询的服务端应答位（未探询 = 0）。
+    pub server_caps: u8,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> CsWire<S> {
@@ -506,6 +511,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> CsWire<S> {
             enc_w: None,
             comp_r: None,
             comp_w: None,
+            server_caps: 0,
         }
     }
 
@@ -1060,12 +1066,16 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 let mut pad = [0u8; 16];
                 wire.read_exact(&mut pad).await?;
+                // 应答走装饰器栈（write_all）：0x08 可能在 0x09 之后到达——此时
+                // 加密层已装入，C# 客户端经加密流读 0x18，裸写会被 C# 的段格式
+                // 解析卡死到 8s 响应窗超时（实机 F2 排障实录，TECH-STACK §7.31）。
+                // 压缩层此刻尚未装入（enable_compress 在应答之后），无叠层问题。
                 if opts.compress {
-                    wire.raw_write(&[R_COMPRESS, 0]).await?;
+                    wire.write_all(&[R_COMPRESS, 0]).await?;
                     wire.enable_compress();
                 } else {
                     // 状态非 0：对端继续明文（C# 客户端宽容降级，不重连）。
-                    wire.raw_write(&[R_COMPRESS, 1]).await?;
+                    wire.write_all(&[R_COMPRESS, 1]).await?;
                 }
             }
             F_CAPS => {
@@ -1079,7 +1089,8 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 let mut caps = [0u8; 1];
                 wire.read_exact(&mut caps).await?;
-                wire.raw_write(&[R_CAPS, 0x03]).await?;
+                // 同 0x08：0x1A 应答必须经装饰器栈（此时可能已压缩+加密）。
+                wire.write_all(&[R_CAPS, 0x03]).await?;
                 *per_file_skip = caps[0] & 0x01 != 0;
                 *chunk_sessions = caps[0] & 0x02 != 0;
             }
@@ -1164,7 +1175,7 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
             outcome.success = ok;
         }
         F_TEXT => {
-            handle_text(wire, opts).await?;
+            handle_text(wire, peer, opts).await?;
             outcome.success = true;
         }
         F_COVER_Q => {
@@ -1296,7 +1307,7 @@ async fn handle_single_file<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(r) = &reporter {
         r.finish();
     }
-    record_recv(opts, peer, size as u64, 1, Instant::now(), &name, &name);
+    record_recv(opts, peer, size as u64, 1, Instant::now(), "直接发送", &save_path);
     Ok(size as u64)
 }
 
@@ -1358,7 +1369,7 @@ async fn handle_folder<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(r) = &reporter {
         r.finish();
     }
-    record_recv(opts, peer, total, file_count as u32, Instant::now(), &folder, &folder);
+    record_recv(opts, peer, total, file_count as u32, Instant::now(), "整夹发送", &folder_dir);
     Ok((total, file_count as u32))
 }
 
@@ -1489,11 +1500,19 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             .lock()
             .expect("tracker 锁")
             .remove(&tracker_key);
-        if t.is_some() {
+        if let Some(tr) = t {
             if let Some(g) = &group_key {
                 state.group_peers.lock().expect("组归属锁").remove(g);
             }
-            record_recv(opts, peer, total as u64, 1, Instant::now(), &name, &name);
+            record_recv(
+                opts,
+                peer,
+                total as u64,
+                1,
+                Instant::now(),
+                "分块传输",
+                &tr.save_path,
+            );
             if let Some(r) = &reporter {
                 r.finish();
             }
@@ -1584,11 +1603,9 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
     };
     match session {
         Session::Done(path) => {
+            record_recv(opts, peer, total as u64, 1, Instant::now(), "续传传输", &path);
             let st = state.resume.lock().expect("resume 锁").remove(&key);
-            if let Some(st) = st {
-                record_recv(opts, peer, total as u64, 1, Instant::now(), &st.name, &st.name);
-            }
-            let _ = path;
+            drop(st);
             if let Some(r) = &reporter {
                 r.finish();
             }
@@ -1700,7 +1717,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let st = state.resume.lock().expect("resume 锁").remove(key);
     if let Some(st) = st {
-        record_recv(opts, peer, total, 1, Instant::now(), &st.name, &st.name);
+        record_recv(opts, peer, total, 1, Instant::now(), "续传传输", &st.save_path);
     }
     if let Some(r) = reporter {
         r.finish();
@@ -1832,8 +1849,8 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             total_bytes as u64,
             file_count as u32,
             Instant::now(),
-            &folder,
-            &folder,
+            "文件夹同步",
+            &dir,
         );
         return Ok((true, total_bytes as u64, file_count as u32));
     }
@@ -1943,14 +1960,15 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
         total_bytes as u64,
         files.max(1),
         Instant::now(),
-        &folder,
-        &folder,
+        "文件夹同步",
+        &dir,
     );
     Ok((true, total_bytes as u64, files))
 }
 
 async fn handle_text<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut CsWire<S>,
+    peer: SocketAddr,
     opts: &RecvOptions,
 ) -> Result<u64> {
     let mut len_buf = [0u8; 4];
@@ -1967,16 +1985,36 @@ async fn handle_text<S: AsyncRead + AsyncWrite + Unpin>(
     } else {
         eprintln!("[文本] {text}");
     }
+    // 与主方言 0x06 同口径记账（无落盘路径——历史行不提供定位）。
+    record_recv(
+        opts,
+        peer,
+        len as u64,
+        0,
+        Instant::now(),
+        "文本消息",
+        Path::new(""),
+    );
     Ok(len as u64)
 }
 
 /* ============ 客户端（v2 → C#） ============ */
 
-/// 建连 + 认证栈（0x09/0x05 → 0x08），返回组合线。
+/// 建连 + 认证栈（0x09/0x05 → 0x08；不探询能力——0x00/0x01/0x06 客户端用）。
 pub async fn cs_connect_stack(
     addr: SocketAddr,
     opts: &crate::transfer::sender::SendOptions,
 ) -> Result<CsWire<UdtStream>> {
+    Ok(cs_connect_stack_full(addr, opts, 0).await?.0)
+}
+
+/// 建连 + 认证栈。`caps_req`：0x0A 能力探询请求位（0 = 不探询；0x01 = 0x04
+/// 逐文件跳过清单）。返回 (线, 服务端能力位)。
+pub async fn cs_connect_stack_full(
+    addr: SocketAddr,
+    opts: &crate::transfer::sender::SendOptions,
+    caps_req: u8,
+) -> Result<(CsWire<UdtStream>, u8)> {
     let stream = connect_udt(addr, opts.src_port).await?;
     let mut wire = CsWire::new(stream);
     let code = opts.pairing_code.clone().unwrap_or_default();
@@ -1992,6 +2030,17 @@ pub async fn cs_connect_stack(
             cs_client_pairing(&mut wire, &code).await?;
         }
     }
+    negotiate_tail(&mut wire, opts, caps_req).await?;
+    let caps = wire.server_caps;
+    Ok((wire, caps))
+}
+
+/// 认证后的压缩/能力协商尾段。
+async fn negotiate_tail<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    opts: &crate::transfer::sender::SendOptions,
+    caps_req: u8,
+) -> Result<()> {
     if opts.compress {
         let mut pad = [0u8; 16];
         use rand_core::RngCore;
@@ -2009,7 +2058,20 @@ pub async fn cs_connect_stack(
         }
         // 其余状态：对端婉拒 → 明文继续（同连接）。
     }
-    Ok(wire)
+    if caps_req != 0 {
+        // 0x0A 能力探询（认证后；C# 客户端 AuthenticateAsync capabilities 同位）。
+        wire.write_all(&[F_CAPS, caps_req]).await?;
+        let mut resp = [0u8; 2];
+        tokio::time::timeout(PRELUDE_TIMEOUT, wire.read_exact(&mut resp))
+            .await
+            .map_err(|_| proto("0x0A 能力应答超时"))?
+            .map_err(Error::Io)?;
+        if resp[0] != R_CAPS {
+            return Err(proto("0x0A 能力应答类型不符"));
+        }
+        wire.server_caps = resp[1];
+    }
+    Ok(())
 }
 
 /// 结尾裸 ACK 读取（0x01 成功 / 0x00 拒绝 / EOF·超时 = 结果未知 → 失败）。
@@ -2104,6 +2166,11 @@ pub async fn cs_send_folder<S: AsyncRead + AsyncWrite + Unpin>(
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
+            // 本地摘要缓存产物不是要发送的内容（v2 帧 collect_files 同口径——
+            // 否则 0x04 二轮起把 .trft-hash-cache.txt 当文件传给对端）。
+            if crate::hashcache::is_cache_artifact(&e.file_name().to_string_lossy()) {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, out);
             } else if p.is_file() {
@@ -2215,6 +2282,316 @@ pub async fn send_file_cs(
             .unwrap_or("file")
             .to_string();
         crate::transfer::sender::record_stats(opts, addr, bytes, 1, started, "单文件", &name);
+        Ok(())
+    }
+    .await;
+    if res.is_ok() {
+        outcome.finish();
+    }
+    res
+}
+
+/// C# DeriveSyncSession 同式：SHA1("sync|<folder>|<ip>|<port>|udt") 前 16B。
+/// 与 C# CLI/GUI sync 的稳定会话互认（服务端会话目录 `<folder>.<guid8>` 一致）。
+fn derive_sync_session_guid(folder: &str, ip: &str, port: u16) -> [u8; 16] {
+    use sha1::Digest as _;
+    let key = format!(
+        "sync|{}|{}|{}|udt",
+        folder.trim_end_matches(['\\', '/']).to_lowercase(),
+        ip,
+        port
+    );
+    let h = sha1::Sha1::digest(key.as_bytes());
+    h[..16].try_into().expect("SHA1 >= 16B")
+}
+
+/// C# 方言 0x04 差量同步客户端（v2 → C#；C# SendFolderResumableAsync keepState
+/// 同构）。`client_cache`：发送端摘要缓存（命中免算哈希，现算后回填——与 v2 帧
+/// 0x04 同口径）。返回 (发送字节, 发送文件数；服务端已全有 = (0,0))。
+pub(crate) struct CsSyncManifest {
+    pub folder: String,
+    pub entries: Vec<CsSyncEntry>,
+    pub total: u64,
+}
+
+pub(crate) struct CsSyncEntry {
+    pub rel: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub hash: [u8; 32],
+}
+
+/// 清单构建（**建连前**调用——C# BuildFolderManifest 同款：哈希在连接后现算
+/// 会撞服务端 30s 收超时）。命中发送端摘要缓存免算，现算后回填（纳秒粒度键，
+/// 同 §7.31：秒粒度同秒同长改写 = 漏改）。
+pub(crate) async fn build_sync_manifest(
+    path: &Path,
+    client_cache: Option<&std::sync::Arc<tokio::sync::Mutex<crate::hashcache::HashCache>>>,
+) -> Result<CsSyncManifest> {
+    let raw = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| crate::error::config_err("路径没有合法 UTF-8 目录名"))?;
+    let folder = crate::protocol::frame::sanitize_name(raw)?;
+    // 递归清单（确定性排序，与 cs_send_folder 同款）。
+    let mut files: Vec<PathBuf> = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            // 本地摘要缓存产物不是要发送的内容（v2 帧 collect_files 同口径——
+            // 否则 0x04 二轮起把 .trft-hash-cache.txt 当文件传给对端）。
+            if crate::hashcache::is_cache_artifact(&e.file_name().to_string_lossy()) {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    walk(path, &mut files);
+    if files.is_empty() {
+        return Err(crate::error::config_err("目录为空（0x04 要求 fileCount >= 1）"));
+    }
+    if files.len() > CS_MAX_FOLDER_FILES {
+        return Err(crate::error::config_err("目录文件数超上限"));
+    }
+    let mut entries = Vec::with_capacity(files.len());
+    let mut total: u64 = 0;
+    for p in &files {
+        let rel_raw = p
+            .strip_prefix(path)
+            .map_err(|_| crate::error::config_err("相对路径解析失败"))?
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let rel = cs_sanitize_rel(&rel_raw);
+        let meta = tokio::fs::metadata(p).await?;
+        let size = meta.len();
+        if size > CS_MAX_TRANSFER {
+            return Err(crate::error::config_err("文件超过声明上限（1 PiB）"));
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let known = match client_cache {
+            Some(c) => c.lock().await.get(&rel, size, mtime),
+            None => None,
+        };
+        let hash = match known {
+            Some(h) => h,
+            None => {
+                let h = crate::hash::sha256_file(p)?;
+                if let Some(c) = client_cache {
+                    c.lock().await.insert(&rel, size, mtime, h);
+                }
+                h
+            }
+        };
+        total += size;
+        entries.push(CsSyncEntry { rel, path: p.clone(), size, hash });
+    }
+    Ok(CsSyncManifest { folder, entries, total })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cs_send_folder_sync<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    manifest: &CsSyncManifest,
+    sid: [u8; 16],
+    per_file_skip: bool,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<(u64, u32)> {
+    let entries = &manifest.entries;
+    let folder = &manifest.folder;
+    let reporter = opts.progress.as_ref();
+    // 头：[0x04][sessionId 16][folderNameLen i16][folderName][fileCount i32][totalBytes i64]
+    let mut header = Vec::with_capacity(1 + 16 + 2 + folder.len() + 4 + 8);
+    header.push(F_FOLDER_RESUME);
+    header.extend_from_slice(&sid);
+    header.extend_from_slice(&(folder.len() as i16).to_le_bytes());
+    header.extend_from_slice(folder.as_bytes());
+    header.extend_from_slice(&(entries.len() as i32).to_le_bytes());
+    header.extend_from_slice(&(manifest.total as i64).to_le_bytes());
+    wire.write_all(&header).await?;
+    // 清单：每文件 [size i64][pathLen i16][relPath][fullHash 32]
+    for e in entries.iter() {
+        let mut m = Vec::with_capacity(10 + e.rel.len() + 32);
+        m.extend_from_slice(&(e.size as i64).to_le_bytes());
+        m.extend_from_slice(&(e.rel.len() as i16).to_le_bytes());
+        m.extend_from_slice(e.rel.as_bytes());
+        m.extend_from_slice(&e.hash);
+        wire.write_all(&m).await?;
+    }
+
+    // 0x11 判决（长窗口）。
+    let mut resp = [0u8; 18];
+    tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp))
+        .await
+        .map_err(|_| proto("0x11 同步判决应答超时（300s）"))?
+        .map_err(Error::Io)?;
+    if resp[0] == 0x00 {
+        // 接收前确认未通过：服务端写判决字节后拒绝（C# C_RejectedByPeer 同判）。
+        return Err(Error::Rejected("被对端拒绝接收（接收前确认未通过）".into()));
+    }
+    if resp[0] != R_FOLDER_RESUME {
+        return Err(proto("同步判决应答类型不符"));
+    }
+    let resume_index = i64::from_le_bytes(resp[1..9].try_into().expect("8B"));
+    let resume_offset = i64::from_le_bytes(resp[9..17].try_into().expect("8B"));
+    let status = resp[17];
+    if resume_index < 0
+        || resume_index > entries.len() as i64
+        || resume_offset < 0
+        || resume_offset as u64
+            > entries
+                .get(resume_index as usize)
+                .map(|e| e.size)
+                .unwrap_or(0)
+    {
+        return Err(proto("同步判决续点非法"));
+    }
+
+    // 进度总量 = 差量（status 2 = 服务端已全有 → 零传输）。
+    if let Some(r) = &reporter {
+        let to_send: u64 = if status == 2 {
+            0
+        } else {
+            entries
+                .iter()
+                .enumerate()
+                .skip(resume_index as usize)
+                .map(|(i, e)| {
+                    if i == resume_index as usize {
+                        e.size.saturating_sub(resume_offset as u64)
+                    } else {
+                        e.size
+                    }
+                })
+                .sum()
+        };
+        r.set_total(to_send);
+    }
+    if status == 2 {
+        // 服务端已持有全部文件（目录/哈希一致）——带外 ACK 后收工。
+        cs_read_final_ack(wire).await?;
+        if let Some(r) = &reporter {
+            r.finish();
+        }
+        return Ok((0, 0));
+    }
+
+    // 逐文件跳过清单（0x0A bit0 协商成功且续点未到末尾）：声明剩余文件 →
+    // 服务端逐个回 0 跳过 / 1 需发送（C# NegotiatePerFileSkipAsync 同构）。
+    let mut need: Option<Vec<bool>> = None;
+    if per_file_skip {
+        for e in &entries[resume_index as usize..] {
+            let mut m = Vec::with_capacity(10 + e.rel.len() + 32);
+            m.extend_from_slice(&(e.size as i64).to_le_bytes());
+            m.extend_from_slice(&(e.rel.len() as i16).to_le_bytes());
+            m.extend_from_slice(e.rel.as_bytes());
+            m.extend_from_slice(&e.hash);
+            wire.write_all(&m).await?;
+        }
+        let n = entries.len() - resume_index as usize;
+        let mut answers = vec![0u8; n];
+        tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut answers))
+            .await
+            .map_err(|_| proto("跳过清单应答超时（300s）"))?
+            .map_err(Error::Io)?;
+        need = Some(answers.iter().map(|&a| a == 1).collect());
+    }
+
+    // 顺序发（首个自 resumeOffset 续传；每段载荷尾随**增量**的 SHA-256——
+    // 服务端对续传文件按增量哈希核对，C# SendFilePayload 同构）。
+    let mut lim = TokenBucket::new(opts.speed_limit_bps);
+    let mut sent_bytes = 0u64;
+    let mut sent_files = 0u32;
+    for (i, e) in entries.iter().enumerate().skip(resume_index as usize) {
+        if let Some(n) = &need {
+            if !n[i - resume_index as usize] {
+                continue;
+            }
+        }
+        let start = if i == resume_index as usize {
+            resume_offset as u64
+        } else {
+            0
+        };
+        let send_size = e.size - start;
+        let mut f = tokio::fs::File::open(&e.path).await?;
+        use tokio::io::AsyncSeekExt as _;
+        f.seek(std::io::SeekFrom::Start(start)).await?;
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        let mut buf = vec![0u8; crate::transfer::CHUNK];
+        let mut left = send_size;
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            let n = f.read(&mut buf[..want]).await?;
+            if n == 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("{}: 文件读取提前结束", e.rel),
+                )));
+            }
+            lim.acquire(n as u64).await;
+            hasher.update(&buf[..n]);
+            wire.write_all(&buf[..n]).await?;
+            if let Some(r) = &reporter {
+                r.add(n as u64);
+            }
+            left -= n as u64;
+        }
+        let inc_hash: [u8; 32] = hasher.finalize().into();
+        wire.write_all(&inc_hash).await?;
+        sent_bytes += send_size;
+        sent_files += 1;
+    }
+    // 带外 1B ACK（UDT 裸流——装饰器之外；C# RunUdtTransfer 同款）。
+    cs_read_final_ack(wire).await?;
+    if let Some(r) = &reporter {
+        r.finish();
+    }
+    Ok((sent_bytes, sent_files))
+}
+
+/// UDT 槽位差量同步（v2 → C# 0x04；会话 GUID 与 C# DeriveSyncSession 同式，
+/// 同一 (folder, target) 的重复同步与 C# 客户端互相接力）。
+pub async fn send_folder_sync_cs(
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+    client_cache: Option<&std::sync::Arc<tokio::sync::Mutex<crate::hashcache::HashCache>>>,
+) -> Result<()> {
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
+    let started = Instant::now();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("folder")
+        .to_string();
+    let res = async {
+        // 清单（全文件哈希）在**建连前**构建——C# BuildFolderManifest 同款：
+        // 大目录建连后现算哈希会撞服务端 30s 收超时。
+        let manifest = build_sync_manifest(path, client_cache).await?;
+        // 0x01 能力位（逐文件跳过清单）随认证栈协商。
+        let (mut wire, caps) = cs_connect_stack_full(addr, opts, 0x01).await?;
+        let per_file_skip = caps & 0x01 != 0;
+        let sid =
+            derive_sync_session_guid(&path.to_string_lossy(), &addr.ip().to_string(), addr.port());
+        let (bytes, files) =
+            cs_send_folder_sync(&mut wire, &manifest, sid, per_file_skip, opts).await?;
+        let _ = wire.shutdown().await;
+        crate::transfer::sender::record_stats(opts, addr, bytes, files, started, "文件夹同步", &name);
         Ok(())
     }
     .await;
@@ -2473,7 +2850,7 @@ mod tests {
         let got = std::fs::read(&path).unwrap();
         assert_eq!(got.len(), 400);
         let want: Vec<u8> = (0..4)
-            .flat_map(|k| seg.iter().map(move |b| *b))
+            .flat_map(|_| seg.iter().map(move |b| *b))
             .collect();
         assert_eq!(got, want, "乱序写入必须逐字节一致");
     }

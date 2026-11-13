@@ -362,3 +362,33 @@ async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
     assert!(stole.load(Ordering::SeqCst), "放行走 0x05（测试前提自检）");
     server.abort();
 }
+
+/// §7.31 双栈判别：QUIC 通配 [::] endpoint 必须收得到 IPv4 客户端
+/// （Endpoint::new + 自建双栈 socket 路径；去掉仅_v6(false) 本测必红）。
+#[tokio::test]
+async fn quic_v6_wildcard_accepts_v4_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("q6.bin");
+    std::fs::write(&src, b"quic dual-stack").unwrap();
+    let out = dir.path().join("out");
+
+    let (endpoint, cert_fp) = server_endpoint("[::]:0".parse().unwrap()).await.unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let v4 = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port());
+    let server = tokio::spawn(serve_quic_on(endpoint, cert_fp, opts(out.clone(), None, 1)));
+
+    let mut send_opts = SendOptions::default();
+    send_opts.transport = Transport::Quic;
+    trft_core::transfer::sender::send_file(v4, &src, &send_opts)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(15), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sha256_file(&out.join("q6.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
+}

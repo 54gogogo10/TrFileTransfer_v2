@@ -85,7 +85,7 @@
 | TCP | 可靠字节流 | 有 | 全部支持 | 0x03 / 0x04 / 分块覆盖率续传 | 通用、防火墙友好 |
 | QUIC | QUIC（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定） | 有 | 配对支持；机密性由 TLS 承担；压缩支持 | 同 TCP | 加密传输 / `--pin` 钉扎 |
 | RUDP | 自研可靠 UDP 流（`transfer::rudp`，ARQ+SACK+固定窗口；与 UDT4/任何外部协议不做包级互通，WIRE-PROTOCOL.md §7；曾名 UDT，见 §9.2 更名行） | 有 | 全部支持（线协议同 TCP，0x09 加密可选） | 同 TCP | 高丢包链路 |
-| UDT | 真 UDT4 协议（`transfer::udt` 引擎 + `transfer::cswire` C# 方言应用层；**唯一与原 C# 版 2.14 互通的槽位**——WIRE-PROTOCOL.md §9/§10，TECH-STACK §7.30） | 有 | 单文件/目录/文本收发 + 0x02 并发分块/0x03 断点/0x04 目录同步接收（C# 方言全帧集）；0x09 ECDH 加密（CNG blob + PBKDF2-HMAC-SHA1，与 C# 逐字节互通） | C# 方言（小端、CNG 公钥 blob、裸流 1B ACK） | 与原 C# 版安装互传 |
+| UDT | 真 UDT4 协议（`transfer::udt` 引擎 + `transfer::cswire` C# 方言应用层；**唯一与原 C# 版 2.14 互通的槽位**——WIRE-PROTOCOL.md §9/§10，TECH-STACK §7.30） | 有 | 单文件/目录/文本收发 + 0x02 并发分块/0x03 断点/0x04 目录同步（接收 + `(Rust)` 差量同步客户端双向——会话 GUID 与 C# DeriveSyncSession 同式互认，TECH-STACK §7.31）（C# 方言全帧集）；0x09 ECDH 加密（CNG blob + PBKDF2-HMAC-SHA1，与 C# 逐字节互通） | C# 方言（小端、CNG 公钥 blob、裸流 1B ACK） | 与原 C# 版安装互传 |
 | 单向 UDP | 裸 UDP 数据报 | **无** | **不支持**（无握手通道，帮助文案明示） | 「落盘即状态」：重发即续传 | 单向链路、极简接收端 |
 
 **通用传输行为**（四协议共用，除非注明）：
@@ -142,7 +142,7 @@
 
 ### 3.3 接收侧功能
 
-- **五协议标签页**（v2.14+ 三页；UDT/QUIC 拆分后四页（更名批定名 RUDP），UDT 批新增第 5 页）：TCP / QUIC / RUDP / UDT / UDP 各自独立的绑定地址多选（族通配 + 具体网卡，每勾选地址一个监听器）、端口、**保存目录**（`SaveDirTCP/QUIC/RUDP/UDP`，旧单键 `SaveDir` 首启自动迁移、多页初始同值）；可同时运行、独立启停；标签头 `●` 标记运行态。注：拆分前的「UDT 页」实为 QUIC 槽位（TECH-STACK §7.28）。
+- **五协议标签页**（v2.14+ 三页；UDT/QUIC 拆分后四页（更名批定名 RUDP），UDT 批新增第 5 页）：TCP / QUIC / RUDP / UDT / UDP 各自独立的绑定地址多选（族通配 `0.0.0.0` / `::` + 具体网卡——v6 网卡地址跳过链路本地/站点本地；`(Rust)` 通配 `::` 为**双栈监听**（IPv4 经映射进入，原版同语义，TECH-STACK §7.31），每勾选地址一个监听器）、端口、**保存目录**（`SaveDirTCP/QUIC/RUDP/UDP`，旧单键 `SaveDir` 首启自动迁移、多页初始同值）；可同时运行、独立启停；标签头 `●` 标记运行态。注：拆分前的「UDT 页」实为 QUIC 槽位（TECH-STACK §7.28）。
 - **运行中不锁配置**：某协议启动后仅该页的绑定/端口/目录冻结，其他协议页随时可改。
 - **端口冲突检测**（v2.14+）：启动前逐地址预检——进程内同传输监听（TCP 独立；QUIC/RUDP × 裸 UDP 同承载于 UDP，同端口互斥）+ OS 精确探测（族独立）；冲突弹窗逐地址列出，全被外部进程占用时保留「换下一可用端口」提议。
 - **接收选项**（对话框；目录类选项下次服务器启动生效，有提示）：
@@ -160,7 +160,7 @@
 
 - **接收文件管理**：「打开目录」（当前选中标签页的目录）/「最近接收」（内存 100 条）；按日期归档 `AutoArchive`。
 - **设备记忆与发现**：传输成功记入已知设备（`Name|Ip|Port|flags`，上限 10 条）；UDP 广播发现（`0xD1`→`0xD2`，默认端口 45000，响应含 TCP/QUIC/RUDP/UDT/需配对标志位（WIRE-PROTOCOL.md §6.2 向后兼容布局），仅 IPv4；与 C# 版发现双向兼容——裸 0xD1 探测回 C# 格式应答，C# 0xD2 帧可解析）；已知设备管理对话框（使用/删除/清空）。
-- **统计与历史**：`stats.log` 追加式（>2MB 重写保留末 5000 行）；今日/7 天/累计聚合 + 按设备明细；历史对话框按方向筛选、资源管理器定位、导出 CSV（UTF-8 BOM）；「全部清除」危险按钮双视图同步。
+- **统计与历史**：`stats.log` 追加式（>2MB 重写保留末 5000 行）；今日/7 天/累计聚合 + 按设备明细；历史对话框按方向筛选、资源管理器定位（`(Rust)` 接收行记**最终落盘全路径**——对齐原版 WireSessionStats.Path，TECH-STACK §7.31）、导出 CSV（UTF-8 BOM）；「全部清除」危险按钮双视图同步。
 
 ### 3.4 HTTP 共享
 
@@ -404,7 +404,7 @@
 
 ### 10.2 CI 与发布
 
-- CI：当前仓库未配置（`.github/` 缺席）——发布前本地 `cargo test --workspace` + `build.bat` 全绿为准，CI 接入为待办项。
+- CI：`.github/workflows/ci.yml`（§7.26 闭环）：Windows 全量测试 + release 编译门；Linux/macOS 逻辑层三 crate；CLI `--version` 冒烟。
 - 发布：版本单源 `tauri.conf.json` / `Cargo.toml`；`build.bat` 产出 `release\TrFileTransfer-<版本>.exe`（CLI/GUI/server 三件）+ `.sha256` 边车（小写哈希 + ` *文件名`）+ 离线便携版 zip（`build\WebView2FixedRuntime\` 就绪时）。
 - **发布检查单**：① 版本号已递增；② 全量测试绿（0 告警）；③ GitHub Release 上传产物 + `.sha256`（升级器强依赖边车）；④ README/PRODUCT-SPEC/TECH-STACK/WIRE-PROTOCOL 文档同步；⑤ 便携版冷启动判别（子进程路径落在便携目录）。
 
@@ -427,7 +427,7 @@
 
 ### 12.1 配置键参考（按域分组）
 
-> `(Rust)` 下表为原 C# 键名（PascalCase）参考；本实现为 `config.toml` snake_case 字段，权威定义见 `trft-core/src/config.rs` 的 `Config` 结构（对应关系如 `ServerPortTCP→server_port_tcp`、`PairingLength→pairing_length`；`Mica`/`SoftwareRender`/`AutoUpdateCheck` 等未实现键不入库）。
+> `(Rust)` 下表为原 C# 键名（PascalCase）参考；本实现为 `config.toml` snake_case 字段，权威定义见 `trft-core/src/config.rs` 的 `Config` 结构（对应关系如 `ServerPortTCP→server_port_tcp`、`PairingLength→pairing_length`；`Mica`/`SoftwareRender` 等未实现键不入库；§7.31 后 `ClientIP`/`ClientPort`/`ClientProtocol`/`LastPath`/`AutoUpdateCheck` 已入库为 `client_ip`/`client_port`/`client_proto`/`last_path`/`auto_update_check`）。
 
 | 域 | 键 |
 |----|----|

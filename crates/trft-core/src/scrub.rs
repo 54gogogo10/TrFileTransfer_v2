@@ -131,7 +131,7 @@ pub fn verify_dir(
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let size = meta.len();
         report.scanned += 1;

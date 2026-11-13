@@ -592,3 +592,26 @@ async fn ip_filter_blocks_and_allows() {
     server.abort();
     assert!(out_path.join("f.bin").is_file(), "allow 命中必须成功接收");
 }
+
+#[tokio::test]
+async fn v6_wildcard_bind_accepts_v4_connection() {
+    // §7.31 双栈判别：通配 [::] 监听必须同时收 IPv4 对端。Windows 默认
+    // IPV6_V6ONLY=1——去掉 std_tcp_listener 的 only_v6(false) 本测必红。
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("dual.bin");
+    std::fs::write(&src, b"dual-stack payload").unwrap();
+    let out = dir.path().join("out");
+
+    let listener = trft_core::transfer::bind_tcp("[::]:0".parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // 服务端 socket 是 v6；发给客户端的地址必须是 v4 环回（走映射进双栈监听）。
+    let v4 = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port());
+    let server = tokio::spawn(serve_on(listener, opts(out.clone(), None, 1)));
+    send_file(v4, &src, &SendOptions::default()).await.unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(out.join("dual.bin").exists());
+}

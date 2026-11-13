@@ -504,7 +504,7 @@ mod tests {
         let cs = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         cs.send_to(&[0xD1u8], ans_addr).await.unwrap();
         let mut buf = vec![0u8; MAX_PACKET];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(3), cs.recv_from(&mut buf))
+        let (_, _) = tokio::time::timeout(Duration::from_secs(3), cs.recv_from(&mut buf))
             .await
             .expect("C# 探测必须有应答")
             .unwrap();

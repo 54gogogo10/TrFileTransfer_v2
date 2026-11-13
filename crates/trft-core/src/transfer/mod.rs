@@ -17,12 +17,62 @@ pub mod udp;
 /// C# 方言应用层（跑在 `transfer::udt` 之上；帧集与 C# 版 TCP 协议同构）。
 pub mod cswire;
 
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// 传输块大小：1 MiB（限速与进度节流的基准）。
 pub const CHUNK: usize = 1 << 20;
+
+/// 通配 IPv6（`::`）判定：唯一需要双栈的绑定地址（对齐原版「全部 IPv6」，
+/// TECH-STACK §7.31）。具体 IPv6 地址只服务本族，无需双栈。
+pub fn is_v6_wildcard(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unspecified())
+}
+
+/// TCP 监听 socket（socket2：通配 `::` 时关 only_v6 = **双栈**——Windows 默认
+/// IPV6_V6ONLY=1，不关则 `::` 收不到 IPv4；选项必须 bind 前设置）。
+pub fn std_tcp_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    if is_v6_wildcard(addr.ip()) {
+        let _ = sock.set_only_v6(false); // 平台不支持仅损失双栈（fail-open 与原版一致）
+    }
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    Ok(sock.into())
+}
+
+/// TCP 监听（tokio 封装，serve 入口用）。
+pub async fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let l = std_tcp_listener(addr)?;
+    l.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(l)
+}
+
+/// UDP 监听 socket（socket2：收缓冲 4MB 规格 §6.1；通配 `::` 时关 only_v6 = 双栈——
+/// QUIC/RUDP/UDT/单向 UDP 共用）。
+pub fn std_udp_listener(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    if is_v6_wildcard(addr.ip()) {
+        let _ = sock.set_only_v6(false);
+    }
+    sock.bind(&addr.into())?;
+    if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
+        eprintln!("[警告] UDP 收缓冲设置失败: {e}");
+    }
+    Ok(sock.into())
+}
 
 /// 流式传输通道（单向 UDP 不在此列——它走 `udp` 模块的无回传协议）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

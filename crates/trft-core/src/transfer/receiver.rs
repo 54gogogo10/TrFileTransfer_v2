@@ -320,6 +320,8 @@ impl Default for RecvOptions {
 }
 
 /// 接收侧成功记账（仅成功；与发送侧同口径——TECH-STACK §7.10）。
+/// `path` = 最终落盘全路径（历史「资源管理器定位」用；文本等无落盘路径传空——
+/// 对齐原版 WireSessionStats.Path 语义，TECH-STACK §7.31）。
 pub(crate) fn record_recv(
     opts: &RecvOptions,
     peer: SocketAddr,
@@ -327,7 +329,7 @@ pub(crate) fn record_recv(
     files: u32,
     started: Instant,
     detail: &str,
-    name: &str,
+    path: &Path,
 ) {
     if let Some(s) = &opts.stats {
         s.record(
@@ -337,7 +339,7 @@ pub(crate) fn record_recv(
             files,
             started.elapsed().as_secs(),
             detail,
-            name,
+            &path.display().to_string(),
         );
     }
 }
@@ -450,7 +452,7 @@ pub(crate) async fn confirm_once(peer: SocketAddr, opts: &RecvOptions, confirmed
 }
 
 pub async fn serve(addr: SocketAddr, opts: RecvOptions) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = crate::transfer::bind_tcp(addr).await.map_err(Error::Io)?;
     serve_on(listener, opts).await
 }
 
@@ -942,7 +944,7 @@ where
                     0,
                     t0,
                     "文本消息",
-                    "<文本>",
+                    Path::new(""),
                 );
                 *handled += 1;
             }
@@ -1119,7 +1121,7 @@ where
             outcome.finish();
             // skip 也是免费填充点（现有文件哈希已被证实——规格 §3.1 免费填充路径）。
             resume::fill_cache_at(opts, &dest, size, actual).await;
-            record_recv(opts, peer, 0, 1, started, "已存在（跳过）", &name);
+            record_recv(opts, peer, 0, 1, started, "已存在（跳过）", &dest);
             return Ok(()); // 新副本丢弃（guard 兜底删除 part）
         }
     }
@@ -1130,7 +1132,7 @@ where
     resume::fill_cache_at(opts, &final_dest, size, actual).await;
     eprintln!("[接收] {name} → {}", final_dest.display());
     outcome.finish();
-    record_recv(opts, peer, size, 1, started, "直接发送", &name);
+    record_recv(opts, peer, size, 1, started, "直接发送", &final_dest);
     Ok(())
 }
 

@@ -220,7 +220,7 @@ where
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+                .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
             c.lock().await.insert(rel, size, mtime, hash);
         }
@@ -343,7 +343,7 @@ where
         recv_files,
         started,
         "整夹发送",
-        &root_name,
+        &base,
     );
     eprintln!(
         "[接收] 文件夹 {root_name}（{count} 个文件）→ {}",

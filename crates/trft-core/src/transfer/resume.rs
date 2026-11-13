@@ -183,10 +183,12 @@ pub(crate) async fn dest_hash(
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> u64 {
+    // **纳秒粒度**（TECH-STACK §7.31）：秒粒度下同秒同长改写会让缓存键不变，
+    // 0x04 同步拿旧哈希误判「服务端已有」→ 增量备份漏改（静默丢数据方向）。
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -275,7 +277,7 @@ where
                     reply_nego(s, NEGO_SKIP, 0).await?;
                     fill_cache_at(opts, &dest, size, claimed).await;
                     outcome.finish();
-                    record_recv(opts, peer, 0, 1, started, "已存在（跳过）", &name);
+                    record_recv(opts, peer, 0, 1, started, "已存在（跳过）", &dest);
                     return Ok(());
                 }
             }
@@ -392,7 +394,7 @@ where
     fill_cache_at(opts, &final_dest, size, claimed).await;
     eprintln!("[接收] 续传 {name}（自 {offset}）→ {}", dest.display());
     outcome.finish();
-    record_recv(opts, peer, size - offset, 1, started, "续传传输", &name);
+    record_recv(opts, peer, size - offset, 1, started, "续传传输", &final_dest);
     Ok(())
 }
 
@@ -512,7 +514,7 @@ where
         to_receive as u32,
         started,
         "文件夹同步",
-        &root_name,
+        &base,
     );
     eprintln!(
         "[接收] 文件夹同步 {root_name}（{to_receive}/{count} 个文件）→ {}",
@@ -842,11 +844,12 @@ pub async fn send_folder_resume(
         if size > MAX_TRANSFER_SIZE {
             return Err(proto(format!("{rel}: 单文件超过 1 PiB 上限")));
         }
+        // 纳秒粒度缓存键（同 §7.31：秒粒度同秒同长改写 = 漏改）。
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let known = match client_cache {
             Some(c) => c.lock().await.get(rel, size, mtime),

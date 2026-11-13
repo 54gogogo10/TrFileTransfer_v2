@@ -154,7 +154,21 @@ pub async fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, [u8; 
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .map_err(|e| proto(format!("QUIC 服务端配置失败: {e}")))?;
     let cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    Ok((quinn::Endpoint::server(cfg, addr).map_err(io_err)?, fp))
+    // 通配 `::` 用自建双栈 socket（quinn 默认绑定 v6only——Windows 上收不到
+    // IPv4 对端；TECH-STACK §7.31），其余走 Endpoint::server 平台默认。
+    let endpoint = if crate::transfer::is_v6_wildcard(addr.ip()) {
+        let socket = crate::transfer::std_udp_listener(addr).map_err(io_err)?;
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(cfg),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(io_err)?
+    } else {
+        quinn::Endpoint::server(cfg, addr).map_err(io_err)?
+    };
+    Ok((endpoint, fp))
 }
 
 pub async fn connect_quic(addr: SocketAddr, pin: Option<[u8; 32]>) -> Result<QuicStream> {

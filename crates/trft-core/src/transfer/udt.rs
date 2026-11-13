@@ -31,6 +31,19 @@ use tokio::sync::{watch, Notify};
 const CWND_INIT: f64 = 16.0;
 /// 接收重排缓冲上限（对端 libudt 收缓冲默认 8192 包；本地对等取同值）。
 const REORDER_CAP: usize = 8192;
+
+/// 连接本地 µs 时钟（Instant 单调；探测/到达窗与 SYN 节流共用）。
+fn now_us_since(epoch: &Instant) -> u64 {
+    epoch.elapsed().as_micros() as u64
+}
+
+/// 中位数（libudt nth_element 同效；不改原序——拷贝小窗排序）。
+fn median_of(win: &[u32; 16]) -> u32 {
+    let mut c = *win;
+    c.sort_unstable();
+    c[8]
+}
+
 /// 重传兜底扫描节流（NAK 触发即发，不受此限）。
 const RETRANS_MIN_INTERVAL: Duration = Duration::from_millis(50);
 /// 驱动节拍（libudt ACK/EXP 检查粒度 = SYN 10ms）。
@@ -121,6 +134,21 @@ struct RecvState {
     /// light ACK 计数（每 64 包一个）。
     pkt_count: i32,
     light_count: i32,
+    /// 最近一次 **6 词** ACK 时刻（libudt m_ullLastAckTime：word4/5 的 SYN 节流
+    /// 与重复 ACK 守卫共用——只在 6 词分支刷新）。
+    last_full_us: u64,
+    /// 包到达间隔窗（µs，16 槽，中位数滤波——libudt CPktTimeWindow 同款，
+    /// 喂 ACK word4 接收速率；UDT4 互通必需，缺失时 libudt CC 退出慢启动后
+    /// `cwnd = RcvRate/1e6×(RTT+RC)+16` 恒钉 16 包 → 发送端 750 pkt/s 塌陷）。
+    pkt_win: [u32; 16],
+    pkt_ptr: usize,
+    last_arr_us: u64,
+    /// 探测对间隔窗（µs，16 槽——seq&0xF==0/1 成对到达测链路容量，喂 word5）。
+    probe_win: [u32; 16],
+    probe_ptr: usize,
+    probe_time_us: u64,
+    /// µs 时钟基准（连接建立时刻；Instant 单调）。
+    epoch: Instant,
 }
 
 impl RecvState {
@@ -141,7 +169,61 @@ impl RecvState {
             ack_immediate: false,
             pkt_count: 0,
             light_count: 1,
+            last_full_us: 0,
+            pkt_win: [1_000_000; 16],
+            pkt_ptr: 0,
+            last_arr_us: 0,
+            probe_win: [1_000; 16],
+            probe_ptr: 0,
+            probe_time_us: 0,
+            epoch: Instant::now(),
         }
+    }
+
+    /// 包到达记账（libudt CPktTimeWindow::onPktArrival 同款；每个 DATA 到达调用）。
+    fn on_pkt_arrival(&mut self, now_us: u64, seq: i32) {
+        let interval = (now_us - self.last_arr_us).min(u32::MAX as u64) as u32;
+        self.pkt_win[self.pkt_ptr] = interval;
+        self.pkt_ptr = (self.pkt_ptr + 1) % 16;
+        self.last_arr_us = now_us;
+        // 探测对：seq 低 4 位 0/1 成对（libudt processData 同判）。
+        if seq & 0xF == 0 {
+            self.probe_time_us = now_us;
+        } else if seq & 0xF == 1 && self.probe_time_us > 0 {
+            let gap = (now_us - self.probe_time_us).min(u32::MAX as u64) as u32;
+            self.probe_win[self.probe_ptr] = gap;
+            self.probe_ptr = (self.probe_ptr + 1) % 16;
+        }
+    }
+
+    /// 接收速率估计（包/秒；中位数滤波，样本不足半窗回 0——libudt getPktRcvSpeed）。
+    fn pkt_rcv_speed(&self) -> u32 {
+        let median = median_of(&self.pkt_win);
+        let (mut count, mut sum) = (0u32, 0u64);
+        for &v in &self.pkt_win {
+            if v < median * 8 && v > median / 8 {
+                count += 1;
+                sum += v as u64;
+            }
+        }
+        if count > 8 {
+            (1_000_000.0 / (sum as f64 / count as f64)).ceil() as u32
+        } else {
+            0
+        }
+    }
+
+    /// 链路带宽估计（包/秒；探测对中位数滤波——libudt getBandwidth）。
+    fn bandwidth(&self) -> u32 {
+        let median = median_of(&self.probe_win);
+        let (mut count, mut sum) = (1u32, median as u64);
+        for &v in &self.probe_win {
+            if v < median * 8 && v > median / 8 {
+                count += 1;
+                sum += v as u64;
+            }
+        }
+        (1_000_000.0 / (sum as f64 / count as f64)).ceil() as u32
     }
 
     /// ACK cum：无损失 = curr+1；有损失 = 首个缺失 seq（libudt sendCtrl(2) 语义）。
@@ -433,6 +515,12 @@ impl UdtConn {
     /* ---------- 接收方向 ---------- */
 
     fn on_data(self: &Arc<Self>, seq: i32, payload: &[u8]) {
+        // 到达速率/探测对记账（libudt processData：每个到达先记时再处理）。
+        {
+            let mut r = self.recv.lock().expect("接收锁");
+            let now_us = now_us_since(&r.epoch);
+            r.on_pkt_arrival(now_us, seq);
+        }
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut nak_words: Option<Vec<u32>> = None;
         let mut eof_now = false;
@@ -557,13 +645,31 @@ impl UdtConn {
                     }
                     let last = r.last_ack_sent;
                     r.ack_window.insert(ack_no, (now, last));
-                    let words = [
+                    // libudt checkTimers ACK 分支：距上次 6 词 ACK > SYN → 附带
+                    // word4/5（接收速率/带宽估计）成 24B；否则 16B。libudt 发送端
+                    // CC 退出慢启动后 `cwnd = RcvRate/1e6×(RTT+RC)+16`——缺 word4
+                    // 时 cwnd 恒 16 包，C# 发送端塌陷到 ~750 pkt/s（实机 80MB 1MB/s
+                    // vs C#↔C# 63MB/s，TECH-STACK §7.31）。
+                    let now_us = now_us_since(&r.epoch);
+                    let six = now_us - r.last_full_us > pw::SYN_US as u64;
+                    if six {
+                        r.last_full_us = now_us;
+                    }
+                    let mut words = [
                         last as u32,
                         r.rtt_us as u32,
                         r.rttvar_us as u32,
                         r.avail_buf() as u32,
+                        0,
+                        0,
                     ];
-                    self.send_ctrl(pw::C_ACK, ack_no, &words);
+                    if six {
+                        words[4] = r.pkt_rcv_speed();
+                        words[5] = r.bandwidth();
+                    }
+                    // 线上保真：非 6 词节拍发 16B（4 词）——libudt 同款。
+                    let out_words: &[u32] = if six { &words } else { &words[..4] };
+                    self.send_ctrl(pw::C_ACK, ack_no, out_words);
                     r.last_ack_time = now;
                     r.pkt_count = 0;
                     r.light_count = 1;
@@ -1073,23 +1179,14 @@ struct ConnEntry {
     hs_resp: Vec<u8>,
 }
 
-/// 监听并服务 UDT 连接（socket2 收缓冲 4MB，对齐 `serve_rudp` 口径）。
+/// 监听并服务 UDT 连接（收缓冲 4MB，对齐 `serve_rudp` 口径；通配 `::` 双栈——
+/// TECH-STACK §7.31）。
 pub async fn serve_udt(
     addr: SocketAddr,
     opts: crate::transfer::receiver::RecvOptions,
 ) -> Result<()> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None).map_err(Error::Io)?;
-    sock.set_nonblocking(true).map_err(Error::Io)?;
-    sock.bind(&addr.into()).map_err(Error::Io)?;
-    if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
-        eprintln!("[警告] UDT 收缓冲设置失败: {e}");
-    }
-    let std_sock: std::net::UdpSocket = sock.into();
+    let std_sock = crate::transfer::std_udp_listener(addr).map_err(Error::Io)?;
+    std_sock.set_nonblocking(true).map_err(Error::Io)?;
     let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
     serve_udt_on(socket, opts).await
 }

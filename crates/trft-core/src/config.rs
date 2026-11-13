@@ -96,6 +96,17 @@ pub struct Config {
     /// 发送队列失败自动重试次数（规格 §3.2/§12.1 QueueRetries：0–5，默认 1；
     /// 轮 6 P2-3 补齐——此前队列失败仅记日志继续，无重试）。
     pub queue_retries: u32,
+    /// 发送面板目标记忆（规格 §12.1 ClientIP/ClientPort/ClientProtocol——对齐原版
+    /// 跨重启恢复发送面板，TECH-STACK §7.31；保存时机 = 发送动作/浏览选盘，非关窗）。
+    pub client_ip: Option<String>,
+    pub client_port: Option<u16>,
+    /// 发送协议（tcp/quic/rudp/udt/udp；前端下拉值）。
+    pub client_proto: Option<String>,
+    /// 文件对话框记忆目录（规格 §12.1 LastPath；存所选文件/目录的父目录）。
+    pub last_path: Option<String>,
+    /// 启动静默检查更新开关（规格 §12.1 AutoUpdateCheck，默认开——对齐原版
+    /// UpdateDialog 复选框；仅 gate 启动 3s 检查，手动「检查更新」不受限）。
+    pub auto_update_check: bool,
 }
 
 impl Default for Config {
@@ -138,6 +149,11 @@ impl Default for Config {
             skip_version: None,
             token_secret: None,
             queue_retries: 1,
+            client_ip: None,
+            client_port: None,
+            client_proto: None,
+            last_path: None,
+            auto_update_check: true,
         }
     }
 }
@@ -263,6 +279,34 @@ mod tests {
         c.save(&p).unwrap();
         let c2 = Config::load(&p).unwrap();
         assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn client_memory_and_update_gate_defaults_and_roundtrip() {
+        // 旧 config.toml（无 §7.31 新键）载入 = serde 缺省：目标记忆空、自动检查开。
+        let (_d, p) = tmp_config();
+        std::fs::write(
+            &p,
+            "language = \"zh\"\ntheme = \"system\"\nserver_port_tcp = 9000\n",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.client_ip, None);
+        assert_eq!(c.client_port, None);
+        assert_eq!(c.client_proto, None);
+        assert_eq!(c.last_path, None);
+        assert!(c.auto_update_check, "AutoUpdateCheck 缺省开（对齐原版默认）");
+
+        // 写入后 round-trip 保真。
+        let mut c2 = Config::default();
+        c2.client_ip = Some("192.168.1.20".into());
+        c2.client_port = Some(8080);
+        c2.client_proto = Some("udt".into());
+        c2.last_path = Some("D:\\downloads".into());
+        c2.auto_update_check = false;
+        c2.save(&p).unwrap();
+        let c3 = Config::load(&p).unwrap();
+        assert_eq!(c2, c3);
     }
 
     #[test]

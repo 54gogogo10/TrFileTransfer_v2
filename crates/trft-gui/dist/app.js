@@ -9,7 +9,7 @@ const listen = T.event.listen;
 const L10N = {
   zh: {
     tab_send: "发送", tab_recv: "接收", tab_share: "共享", tab_verify: "校验", tab_settings: "设置",
-    bind_addr: "绑定地址", wildcard_v4: "全部 IPv4 (0.0.0.0)", no_addr_selected: "请至少勾选一个绑定地址", partial_bind: "部分地址绑定失败", dd_placeholder: "选择监听地址…",
+    bind_addr: "绑定地址", wildcard_v4: "全部 IPv4 (0.0.0.0)", wildcard_v6: "全部 IPv6 (::)", no_addr_selected: "请至少勾选一个绑定地址", partial_bind: "部分地址绑定失败", dd_placeholder: "选择监听地址…",
     duplicate: "重复文件", dup_rename: "改名保留（file_1）", dup_skip: "跳过相同内容", cache_days: "摘要缓存有效期（天）",
     share_dir: "共享目录", after_done: "完成后", ad_none: "无动作", ad_shutdown: "关机（60s 可取消）", ad_sleep: "休眠", ad_command: "执行命令",
     confirm_shutdown: "队列完成后将关闭系统（60 秒后执行，shutdown /a 可取消）。确认执行队列？",
@@ -47,7 +47,7 @@ const L10N = {
     sync_hint: "按 (源路径, 目标地址) 派生稳定会话 ID，与 CLI sync 互相接力",
     settings_limits: "限速与 UDP", send_limit_lbl: "发送限速 KB/s", recv_limit_lbl: "接收限速 KB/s",
     udp_passes_lbl: "UDP 重发轮数", fec: "FEC 前向纠错", udp_parity_lbl: "校验片",
-    settings_update: "更新", update_url: "清单 URL", check_update: "检查更新", save: "保存设置",
+    settings_update: "更新", update_url: "清单 URL", check_update: "检查更新", auto_update_check: "自动检查更新（启动时静默，发现新版本提示）", save: "保存设置",
     logs: "日志", clear: "清空",
     st_running: "传输中", st_done: "完成", st_failed: "失败", st_unknown: "未知",
     up_to_date: "已是最新版本", new_version: "发现新版本", update_fail: "检查失败",
@@ -89,7 +89,7 @@ const L10N = {
   },
   en: {
     tab_send: "Send", tab_recv: "Receive", tab_share: "Share", tab_verify: "Verify", tab_settings: "Settings",
-    bind_addr: "Bind addresses", wildcard_v4: "All IPv4 (0.0.0.0)", no_addr_selected: "Select at least one bind address", partial_bind: "Some addresses failed to bind", dd_placeholder: "Select bind addresses…",
+    bind_addr: "Bind addresses", wildcard_v4: "All IPv4 (0.0.0.0)", wildcard_v6: "All IPv6 (::)", no_addr_selected: "Select at least one bind address", partial_bind: "Some addresses failed to bind", dd_placeholder: "Select bind addresses…",
     duplicate: "Duplicates", dup_rename: "Rename (file_1)", dup_skip: "Skip identical", cache_days: "Hash cache TTL (days)",
     share_dir: "Shared dir", after_done: "After done", ad_none: "None", ad_shutdown: "Shutdown (60s)", ad_sleep: "Sleep", ad_command: "Run command",
     confirm_shutdown: "The system will shut down after the queue finishes (60s, cancellable via shutdown /a). Run the queue?",
@@ -127,7 +127,7 @@ const L10N = {
     sync_hint: "Stable session ID from (source path, target) — interoperates with CLI sync",
     settings_limits: "Limits & UDP", send_limit_lbl: "Send limit KB/s", recv_limit_lbl: "Recv limit KB/s",
     udp_passes_lbl: "UDP passes", fec: "FEC", udp_parity_lbl: "Parity",
-    settings_update: "Update", update_url: "Manifest URL", check_update: "Check update", save: "Save settings",
+    settings_update: "Update", update_url: "Manifest URL", check_update: "Check update", auto_update_check: "Check for updates automatically (silent at startup)", save: "Save settings",
     logs: "Logs", clear: "Clear",
     st_running: "Running", st_done: "Done", st_failed: "Failed", st_unknown: "Unknown",
     up_to_date: "Up to date", new_version: "New version", update_fail: "Check failed",
@@ -354,8 +354,20 @@ $("#send-proto").addEventListener("change", () => {
 });
 
 $("#btn-browse").addEventListener("click", async () => {
-  const file = await T.dialog.open({ multiple: false, directory: sendKind === "folder" });
-  if (file) $("#send-path").value = file;
+  const file = await T.dialog.open({
+    multiple: false,
+    directory: sendKind === "folder",
+    defaultPath: (appState && appState.config && appState.config.last_path) || undefined,
+  });
+  if (file) {
+    $("#send-path").value = file;
+    // 规格 §12.1 LastPath：记忆所选目录（下次开对话框落在这里）。
+    if (appState && appState.config) {
+      const i = Math.max(file.lastIndexOf("\\"), file.lastIndexOf("/"));
+      appState.config.last_path = i > 0 ? file.slice(0, i) : null;
+      invoke("save_config", { config: appState.config }).catch(() => { /* 忽略 */ });
+    }
+  }
 });
 
 const RE_V4 = /^\d{1,3}(\.\d{1,3}){3}$/;
@@ -480,9 +492,21 @@ function sendRequest(kindOverride) {
   return { req, errs };
 }
 
+/* 发送面板目标记忆（规格 §12.1 ClientIP/ClientPort/ClientProtocol——对齐原版
+   跨重启恢复；原版存于关窗，本实现随发送动作落盘更稳——TECH-STACK §7.31）。 */
+function persistSendMemory() {
+  if (!appState || !appState.config) return;
+  appState.config.client_ip = $("#send-ip").value.trim() || null;
+  const port = parseInt($("#send-port").value, 10);
+  appState.config.client_port = port >= 1 && port <= 65535 ? port : null;
+  appState.config.client_proto = $("#send-proto").value;
+  invoke("save_config", { config: appState.config }).catch(() => { /* 记忆失败不打扰 */ });
+}
+
 async function doSend(chunked) {
   const { req, errs } = sendRequest();
   if (errs.length) { toast(errs.join(", "), "err"); return; }
+  persistSendMemory();
   try {
     if (chunked) {
       // 提交门：红框已标非法时分块数不再 clamp 静默放行（红框与实际行为一致）。
@@ -569,7 +593,11 @@ $("#btn-queue-add").addEventListener("click", () => {
 });
 // 对齐原版「批量添加」：多选文件对话框一次入队多个（拖放之外的入口）。
 $("#btn-queue-batch").addEventListener("click", async () => {
-  const files = await T.dialog.open({ multiple: true, directory: false });
+  const files = await T.dialog.open({
+    multiple: true,
+    directory: false,
+    defaultPath: (appState && appState.config && appState.config.last_path) || undefined,
+  });
   if (!files || !files.length) return;
   const snap = queueSnapshot();
   for (const f of files) {
@@ -984,7 +1012,9 @@ function renderReceivers() {
    Linux 上冲突则由逐地址失败上报呈现，不做 UI 互斥。 */
 function ddLabelFor(sel) {
   if (!sel.length) return t("dd_placeholder");
-  const named = sel.map((v) => (v === "0.0.0.0" ? t("wildcard_v4") : v));
+  const named = sel.map((v) =>
+    v === "0.0.0.0" ? t("wildcard_v4") : v === "::" ? t("wildcard_v6") : v
+  );
   return named.length <= 2 ? named.join(", ") : named[0] + " +" + (named.length - 1);
 }
 
@@ -995,7 +1025,12 @@ function renderAddrDropdowns() {
     // 重渲染（语言切换/地址刷新）时保留已选。
     const prev = new Set([...panel.querySelectorAll("input:checked")].map((x) => x.value));
     panel.textContent = "";
-    const items = [["0.0.0.0", t("wildcard_v4")]].concat((appState.addresses || []).map((a) => [a, a]));
+    // 绑定候选（对齐原版）：双族通配 + 全部 IPv4/可用 IPv6 网卡地址（bindAddresses）；
+    // addresses 仅 IPv4——二维码面向手机浏览器，不混入 v6。
+    const items = [
+      ["0.0.0.0", t("wildcard_v4")],
+      ["::", t("wildcard_v6")],
+    ].concat((appState.bindAddresses || appState.addresses || []).map((a) => [a, a]));
     items.forEach(([val, text]) => {
       const lb = document.createElement("label");
       lb.className = "chk";
@@ -1224,6 +1259,7 @@ function fillSettings() {
   $("#cfg-fec").checked = !!c.udp_fec;
   $("#cfg-parity").value = c.udp_fec_parity;
   $("#cfg-update-url").value = c.update_url || "";
+  $("#cfg-auto-update").checked = c.auto_update_check !== false;
   $("#http-port").value = c.http_port;
   $("#version-line").textContent = "v" + appState.version;
   $$(".recv-card").forEach((card) => {
@@ -1265,6 +1301,7 @@ async function saveSettings() {
   c.udp_fec = $("#cfg-fec").checked;
   c.udp_fec_parity = parseInt($("#cfg-parity").value, 10) || 2;
   c.update_url = $("#cfg-update-url").value.trim() || null;
+  c.auto_update_check = $("#cfg-auto-update").checked;
   c.http_port = parseInt($("#http-port").value, 10) || 8090;
   c.language = lang;
   c.theme = localStorage.getItem("trft-theme") || "system";
@@ -1493,7 +1530,10 @@ $("#btn-monitor-start").addEventListener("click", async () => {
         watchDir: dir, ip, port,
         proto: $("#monitor-proto").value,
         code: $("#monitor-code").value.trim() || null,
-        limit: null, passes: null, fecParity: null, nofec: false,
+        // 启动时快照发送面板源端口/限速（对齐原版监控继承客户端面板参数）。
+        srcPort: parseInt($("#send-srcport").value, 10) || null,
+        limit: parseInt($("#send-limit").value, 10) || null,
+        passes: null, fecParity: null, nofec: false,
       },
     });
     $("#dot-monitor").classList.add("on");
@@ -1790,6 +1830,13 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
   applyLang();
   applyTheme();
   fillSettings();
+  // 发送面板目标记忆（§12.1 ClientIP/Port/Protocol）：先填协议再填端口，
+  // 记忆值优先于「协议↔端口跟随」（程序赋值不触发 change，无跟随覆盖）。
+  if (appState.config.client_proto && $("#send-proto").querySelector(`option[value="${appState.config.client_proto}"]`)) {
+    $("#send-proto").value = appState.config.client_proto;
+  }
+  if (appState.config.client_ip) $("#send-ip").value = appState.config.client_ip;
+  if (appState.config.client_port) $("#send-port").value = appState.config.client_port;
   fillShareDirOptions();
   renderAddrDropdowns();
   renderReceivers();
@@ -1832,6 +1879,7 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
   // 规格 §3.7 自动升级：启动 3 秒后台静默检查（配置了 UpdateUrl 才查），「跳过此版本」记忆。
   setTimeout(async () => {
     if (!appState.config.update_url) return;
+    if (appState.config.auto_update_check === false) return; // 规格 §12.1 AutoUpdateCheck
     try {
       const r = await invoke("update_check");
       if (r.hasUpdate && r.version !== appState.config.skip_version) {

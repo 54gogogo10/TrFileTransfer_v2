@@ -8,7 +8,7 @@ mod common;
 
 use common::{opts, random_file, wait_server};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use trft_core::hash::sha256_file;
 use trft_core::transfer::cswire::CsWire;
@@ -140,13 +140,16 @@ async fn udt_text_and_folder() {
 /// 用 cswire 客户端原语直连 v2 UDT 服务端：0x00 单文件 + 裸 ACK 读判决。
 #[tokio::test]
 async fn cs_dialect_client_sends_single_file() {
-    use trft_core::transfer::cswire::{cs_read_final_ack, cs_send_file};
+    use trft_core::transfer::cswire::cs_send_file;
 
     let dir = tempfile::tempdir().unwrap();
     let (src, _) = random_file(dir.path(), "cs.bin", 300_000);
     let out = dir.path().join("out");
+    let stats_path = dir.path().join("stats.log");
     let (sock, addr) = ephemeral_udp().await;
-    let server = tokio::spawn(serve_udt_on(sock, opts(out.clone(), None, 1)));
+    let mut ro = opts(out.clone(), None, 1);
+    ro.stats = Some(std::sync::Arc::new(trft_core::stats::StatsLog::new(stats_path.clone())));
+    let server = tokio::spawn(serve_udt_on(sock, ro));
 
     // 直连（无认证栈——服务端未配配对码）。
     let stream = trft_core::transfer::udt::connect_udt(addr, None).await.unwrap();
@@ -158,6 +161,15 @@ async fn cs_dialect_client_sends_single_file() {
     assert_eq!(
         sha256_file(&out.join("cs.bin")).unwrap(),
         sha256_file(&src).unwrap()
+    );
+    // C# 方言分支的记账判别：detail 用规范文案，path 记最终落盘全路径（§7.31）。
+    let rows = trft_core::stats::StatsLog::new(stats_path).load();
+    assert_eq!(rows.len(), 1, "一次成功接收恰好一行");
+    assert_eq!(rows[0].detail, "直接发送", "C# 方言行不得把文件名当 detail");
+    assert_eq!(
+        rows[0].path,
+        out.join("cs.bin").display().to_string(),
+        "C# 方言行必须记最终落盘全路径（历史定位用）"
     );
 }
 
@@ -384,3 +396,92 @@ async fn udt_rejects_wrong_version_handshake() {
 }
 
 use trft_core::transfer::udt::serve_udt_on;
+
+/// §7.31 判别：C# 方言 **加密+压缩** 全栈回环——0x08 提议在 0x09 之后到达时，
+/// 服务端 0x18 应答必须经加密装饰器返回（实机 F2 排障：裸写被 C# 段格式卡死
+/// 到 8s 响应窗超时 → 对端回退明文；服务端应答改走 write_all 后本测为绿）。
+#[tokio::test]
+async fn cs_dialect_encrypted_compressed_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, _) = random_file(dir.path(), "enc.bin", 100_000);
+    let out = dir.path().join("out");
+    let (sock, addr) = ephemeral_udp().await;
+    let server = tokio::spawn(serve_udt_on(sock, opts(out.clone(), Some("135790"), 1)));
+
+    let o = SendOptions {
+        transport: Transport::Udt,
+        pairing_code: Some("135790".into()),
+        compress: true,
+        ..Default::default()
+    };
+    trft_core::transfer::sender::send_file(addr, &src, &o)
+        .await
+        .unwrap();
+    wait_server(server).await;
+    assert_eq!(
+        sha256_file(&out.join("enc.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
+}
+
+/* ============ 0x04 差量同步客户端（TECH-STACK §7.31） ============ */
+
+fn sync_cache(dir: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<trft_core::hashcache::HashCache>> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(trft_core::hashcache::HashCache::load(
+        &dir.join("cache.txt"),
+        7,
+    )))
+}
+
+/// 判别：UDT 槽位 0x04 同步客户端对 C# 方言服务端——首轮全量落盘；
+/// 改一个文件后二轮只补差异（服务端逐文件哈希核对，其余跳过）。
+/// 退回 §7.30 的 Unsupported 短路（或 0x11/跳过清单接线错误）本测必红。
+#[tokio::test]
+async fn cs_dialect_sync_incremental_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lib");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.bin"), vec![1u8; 50_000]).unwrap();
+    std::fs::write(root.join("sub/b.txt"), b"hello sync").unwrap();
+    let out = dir.path().join("out");
+    let (sock, addr) = ephemeral_udp().await;
+    let server = tokio::spawn(serve_udt_on(sock, common::opts_resident(out.clone(), None)));
+
+    let cache = sync_cache(dir.path());
+    trft_core::transfer::cswire::send_folder_sync_cs(addr, &root, &udt_opts(), Some(&cache))
+        .await
+        .unwrap();
+
+    // 服务端会话目录 = out/<folder>.<guid8>（确定性派生——重复同步续用）。
+    let session_dir = std::fs::read_dir(&out)
+        .unwrap()
+        .find_map(|e| {
+            let n = e.unwrap().file_name().to_string_lossy().to_string();
+            n.starts_with("lib.").then(|| out.join(n))
+        })
+        .expect("服务端必须建立 <folder>.<guid8> 会话目录");
+    assert_eq!(
+        std::fs::read(session_dir.join("a.bin")).unwrap(),
+        vec![1u8; 50_000]
+    );
+    assert_eq!(std::fs::read(session_dir.join("sub/b.txt")).unwrap(), b"hello sync");
+
+    // 改一个文件 + 新增一个 → 二轮同步只补差异（跳过清单逐文件核对）。
+    std::fs::write(root.join("a.bin"), vec![2u8; 50_000]).unwrap();
+    std::fs::write(root.join("new.bin"), b"added").unwrap();
+    trft_core::transfer::cswire::send_folder_sync_cs(addr, &root, &udt_opts(), Some(&cache))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(session_dir.join("a.bin")).unwrap(),
+        vec![2u8; 50_000],
+        "被改文件必须重新同步"
+    );
+    assert_eq!(std::fs::read(session_dir.join("new.bin")).unwrap(), b"added");
+    assert_eq!(
+        std::fs::read(session_dir.join("sub/b.txt")).unwrap(),
+        b"hello sync",
+        "未变文件必须跳过（哈希一致）"
+    );
+    server.abort();
+}

@@ -571,3 +571,54 @@ async fn resume_offset_authority_is_server_disk() {
         server.abort();
     }
 }
+
+// ============ 传输历史接收行全路径（TECH-STACK §7.31）============
+
+/// 判别：接收行 stats.path 必须是**最终落盘全路径**（历史「资源管理器定位」依赖）。
+/// 退回 §7.27 G3 旧行为（只记文件名）必红。
+#[tokio::test]
+async fn recv_stats_row_records_full_dest_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, _) = random_file(dir.path(), "locate.bin", 4096);
+    let out = dir.path().join("out");
+    let stats_path = dir.path().join("stats.log");
+    let mut ro = common::opts(out.clone(), None, 1);
+    ro.stats = Some(Arc::new(trft_core::stats::StatsLog::new(stats_path.clone())));
+    let (listener, addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(listener, ro));
+    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    wait_server(server).await;
+
+    let rows = trft_core::stats::StatsLog::new(stats_path).load();
+    assert_eq!(rows.len(), 1, "一次成功接收恰好一行");
+    assert_eq!(rows[0].detail, "直接发送");
+    assert_eq!(
+        rows[0].path,
+        out.join("locate.bin").display().to_string(),
+        "接收行必须记最终落盘全路径（历史定位用）"
+    );
+}
+
+/// 判别：Skip 命中（0x00 已存在跳过）的行同样记既有文件全路径。
+#[tokio::test]
+async fn recv_stats_row_skip_records_existing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, data) = random_file(dir.path(), "dup.bin", 2048);
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let existing = out.join("dup.bin");
+    std::fs::write(&existing, &data).unwrap(); // 同名同长同内容 → Skip 命中
+    let stats_path = dir.path().join("stats.log");
+    let mut ro = common::opts(out.clone(), None, 1);
+    ro.duplicate = DuplicatePolicy::Skip;
+    ro.stats = Some(Arc::new(trft_core::stats::StatsLog::new(stats_path.clone())));
+    let (listener, addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(listener, ro));
+    send_file(addr, &src, &SendOptions::default()).await.unwrap();
+    wait_server(server).await;
+
+    let rows = trft_core::stats::StatsLog::new(stats_path).load();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].detail, "已存在（跳过）");
+    assert_eq!(rows[0].path, existing.display().to_string());
+}

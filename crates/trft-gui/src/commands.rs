@@ -135,6 +135,7 @@ pub fn get_app_state(app: tauri::AppHandle) -> serde_json::Value {
         "receivers": running,
         "httpRunning": http_running,
         "addresses": list_addresses_inner(),
+        "bindAddresses": list_bind_addresses_inner(),
     })
 }
 
@@ -155,6 +156,31 @@ fn list_addresses_inner() -> Vec<String> {
                 if !v4.is_loopback() {
                     out.push(v4.to_string());
                 }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 绑定下拉候选（对齐原版：族通配外再列全部 IPv4 + 可用 IPv6 网卡地址——
+/// 跳过链路本地 fe80::/10 与站点本地 fec0::/10 噪声，TECH-STACK §7.31）。
+fn list_bind_addresses_inner() -> Vec<String> {
+    fn v6_usable(v6: std::net::Ipv6Addr) -> bool {
+        let o = v6.octets();
+        !(o[0] == 0xfe && (o[1] & 0xc0) == 0x80) // fe80::/10 链路本地
+            && !(o[0] == 0xfe && (o[1] & 0xc0) == 0xc0) // fec0::/10 站点本地
+    }
+    let mut out = Vec::new();
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for a in addrs {
+            match a.ip() {
+                std::net::IpAddr::V4(v4) if !v4.is_loopback() => out.push(v4.to_string()),
+                std::net::IpAddr::V6(v6) if !v6.is_loopback() && v6_usable(v6) => {
+                    out.push(v6.to_string());
+                }
+                _ => {}
             }
         }
     }
@@ -761,7 +787,12 @@ pub async fn sync_start(
     let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let settled2 = settled.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        let res = send_folder_resume(addr, &path, &opts, session, cache.as_ref()).await;
+        // UDT 槽位走 C# 方言 0x04（专通 C# 版；会话 GUID 与 C# 同式互相接力）。
+        let res = if opts.transport == trft_core::transfer::Transport::Udt {
+            trft_core::transfer::cswire::send_folder_sync_cs(addr, &path, &opts, cache.as_ref()).await
+        } else {
+            send_folder_resume(addr, &path, &opts, session, cache.as_ref()).await.map(|_| ())
+        };
         let peer = Some((
             ip.to_string(),
             port,
@@ -799,23 +830,12 @@ fn parse_bind_addrs(addrs: Option<Vec<String>>) -> Result<Vec<std::net::IpAddr>,
     Ok(out)
 }
 
-/// UDP 监听（与 trft-core::serve_udp 同口径：4MB 收缓冲，规格 §6.1），
-/// 绑定在调用侧完成以支持逐地址失败上报。
+/// UDP 监听（与 trft-core::serve_udp 同口径：4MB 收缓冲规格 §6.1、通配 `::`
+/// 双栈 §7.31），绑定在调用侧完成以支持逐地址失败上报。
 async fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock =
-        socket2::Socket::new(domain, socket2::Type::DGRAM, None).map_err(|e| e.to_string())?;
-    sock.set_nonblocking(true).map_err(|e| e.to_string())?;
-    sock.bind(&addr.into())
+    let std_sock = trft_core::transfer::std_udp_listener(addr)
         .map_err(|e| format!("{} 绑定失败: {e}", addr))?;
-    if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
-        eprintln!("[警告] UDP 收缓冲设置失败: {e}");
-    }
-    let std_sock: std::net::UdpSocket = sock.into();
+    std_sock.set_nonblocking(true).map_err(|e| e.to_string())?;
     tokio::net::UdpSocket::from_std(std_sock).map_err(|e| e.to_string())
 }
 
@@ -1030,7 +1050,7 @@ pub async fn recv_start(
     for ip in bind_list {
         let addr = SocketAddr::new(ip, port);
         match proto {
-            Proto::Tcp => match tokio::net::TcpListener::bind(addr).await {
+            Proto::Tcp => match trft_core::transfer::bind_tcp(addr).await {
                 Ok(listener) => {
                     let o = shared.as_ref().expect("TCP 选项已建").clone();
                     let a2 = app2.clone();
@@ -1747,6 +1767,9 @@ pub struct MonitorRequest {
     pub passes: Option<u32>,
     pub fec_parity: Option<u8>,
     pub nofec: bool,
+    /// 发送面板源端口快照（规格 §3.1 SrcPort——对齐原版监控继承客户端面板
+    /// SrcPort/限速的快照语义，TECH-STACK §7.31）。
+    pub src_port: Option<u16>,
 }
 
 #[tauri::command]
@@ -1795,6 +1818,8 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
     mcfg.send_opts = SendOptions {
         pairing_code: req.code.clone(),
         speed_limit_bps: req.limit.unwrap_or(0).min(10_000_000) * 1024,
+        // 监控继承发送面板源端口快照（0 = 不绑定，与 CLI --srcport 口径一致）。
+        src_port: req.src_port.filter(|&p| p > 0),
         encrypt: true,
         compress: true,
         stats: Some(stats.clone()),

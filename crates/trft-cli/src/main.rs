@@ -559,7 +559,16 @@ async fn run() -> i32 {
                     trft_core::hashcache::DEFAULT_TTL_DAYS,
                 ))))
             };
-            match send_folder_resume(addr, &folder, &opts, session, client_cache.as_ref()).await {
+            let sent = if opts.transport == Transport::Udt {
+                // C# 方言 0x04（UDT 槽位专通 C# 版——TECH-STACK §7.30/§7.31）。
+                // 会话 GUID 与 C# DeriveSyncSession 同式，同 (folder,target) 互相接力。
+                trft_core::transfer::cswire::send_folder_sync_cs(addr, &folder, &opts, client_cache.as_ref()).await
+            } else {
+                send_folder_resume(addr, &folder, &opts, session, client_cache.as_ref())
+                    .await
+                    .map(|_| ())
+            };
+            match sent {
                 Ok(()) => {
                     println!("同步完成");
                     0

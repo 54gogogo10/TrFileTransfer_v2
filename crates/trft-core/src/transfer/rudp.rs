@@ -803,23 +803,14 @@ fn rst_pkt(conn: u32, reason: &str) -> Option<Vec<u8>> {
     pw::encode(pw::U_P_RST, conn, 0, reason.as_bytes()).ok()
 }
 
-/// 监听并服务 UDT 连接（socket2 收缓冲 4MB，对齐 `serve_udp` 口径）。
+/// 监听并服务 RUDP 连接（收缓冲 4MB，对齐 `serve_udp` 口径；通配 `::` 双栈——
+/// TECH-STACK §7.31）。
 pub async fn serve_rudp(
     addr: SocketAddr,
     opts: crate::transfer::receiver::RecvOptions,
 ) -> Result<()> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None).map_err(Error::Io)?;
-    sock.set_nonblocking(true).map_err(Error::Io)?;
-    sock.bind(&addr.into()).map_err(Error::Io)?;
-    if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
-        eprintln!("[警告] UDT 收缓冲设置失败: {e}");
-    }
-    let std_sock: std::net::UdpSocket = sock.into();
+    let std_sock = crate::transfer::std_udp_listener(addr).map_err(Error::Io)?;
+    std_sock.set_nonblocking(true).map_err(Error::Io)?;
     let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
     serve_rudp_on(socket, opts).await
 }

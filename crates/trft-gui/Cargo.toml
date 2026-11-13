@@ -17,7 +17,6 @@ tokio.workspace = true
 trft-core = { version = "0.2.0", path = "../trft-core" }
 trft-server = { version = "0.2.0", path = "../trft-server" }
 axum = "0.8"
-socket2 = "0.6"
 # QR 只用编码核（default-features=false 零依赖），SVG 由本 crate 自行拼装。
 qrcode = { version = "0.14", default-features = false }
 if-addrs = "0.13"
