@@ -37,6 +37,11 @@ const RUDP_PENDING_CAP: usize = 4 * RUDP_WINDOW;
 /// 重传扫描节拍。
 const RUDP_TICK: Duration = Duration::from_millis(25);
 /// RTO 下限/上限/初值（ms）。
+/// 单次唤醒的批量上限（泵排空/驱动处理/出包发送共用——每批一次让出，
+/// 去掉逐包调度开销；§7.28「批量收发/ACK 合批」）。
+const RUDP_BATCH_CAP: usize = 512;
+/// 读侧单次 poll 的聚合上限（把 1200B 粒度的逐块唤醒拼成大块）。
+const RUDP_READ_AGG: usize = 256 * 1024;
 const RUDP_RTO_MIN_MS: u64 = 200;
 const RUDP_RTO_MAX_MS: u64 = 3000;
 const RUDP_RTO_INIT_MS: u64 = 400;
@@ -61,6 +66,9 @@ struct InFlight {
     first_send: Instant,
     last_send: Instant,
     retries: u32,
+    /// RTO 重发过后置位：其 ACK 采样不代表真实 RTT（Karn 修正，防 RTO
+    /// 正反馈膨胀到上限——大传输爬行的共因）。
+    retransmitted: bool,
 }
 
 #[derive(Debug)]
@@ -236,11 +244,16 @@ impl RudpConn {
         self.err_rx.borrow().clone()
     }
 
-    /// 处理一入包（驱动任务调用）。HS/HS_ACK 只属于握手阶段，驱动期忽略。
-    fn handle_packet(self: &Arc<Self>, kind: u8, seq: u32, payload: &[u8]) {
-        match kind {
+    /// 处理一入包（驱动任务调用）。返回 true = 接收侧状态已推进（Gap/Deliver，
+    /// cum/SACK 变化）→ 批末需合并 ACK；Dup（状态不变）与其他控制帧 = false。
+    /// HS/HS_ACK 只属于握手阶段，驱动期忽略。
+    fn handle_packet(&self, kind: u8, seq: u32, payload: &[u8]) -> bool {
+        let ack_needed = match kind {
             pw::U_P_DATA => self.on_data(seq, payload),
-            pw::U_P_ACK => self.on_ack(payload),
+            pw::U_P_ACK => {
+                self.on_ack(payload);
+                false
+            }
             pw::U_P_FIN => {
                 // FIN 载荷 = DATA 总数（seq 头字段弃用）。
                 let total = if payload.len() >= 4 {
@@ -249,6 +262,7 @@ impl RudpConn {
                     seq
                 };
                 self.on_fin(total);
+                false // on_fin 的缺口路径已自行即席 ACK（收满判据依赖它）
             }
             pw::U_P_FIN_ACK => {
                 self.fin_flag.store(true, Ordering::SeqCst);
@@ -257,6 +271,7 @@ impl RudpConn {
                 if let Some(tx) = self.fin_tx.lock().expect("fin 锁").clone() {
                     let _ = tx.send(());
                 }
+                false
             }
             pw::U_P_RST => {
                 let reason = String::from_utf8(payload.to_vec()).unwrap_or_default();
@@ -266,16 +281,24 @@ impl RudpConn {
                     reason
                 };
                 self.close(Some(msg));
+                false
             }
-            _ => {}
-        }
+            _ => false,
+        };
         *self.last_rx.lock().expect("活性锁") = Instant::now();
+        ack_needed
     }
 
-    fn on_data(self: &Arc<Self>, seq: u32, payload: &[u8]) {
+    /// 批末合并 ACK（驱动任务调用；一批内 cum/SACK 只发一次——ACK 合批）。
+    fn flush_ack(&self) {
+        let r = self.recv.lock().expect("接收锁");
+        self.send_ack(&r);
+    }
+
+    fn on_data(&self, seq: u32, payload: &[u8]) -> bool {
         // 单次加锁完成状态变更与判定；出包/投递一律放锁外（std Mutex 不可重入）。
         enum Action {
-            Dup,           // 重复包（ACK 丢失）→ 重发当前 ACK
+            Dup,           // 重复包（ACK 丢失）→ 状态不变（批末 ACK 与上次同型，省略）
             Gap,           // 乱序 → 已入缓存，ACK 告知空洞
             Deliver(bool), // 连续段就绪 → 投递读侧；bool = FIN 达成（EOF）
         }
@@ -305,10 +328,8 @@ impl RudpConn {
             }
         };
         match action {
-            Action::Dup | Action::Gap => {
-                let r = self.recv.lock().expect("接收锁");
-                self.send_ack(&r);
-            }
+            Action::Dup => true,
+            Action::Gap => true,
             Action::Deliver(eof_now) => {
                 let tx = self.data_tx.lock().expect("数据锁").clone();
                 if let Some(tx) = tx {
@@ -321,6 +342,7 @@ impl RudpConn {
                     let _ = self.data_tx.lock().expect("数据锁").take();
                     self.send_fin_ack();
                 }
+                true
             }
         }
     }
@@ -331,7 +353,7 @@ impl RudpConn {
         }
     }
 
-    fn on_ack(self: &Arc<Self>, payload: &[u8]) {
+    fn on_ack(&self, payload: &[u8]) {
         let Some((cum, sacks)) = pw::decode_ack_payload(payload) else {
             return;
         };
@@ -341,11 +363,15 @@ impl RudpConn {
             if cum > s.next_seq {
                 return; // 非法/超前 ACK（fail-closed 忽略）
             }
-            // RTT 采样：取 cum-1 号包的首次发送时刻（重传包采样偏大 → RTO 偏保守）。
+            // RTT 采样：取 cum-1 号包的首次发送时刻。Karn 修正：RTO 重发过的
+            // 包不采样（重传样本 ≈ 前次 RTO，正反馈把 RTO 推到上限——大传输
+            // 爬行的共因之一）。
             if cum > 0 {
                 if let Some(inf) = s.inflight.get(&(cum - 1)) {
-                    let sample = inf.first_send.elapsed().as_secs_f64() * 1000.0;
-                    s.rto_update(sample.max(0.1));
+                    if !inf.retransmitted {
+                        let sample = inf.first_send.elapsed().as_secs_f64() * 1000.0;
+                        s.rto_update(sample.max(0.1));
+                    }
                 }
             }
             for k in s.inflight.keys().copied().collect::<Vec<_>>() {
@@ -367,23 +393,27 @@ impl RudpConn {
         }
     }
 
-    fn on_fin(self: &Arc<Self>, total: u32) {
-        let (finish, got_gap) = {
+    fn on_fin(&self, total: u32) {
+        // FIN 可重到（发送端 RTO 重发；首个 FIN_ACK 丢失后必须幂等重发，
+        // 否则对端 shutdown 等 RUDP_FIN_WAIT——真机丢包下必踩）。
+        let (finish_now, ack_fin) = {
             let mut r = self.recv.lock().expect("接收锁");
             // 取更小的 total（重复 FIN 一致；防御性取 min）。
             r.remote_fin = Some(r.remote_fin.map_or(total, |t| t.min(total)));
-            let finish = r.expected >= total && r.pending.is_empty() && !r.eof_seen;
-            (finish, !finish)
-        };
-        if finish {
-            let _ = self.data_tx.lock().expect("数据锁").take();
-            {
-                let mut r = self.recv.lock().expect("接收锁");
+            let complete = r.expected >= total && r.pending.is_empty();
+            let finish_now = complete && !r.eof_seen; // 首次达成 → 关读侧（EOF 一次性）
+            if finish_now {
                 r.eof_seen = true;
             }
+            (finish_now, complete)
+        };
+        if finish_now {
+            let _ = self.data_tx.lock().expect("数据锁").take();
+        }
+        if ack_fin {
             self.send_fin_ack();
-        } else if got_gap {
-            // 有空洞：ACK 告知缺口，收满后由 on_data 触发 EOF。
+        } else {
+            // 有空洞：ACK 告知缺口，收满后由 on_data/on_fin 触发 EOF。
             let r = self.recv.lock().expect("接收锁");
             self.send_ack(&r);
         }
@@ -407,6 +437,7 @@ impl RudpConn {
             for (seq, inf) in s.inflight.iter_mut() {
                 if now.duration_since(inf.last_send) >= rto {
                     inf.retries += 1;
+                    inf.retransmitted = true;
                     inf.last_send = now;
                     if inf.retries > RUDP_RETRIES_MAX {
                         break;
@@ -518,7 +549,17 @@ impl AsyncRead for RudpStream {
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut self.data_rx).poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => self.read_buf = chunk,
+                Poll::Ready(Some(chunk)) => {
+                    self.read_buf = chunk;
+                    // 聚合积压（§7.28「应用写聚合」）：1200B 逐块唤醒的开销
+                    // 在大流量下占主导；单次 poll 拼到上限再切片。
+                    while self.read_buf.len() < RUDP_READ_AGG {
+                        match self.data_rx.try_recv() {
+                            Ok(c) => self.read_buf.extend_from_slice(&c),
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Poll::Ready(None) => {
                     if let Some(e) = self.conn.error() {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
@@ -578,6 +619,7 @@ impl AsyncWrite for RudpStream {
                     first_send: now,
                     last_send: now,
                     retries: 0,
+                    retransmitted: false,
                 },
             );
         }
@@ -663,18 +705,50 @@ async fn run_driver(conn: Arc<RudpConn>, mut in_rx: UnboundedReceiver<Pkt>) {
         if conn.closed.load(Ordering::SeqCst) {
             break;
         }
-        tokio::select! {
-            pkt = in_rx.recv() => match pkt {
-                Some((kind, seq, payload)) => {
-                    conn.handle_packet(kind, seq, &payload);
-                    // 协作让出（传输饥饿防线）：入包有积压时 recv 恒 Ready，
-                    // 不让出会饿死对端泵/写端（current-thread runtime 上必现）。
-                    tokio::task::yield_now().await;
+        // 批量排空（§7.28「ACK 合批」）：一批包共用一次让出与一个合并 ACK。
+        // 修复 P0：连续投递（常态路径）此前不发 ACK，发送端窗口灌满后只能等
+        // RTO 重传命中 Dup 才释放窗口——每窗口轮次烧一次 RTO，大传输爬行。
+        let mut ack_needed = false;
+        let mut n = 0usize;
+        while n < RUDP_BATCH_CAP {
+            match in_rx.try_recv() {
+                Ok((kind, seq, payload)) => {
+                    ack_needed |= conn.handle_packet(kind, seq, &payload);
+                    n += 1;
                 }
-                None => break, // 入口关闭（泵/服务端摘表）
-            },
-            _ = ticker.tick() => conn.scan(),
+                Err(_) => break,
+            }
         }
+        if n == 0 {
+            // 无积压：等一个包或节拍（scan 分支继续循环，不得当作入口关闭）。
+            enum Wait {
+                Pkt,
+                Tick,
+                Closed,
+            }
+            let ev = tokio::select! {
+                pkt = in_rx.recv() => match pkt {
+                    Some((kind, seq, payload)) => {
+                        ack_needed = conn.handle_packet(kind, seq, &payload);
+                        Wait::Pkt
+                    }
+                    None => Wait::Closed, // 入口关闭（泵/服务端摘表）
+                },
+                _ = ticker.tick() => {
+                    conn.scan();
+                    Wait::Tick
+                }
+            };
+            if matches!(ev, Wait::Closed) {
+                break;
+            }
+        }
+        if ack_needed {
+            conn.flush_ack();
+        }
+        // 协作让出（传输饥饿防线）：入包有积压时 recv 恒 Ready，不让出会饿死
+        // 对端泵/写端（current-thread runtime 上必现）——每批让出一次。
+        tokio::task::yield_now().await;
     }
     conn.close(None);
 }
@@ -757,17 +831,44 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
             if pump_conn.closed.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::select! {
-                r = pump_sock.recv_from(&mut b) => match r {
-                    Ok((n, src)) => {
+            // 批量排空积压（§7.28「批量收发」）：非阻塞 try 到 WouldBlock/上限。
+            let mut n = 0usize;
+            while n < RUDP_BATCH_CAP {
+                match pump_sock.try_recv_from(&mut b) {
+                    Ok((len, src)) => {
                         if src == pump_conn.peer {
-                            if let Some((h, payload)) = pw::decode(&b[..n]) {
+                            if let Some((h, payload)) = pw::decode(&b[..len]) {
                                 if h.conn == pump_conn.conn {
                                     let _ = pump_in.send((h.kind, h.seq, payload.to_vec()));
                                 }
                             }
                         }
-                        // 协作让出（传输饥饿防线，与 demux/driver 同口径）。
+                        n += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    // EMSGSIZE 等杂包：丢弃本包继续（与 serve_udp 同口径——超长
+                    // 垃圾包不得杀死泵）。
+                    Err(_) => {
+                        n += 1;
+                        continue;
+                    }
+                }
+            }
+            if n > 0 {
+                // 协作让出（传输饥饿防线，与 demux/driver 同口径）。
+                tokio::task::yield_now().await;
+                continue;
+            }
+            tokio::select! {
+                r = pump_sock.recv_from(&mut b) => match r {
+                    Ok((len, src)) => {
+                        if src == pump_conn.peer {
+                            if let Some((h, payload)) = pw::decode(&b[..len]) {
+                                if h.conn == pump_conn.conn {
+                                    let _ = pump_in.send((h.kind, h.seq, payload.to_vec()));
+                                }
+                            }
+                        }
                         tokio::task::yield_now().await;
                     }
                     Err(_) => break,
@@ -776,12 +877,27 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
             }
         }
     });
-    // 出包任务：驱动编码包 → socket。
+    // 出包任务：驱动编码包 → socket（批量排空，每批一次让出）。
     let send_sock = socket;
     tokio::spawn(async move {
-        while let Some((dst, pkt)) = out_rx.recv().await {
+        loop {
+            let Some((dst, pkt)) = out_rx.recv().await else {
+                break;
+            };
             if send_sock.send_to(&pkt, dst).await.is_err() {
                 break;
+            }
+            let mut n = 1usize;
+            while n < RUDP_BATCH_CAP {
+                match out_rx.try_recv() {
+                    Ok((dst, pkt)) => {
+                        if send_sock.send_to(&pkt, dst).await.is_err() {
+                            return;
+                        }
+                        n += 1;
+                    }
+                    Err(_) => break,
+                }
             }
             // 协作让出（传输饥饿防线）。
             tokio::task::yield_now().await;
@@ -831,9 +947,24 @@ pub async fn serve_rudp_on(
     let socket = Arc::new(socket);
     let send_sock = socket.clone();
     tokio::spawn(async move {
-        while let Some((dst, pkt)) = out_rx.recv().await {
+        loop {
+            let Some((dst, pkt)) = out_rx.recv().await else {
+                break;
+            };
             if send_sock.send_to(&pkt, dst).await.is_err() {
                 break;
+            }
+            let mut n = 1usize;
+            while n < RUDP_BATCH_CAP {
+                match out_rx.try_recv() {
+                    Ok((dst, pkt)) => {
+                        if send_sock.send_to(&pkt, dst).await.is_err() {
+                            return;
+                        }
+                        n += 1;
+                    }
+                    Err(_) => break,
+                }
             }
             // 协作让出（传输饥饿防线）。
             tokio::task::yield_now().await;
@@ -1061,6 +1192,70 @@ mod tests {
         let mut eof = Vec::new();
         let n = s.read_to_end(&mut eof).await.unwrap();
         assert_eq!(n, 0, "FIN 后服务端必须见 EOF");
+    }
+
+    /// 判别（TECH-STACK §7.31 性能批）：连续投递必须经批末合并 ACK 实时释放
+    /// 发送窗口。退回「常态不发 ACK」的旧行为时，4MB（≈13 个窗口轮次）只能靠
+    /// RTO 重传命中 Dup 才释放窗口（每轮 ≥RTO=400ms，且重传采样把 RTO 推向
+    /// 3s 上限）——完成时间爆表。新行为为纯内存通道流转，<3s 恒真。
+    #[tokio::test]
+    async fn in_order_delivery_releases_window_via_batched_ack() {
+        let (mut c, mut s) = pair(false).await;
+        let payload: Vec<u8> = (0..4_000_000u32).map(|i| (i % 199) as u8).collect();
+        let t0 = std::time::Instant::now();
+        c.write_all(&payload).await.unwrap();
+        c.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        s.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "大流量必须逐字节一致");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "4MB 传输耗时 {elapsed:?}——窗口未被合并 ACK 实时释放（旧行为 ≥13×RTO）"
+        );
+        c.shutdown().await.unwrap();
+    }
+
+    /// 判别（TECH-STACK §7.31 性能批）：FIN_ACK 必须对重到的 FIN 幂等重发。
+    /// 丢弃首个 FIN_ACK（真机丢包常态）后，旧行为下后续 FIN 走缺口 ACK 分支
+    /// → 发送端 shutdown 等 RUDP_FIN_WAIT(5s) 兜底；新行为立刻重发 FIN_ACK。
+    #[tokio::test]
+    async fn fin_ack_is_idempotent_after_first_loss() {
+        let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let (_c_conn, mut cs, c_in, mut c_out, _c_drv) = build_conn(1, peer_s);
+        let (_s_conn, mut ss, s_in, mut s_out, _s_drv) = build_conn(1, peer_c);
+        // c_out → s_in 无损；s_out → c_in 丢弃**首个** FIN_ACK。
+        tokio::spawn(async move {
+            while let Some((_dst, pkt)) = c_out.recv().await {
+                if let Some((h, pl)) = pw::decode(&pkt) {
+                    let _ = s_in.send((h.kind, h.seq, pl.to_vec()));
+                }
+            }
+        });
+        let mut fin_ack_dropped = false;
+        tokio::spawn(async move {
+            while let Some((_dst, pkt)) = s_out.recv().await {
+                if let Some((h, pl)) = pw::decode(&pkt) {
+                    if h.kind == pw::U_P_FIN_ACK && !fin_ack_dropped {
+                        fin_ack_dropped = true;
+                        continue; // 模拟首个 FIN_ACK 丢包
+                    }
+                    let _ = c_in.send((h.kind, h.seq, pl.to_vec()));
+                }
+            }
+        });
+        drop((_c_conn, _s_conn, _c_drv, _s_drv));
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 197) as u8).collect();
+        cs.write_all(&payload).await.unwrap();
+        cs.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        ss.read_exact(&mut got).await.unwrap();
+        // 旧行为：首个 FIN_ACK 被丢 → 后续 FIN 只回缺口 ACK → shutdown 等 5s 兜底。
+        tokio::time::timeout(std::time::Duration::from_secs(2), cs.shutdown())
+            .await
+            .expect("FIN_ACK 幂等重发后 shutdown 必须即时完成（旧行为等 5s 兜底）")
+            .unwrap();
     }
 
     /// 25% 丢包注入：重传 + SACK 必须恢复出完整流（乱序重排）。

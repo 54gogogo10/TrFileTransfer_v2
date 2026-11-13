@@ -278,6 +278,14 @@
    - **P1 UDT 接收端 ACK 缺 word4/5 → C# 发送端 CC 塌陷**（真机 80MB 实测发现）：插桩实测 C#→v2 80MB 单连接仅 752 pkt/s（1.0MB/s）而 v2↔v2 环回 112MB/s、C#↔C# 62.9MB/s、v2 无丢包无 NAK 风暴、流窗恒满——瓶颈定位到 libudt 默认 CC 的拥塞窗公式：退出慢启动后 `cwnd = RcvRate/1e6×(RTT+RC)+16`，`RcvRate` 来自 **ACK word4**；v2 完整 ACK 恒 16B（缺 word4/5）→ `RcvRate=0` → **cwnd 恒钉 16 包** → 每个确认周期只能推进 ~10 包。修复：接收端实现 libudt `CPktTimeWindow(16,16)` 同款算法（16 槽到达间隔窗 + seq&0xF==0/1 探测对 + 中位数滤波）并按其 SYN 节流语义分档——距上次 6 词 ACK >SYN 发 24B（带 word4/5）刷新节流基准，否则 16B（4 词，线上形状与 vendored core.cpp checkTimers ACK 分支逐字对齐）；`m_ullLastAckTime` 单字段语义同步（只在 6 词分支刷新，重复 ACK 守卫共用）。实测修复后 C#→v2 80MB **0.6s（130.6MB/s）**——128 倍，且超过 C#↔C# 同口径（62.9MB/s）；全部 15 场景矩阵（双向明文/加密/压缩/80MB/文件夹含中文与空文件/文本/同步三轮/负例错码×2/GUI 并发4=0x02 组会话）SHA-256 全对；
    - **吞吐登记**（未修，留作后续优化项）：v2 发送端对 C# 接收端 ~10MB/s（80MB 8.3s）——v2 发送侧 CC 为近似实现（慢启动倍增、逐包调度），与 §7.28 已登记的 ACK 合批/批量收发优化项同批；C# 单连接对 v2 修复后 130MB/s，反向是当前短板；
    - 测试床：`.zcode/scratch-interop/`（gitignored）——fixture 构建 + 双向矩阵 harness + 哈希基准，非自动化套件（依赖本机 C# 2.14 exe）。
+33. **性能优化批：RUDP 协议级缺陷 + 引擎批量化 + UDT lite-ACK 语义错位**（2026-11-14，兑现 §7.28 优化项）：
+   - **P0 RUDP 连续投递不发 ACK**（基线实测暴露，非单纯性能——是协议缺陷）：常态路径（Gap/Deliver）从不 ACK、scan() 只管重传/超时——发送端 256 包窗口灌满后**只能等 RTO 重传命中 Dup 才释放窗口**，每窗口轮次烧一次 RTO（且重传采样把 RTO 正反馈推到 3s 上限）→ 大传输 ~0.1MB/s 爬行（80MB 600s 跑不完；e2e 未红因小文件在首窗内传完 + FIN 独立于 ACK）。修复：驱动批量排空 + **批末合并 ACK**（Gap/Deliver 触发、Dup 状态不变不触发）；判别 e2e `in_order_delivery_releases_window_via_batched_ack`（4MB > 13 窗轮次 + 3s 时间上界——去修复必红 ≥5.2s）。**实测 <0.13 → 126.1 MB/s（~1000 倍）**；
+   - **P1 FIN_ACK 只发一次**（同轮暴露）：`finish` 判据带 `!eof_seen` → 重到的 FIN 走缺口 ACK 分支，首个 FIN_ACK 被丢后对端 shutdown 等 RUDP_FIN_WAIT(5s) 兜底。修复：FIN_ACK 对重到的 FIN 幂等重发（`complete` 独立于 `eof_seen`）；判别 e2e `fin_ack_is_idempotent_after_first_loss`（定向丢首个 FIN_ACK，旧行为 5s 兜底红）。原 lossy e2e 靠确定性种子幸存——ACK 合批改变了 ACK 流形状后暴露；
+   - **§7.28 批量收发/应用写聚合（RUDP+UDT 出入泵）**：泵 `try_recv_from` 排空到 WouldBlock/上限、出包任务 `try_recv` 排空、读侧 poll 聚合到 256KB、驱动批处理——每批一次让出（保留 current-thread 饥饿防线）；EMSGSIZE 杂包不杀泵。TCP/QUIC 不动；
+   - **P1 UDT lite-ACK 语义错位（v2 发送端对 C# 10MB/s 根因）**：libudt 流窗是「每发减一、每 ACK 加回」减量模型（lite ACK `+=`）；v2 是**在途计数模型**（pkts.len() vs 上限）却照搬 `-= off`——acked 包已体现在在途数里，`-=` 双重扣减把窗口以 16×k lite-ACK 频率棘轮到 0，发送端在两个完整 ACK（≤100/s，ACK2 节流）之间被饿死。修复：lite ACK 不动窗口（弹出已扣减）；UDT 出包泵同款批量化。**实测 v2→C# 80MB 10 → 167.5 MB/s（16.7 倍）**；
+   - **测试设施**：e2e_udt `ephemeral_udp` 收缓冲补 4MB 镜像生产口径（批量泵一个调度片 blast 数百 KB，OS 默认 ~64KB 缓冲会 OS 层丢包——0x03 续传 e2e 首收 77/183 包暴露）；
+   - **实测矩阵**（80MB 环回，禁压缩）：TCP 199 / QUIC 179 / **RUDP 126（原 <0.13）** / **UDT 161** / 单向 UDP 13.2（两轮重发+FEC 设计特性）；真机 C# 对打 14/14 SHA-256 全对 + GUI 0x02 80MB 复验；全量 264 绿（264 = 262 + RUDP 判别 2）0 告警；
+   - **登记接受**（不修）：单向 UDP 吞吐受设计定位约束（多轮重发换抗丢包）；deflate 对不可压缩数据占满 CPU（真机 80MB 压缩路径 8.3s，明文 0.5s——采样降级已按规格实现，用户可 --nocompress）。
 
 ## 8. 记录在案的否决项
 

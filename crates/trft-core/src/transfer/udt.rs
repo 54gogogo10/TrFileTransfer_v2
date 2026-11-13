@@ -46,6 +46,8 @@ fn median_of(win: &[u32; 16]) -> u32 {
 
 /// 重传兜底扫描节流（NAK 触发即发，不受此限）。
 const RETRANS_MIN_INTERVAL: Duration = Duration::from_millis(50);
+/// 出包泵单批上限（每批一次让出——逐包让出的调度开销在大流量下占主导）。
+const UDT_BATCH_CAP: usize = 512;
 /// 驱动节拍（libudt ACK/EXP 检查粒度 = SYN 10ms）。
 const TICK: Duration = Duration::from_millis(10);
 /// EXP 基准（libudt：count×(RTT+4RTTVar)+SYN，下限 count×300ms；RTT 初值 = 10×SYN）。
@@ -421,12 +423,15 @@ impl UdtConn {
         {
             let mut s = self.send.lock().expect("发送锁");
             if words.len() == 1 {
-                // 轻量 ACK：仅 cum，流窗反向递减（libudt 语义）。
+                // 轻量 ACK：仅 cum。libudt 的流窗是「每发减一、每 ACK 加回」的
+                // 减量模型（lite ACK += off）；本实现是在途计数模型（pkts.len()
+                // vs 上限），弹出的包已经体现在在途数里——不得再收缩上限，否则
+                // lite ACK 以 16×k 的频率把窗口棘轮到 0，发送端在两个完整 ACK
+                // （≤100/s）之间被饿死（真机 v2→C# 10MB/s 根因，§7.32）。
                 let cum = words[0] as i32;
                 if pw::seq_cmp(cum, s.last_ack) >= 0 {
                     let off = pw::seq_off(s.last_ack, cum);
                     if off > 0 {
-                        s.flow_window -= off;
                         for _ in 0..off {
                             s.pkts.pop_front();
                         }
@@ -1157,11 +1162,25 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
         }
     });
     // 出包泵。send 失败（ICMP 毒化瞬态）重试而非退出——通道关闭才是退出条件。
+    // 批量排空（每批一次让出；逐包让出的调度开销在大流量下占主导——§7.28）。
     let send_sock = socket;
     tokio::spawn(async move {
-        while let Some(pkt) = out_rx.recv().await {
-            if send_sock.send_to(&pkt, addr).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        loop {
+            let Some(first) = out_rx.recv().await else {
+                break;
+            };
+            let mut batch = vec![first];
+            while batch.len() < UDT_BATCH_CAP {
+                match out_rx.try_recv() {
+                    Ok(next) => batch.push(next),
+                    Err(_) => break,
+                }
+            }
+            for pkt in batch {
+                if send_sock.send_to(&pkt, addr).await.is_err() {
+                    // ICMP 毒化等瞬态：短暂退避后继续（通道关闭才是退出条件）。
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
             }
             tokio::task::yield_now().await;
         }

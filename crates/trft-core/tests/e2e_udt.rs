@@ -16,8 +16,24 @@ use trft_core::transfer::sender::SendOptions;
 use trft_core::transfer::Transport;
 
 /// 空闲 UDP 端口绑定（UDT 服务端入口；IPv4 回环）。
+/// 收缓冲 4MB **镜像生产口径**（serve_udt 同款）：发端批量泵在一个调度片内
+/// 可 blast 数百 KB，OS 默认 ~64KB 缓冲会丢包（批量化后实机暴露——0x03 续传
+/// e2e 首收 77/183 包）。
 async fn ephemeral_udp() -> (UdpSocket, std::net::SocketAddr) {
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    use socket2::{Domain, Socket as S2Socket, Type};
+    let dom = Domain::IPV4;
+    let sock = S2Socket::new(dom, Type::DGRAM, None).unwrap();
+    sock.bind(&"127.0.0.1:0"
+        .parse::<std::net::SocketAddr>()
+        .unwrap()
+        .into())
+    .unwrap();
+    if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
+        eprintln!("[测试] UDP 收缓冲设置失败: {e}");
+    }
+    sock.set_nonblocking(true).unwrap();
+    let std_sock: std::net::UdpSocket = sock.into();
+    let s = UdpSocket::from_std(std_sock).unwrap();
     let a = s.local_addr().unwrap();
     (s, a)
 }
