@@ -17,13 +17,68 @@ use crate::protocol::udp::{
     session_id, UdpHeader, UDP_HEADER_LEN, U_F_DATA, U_F_END, U_F_PARITY, U_F_START,
 };
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::SocketAddr;
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+/// 定位写（性能批 2026-11-15：此前 seek+write_all 两个系统调用/包——定位写一个；
+/// Windows `FileExt::seek_write` / Unix `FileExt::write_at`，短写循环补齐 all 语义）。
+fn file_write_at(f: &mut std::fs::File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            f.seek_write(buf, off)?
+        };
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            f.write_at(buf, off)?
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "定位写零字节",
+            ));
+        }
+        off += n as u64;
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+/// 定位读满（Windows `seek_read` / Unix `read_exact_at`，短读循环）。
+fn file_read_exact_at(
+    f: &mut std::fs::File,
+    mut buf: &mut [u8],
+    mut off: u64,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            f.seek_read(buf, off)?
+        };
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            f.read_at(buf, off)?
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "定位读提前 EOF",
+            ));
+        }
+        off += n as u64;
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
 
 pub const UDP_CHUNK: usize = 1200;
 pub const FEC_DATA_SHARDS: usize = 4;
@@ -158,6 +213,11 @@ impl UdpPlan {
 
     /// 流式发送一轮：逐组构建 → 限速发送 → 释放，内存 O(组)（修复整文件驻留）。
     /// 返回本轮计算的全文件哈希。
+    ///
+    /// 大块读游标（性能批 2026-11-15）：此前 1200B 粒度逐次 read_exact——每次
+    /// 都过 tokio blocking 线程池（~15-25µs/次，14 万次/双轮）；改为 256KB 块
+    /// 读 + 内存游标切片，线程池往返摊薄 ~200×。摘要/进度按块累计（总字节
+    /// 与逐次口径完全一致）。
     pub async fn send_pass(
         &self,
         path: &Path,
@@ -168,6 +228,43 @@ impl UdpPlan {
     ) -> Result<[u8; 32]> {
         let mut f = tokio::fs::File::open(path).await?;
         let mut dig = FileDigester::new();
+        const READ_BLOCK: usize = 256 * 1024;
+        let mut rbuf = vec![0u8; READ_BLOCK.min(self.size as usize).max(1)];
+        let mut rpos = 0usize;
+        let mut rlen = 0usize;
+        macro_rules! take_bytes {
+            ($dst:expr, $want:expr) => {{
+                let mut need: usize = $want;
+                while need > 0 {
+                    if rpos == rlen {
+                        // 块读：短读循环到块满或 EOF（read_exact 在文件尾会误报）。
+                        let mut got = 0usize;
+                        while got < rbuf.len() {
+                            let n = f.read(&mut rbuf[got..]).await?;
+                            if n == 0 {
+                                break;
+                            }
+                            got += n;
+                        }
+                        rpos = 0;
+                        rlen = got;
+                        if got > 0 {
+                            dig.update(&rbuf[..got]);
+                            if let Some(r) = report {
+                                r.add(got as u64);
+                            }
+                        } else {
+                            break; // EOF：余下保持补零（接收端哈希兜底）
+                        }
+                    }
+                    let take = need.min(rlen - rpos);
+                    let off = $want - need;
+                    $dst[off..off + take].copy_from_slice(&rbuf[rpos..rpos + take]);
+                    rpos += take;
+                    need -= take;
+                }
+            }};
+        }
         if self.fec {
             let codec = FecCodec::new(FEC_DATA_SHARDS, self.parity_shards as usize)?;
             let groups = self.chunk_count.div_ceil(FEC_DATA_SHARDS as u64);
@@ -179,11 +276,7 @@ impl UdpPlan {
                     if idx < self.chunk_count {
                         let want = (UDP_CHUNK as u64).min(self.size - idx * self.chunk_len as u64)
                             as usize;
-                        f.read_exact(&mut shard[..want]).await?;
-                        dig.update(&shard[..want]);
-                        if let Some(r) = report {
-                            r.add(want as u64);
-                        }
+                        take_bytes!(shard, want);
                     }
                     shards.push(shard);
                 }
@@ -213,11 +306,7 @@ impl UdpPlan {
             for idx in 0..self.chunk_count {
                 let want = (UDP_CHUNK as u64).min(self.size - idx * self.chunk_len as u64) as usize;
                 let mut chunk = vec![0u8; want];
-                f.read_exact(&mut chunk).await?;
-                dig.update(&chunk);
-                if let Some(r) = report {
-                    r.add(want as u64);
-                }
+                take_bytes!(chunk, want);
                 let frame = self.data_frame(idx, &chunk);
                 lim.acquire(frame.len() as u64).await;
                 socket.send_to(&frame, addr).await?;
@@ -308,7 +397,19 @@ pub async fn send_file_udp(addr: SocketAddr, path: &Path, opts: &UdpSendOptions)
     } else {
         "[::]:0"
     };
-    let socket = UdpSocket::bind(local).await?;
+    // socket2 自建：发/收缓冲 4MB（性能批 2026-11-15——Windows 默认 ~64KB，
+    // 高吞吐突发下 send 频繁 park；与 `std_udp_listener` 同口径）。
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let std_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    std_sock.bind(&socket2::SockAddr::from(local.parse::<SocketAddr>().expect("合法本地地址")))?;
+    let _ = std_sock.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = std_sock.set_recv_buffer_size(4 * 1024 * 1024);
+    std_sock.set_nonblocking(true)?;
+    let socket = UdpSocket::from_std(std_sock.into())?;
     let mut lim = TokenBucket::new(opts.speed_limit_bps);
     let passes = opts.passes.clamp(1, 5);
     // 规格 §3.2：单向 UDP 进度按轮加权（每轮完整重发 → total = size × passes）。
@@ -316,18 +417,24 @@ pub async fn send_file_udp(addr: SocketAddr, path: &Path, opts: &UdpSendOptions)
         r.set_total(plan.size * passes as u64);
     }
     for pass in 0..passes {
-        for st in plan.start_frames() {
+        let start_frames = plan.start_frames();
+        for (i, st) in start_frames.iter().enumerate() {
             lim.acquire(st.len() as u64).await;
-            socket.send_to(&st, addr).await?;
-            tokio::time::sleep(BURST_GAP).await;
+            socket.send_to(st, addr).await?;
+            if i + 1 < start_frames.len() {
+                tokio::time::sleep(BURST_GAP).await; // 帧间才间隔（末帧后的等待纯浪费）
+            }
         }
         let hash = plan
             .send_pass(path, &socket, addr, &mut lim, opts.progress.as_ref())
             .await?;
-        for e in plan.end_frames(&hash) {
+        let end_frames = plan.end_frames(&hash);
+        for (i, e) in end_frames.iter().enumerate() {
             lim.acquire(e.len() as u64).await;
-            socket.send_to(&e, addr).await?;
-            tokio::time::sleep(BURST_GAP).await;
+            socket.send_to(e, addr).await?;
+            if i + 1 < end_frames.len() {
+                tokio::time::sleep(BURST_GAP).await; // 同上
+            }
         }
         if pass + 1 < passes {
             tokio::time::sleep(PASS_DELAY).await;
@@ -622,11 +729,7 @@ impl UdpRecvEngine {
                 return UdpEvent::Ignored("重复块");
             }
             let off = seq * s.chunk_len as u64;
-            if s.file
-                .seek(SeekFrom::Start(off))
-                .and_then(|_| s.file.write_all(p))
-                .is_err()
-            {
+            if file_write_at(&mut s.file, p, off).is_err() {
                 return UdpEvent::Ignored("写盘失败");
             }
             s.bitmap[idx / 64] |= 1u64 << (idx % 64);
@@ -653,10 +756,14 @@ impl UdpRecvEngine {
         let group = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
         let idx = p[4];
         let shard = &p[5..];
-        // idx 必须落在校验分片域 [k, k+r)，垃圾分片不占预算。
+        // idx 必须落在校验分片域 [k, k+r)，垃圾分片不占预算；组号上界同理
+        // （性能批：伪造大组号会分配 4×chunk_len 零分片跑无意义重构——有界但白费）。
         if idx < FEC_DATA_SHARDS as u8 || idx >= (FEC_DATA_SHARDS + s.parity_shards as usize) as u8
         {
             return UdpEvent::Ignored("PARITY 分片序号越界");
+        }
+        if group as u64 >= s.chunk_count.div_ceil(FEC_DATA_SHARDS as u64) {
+            return UdpEvent::Ignored("PARITY 组号越界");
         }
         if shard.len() != s.chunk_len as usize {
             return UdpEvent::Ignored("PARITY 分片长度不符");
@@ -743,11 +850,7 @@ impl UdpRecvEngine {
                         }
                         let off = idx * s.chunk_len as u64;
                         let mut v = vec![0u8; s.chunk_len as usize];
-                        if s.file
-                            .seek(SeekFrom::Start(off))
-                            .and_then(|_| s.file.read_exact(&mut v))
-                            .is_err()
-                        {
+                        if file_read_exact_at(&mut s.file, &mut v, off).is_err() {
                             return None;
                         }
                         Some(v)
@@ -785,10 +888,7 @@ impl UdpRecvEngine {
                 continue;
             }
             let off = idx * s.chunk_len as u64;
-            if s.file
-                .seek(SeekFrom::Start(off))
-                .and_then(|_| s.file.write_all(&shard))
-                .is_ok()
+            if file_write_at(&mut s.file, &shard, off).is_ok()
             {
                 s.bitmap[idx as usize / 64] |= 1u64 << (idx as usize % 64);
                 s.done += 1;
@@ -1028,6 +1128,14 @@ pub async fn serve_udp_on(
 ) -> Result<()> {
     cleanup_orphans(&opts.save_dir);
     let _ = std::fs::create_dir_all(&opts.save_dir);
+    // 接收缓冲升 4MB（性能批 2026-11-15：`serve_udp` 路径经 `std_udp_listener`
+    // 已有；GUI bind_udp / e2e 传入的 socket 是 OS 默认 ~64KB——新发送端去掉
+    // 逐包 blocking 读后突发可达 ~77KB/50KB 文件，尾部包确定性 OS 层丢失，
+    // 多轮重发同型再丢 → 永不收敛。失败仅忽略（与监听口径一致）。
+    {
+        let sock_ref = socket2::SockRef::from(&socket);
+        let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
+    }
     let filter = (opts.ip_filter_mode, opts.ip_filter_list.clone());
     // 目录解析器：`<save>/<设备名|IP>/<yyyy-mm-dd>/`（规格 §3.3）；
     // 单向 UDP 无握手确认点，ConfirmReceive 不适用（TECH-STACK §7.10）。
@@ -1094,18 +1202,36 @@ pub async fn serve_udp_on(
             }
             Err(e) => return Err(crate::error::Error::Io(e)),
         };
+        // 批量抽干 + 每批一次 blocking 池往返（性能批 2026-11-15：此前每包一次
+        // spawn_blocking——线程池调度 ~15-25µs/包，占每包成本一半以上；批内
+        // 引擎串行语义不变，4MB 内核缓冲在批处理期间吸收后续包，溢出由
+        // FEC/下一轮兜底——与此前 END 哈希期间同一口径）。
+        const UDP_RECV_BATCH: usize = 512;
+        let mut batch: Vec<(Vec<u8>, IpAddr)> = Vec::with_capacity(UDP_RECV_BATCH);
         // IP 过滤（规格 §3.3）：来源被拒 → 静默丢弃（引擎处理前判定，无状态污染）。
-        if !crate::transfer::receiver::ip_allowed(peer.ip(), filter.0, &filter.1) {
+        if crate::transfer::receiver::ip_allowed(peer.ip(), filter.0, &filter.1) {
+            batch.push((buf[..n].to_vec(), peer.ip()));
+        }
+        while batch.len() < UDP_RECV_BATCH {
+            match socket.try_recv_from(&mut buf) {
+                Ok((n2, peer2)) => {
+                    if crate::transfer::receiver::ip_allowed(peer2.ip(), filter.0, &filter.1) {
+                        batch.push((buf[..n2].to_vec(), peer2.ip()));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if batch.is_empty() {
             continue;
         }
         // 引擎放入 blocking 池：END 的整文件哈希不占 async worker。
-        // 注意：逐包 await 意味着引擎仍串行——大文件 END 哈希期间后续包
-        // 在内核缓冲排队，靠多轮重发收敛（规格 §4.2 落盘即状态）。
-        let packet = buf[..n].to_vec();
-        let remote = peer.ip();
-        let (eng, ev) = match tokio::task::spawn_blocking(move || {
-            let ev = engine.handle_from(&packet, Some(remote));
-            (engine, ev)
+        let (eng, evs) = match tokio::task::spawn_blocking(move || {
+            let mut evs: Vec<(IpAddr, UdpEvent)> = Vec::with_capacity(batch.len());
+            for (packet, remote) in &batch {
+                evs.push((*remote, engine.handle_from(packet, Some(*remote))));
+            }
+            (engine, evs)
         })
         .await
         {
@@ -1116,78 +1242,81 @@ pub async fn serve_udp_on(
             }
         };
         engine = eng;
-        match &ev {
-            UdpEvent::Started {
-                session,
-                name,
-                size,
-                chunk_len,
-            } => {
-                if let Some(hub) = &opts.progress {
-                    if reports.len() >= 256 {
-                        if let Some(old) = report_order.pop_front() {
-                            if let Some((r, ..)) = reports.remove(&old) {
-                                r.fail();
+        for (peer_ip, ev) in evs {
+            let peer_str = peer_ip.to_string();
+            match &ev {
+                UdpEvent::Started {
+                    session,
+                    name,
+                    size,
+                    chunk_len,
+                } => {
+                    if let Some(hub) = &opts.progress {
+                        if reports.len() >= 256 {
+                            if let Some(old) = report_order.pop_front() {
+                                if let Some((r, ..)) = reports.remove(&old) {
+                                    r.fail();
+                                }
                             }
                         }
-                    }
-                    let r = hub.register("recv", name.clone(), *size);
-                    r.set_peer(&peer.ip().to_string());
-                    report_order.push_back(*session);
-                    reports.insert(
-                        *session,
-                        (r, *chunk_len as u64, *size, 0, std::time::Instant::now()),
-                    );
-                }
-            }
-            UdpEvent::Progress { session, done, .. } => {
-                if let Some((r, chunk_len, size, last, _)) = reports.get_mut(session) {
-                    let bytes = (*done * *chunk_len).min(*size);
-                    if bytes > *last {
-                        r.add(bytes - *last);
-                        *last = bytes;
+                        let r = hub.register("recv", name.clone(), *size);
+                        r.set_peer(&peer_str);
+                        report_order.push_back(*session);
+                        reports.insert(
+                            *session,
+                            (r, *chunk_len as u64, *size, 0, std::time::Instant::now()),
+                        );
                     }
                 }
+                UdpEvent::Progress { session, done, .. } => {
+                    if let Some((r, chunk_len, size, last, _)) = reports.get_mut(session) {
+                        let bytes = (*done * *chunk_len).min(*size);
+                        if bytes > *last {
+                            r.add(bytes - *last);
+                            *last = bytes;
+                        }
+                    }
+                }
+                UdpEvent::Completed {
+                    session,
+                    path,
+                    size,
+                    start,
+                } => {
+                    let removed = reports.remove(session);
+                    if let Some((r, ..)) = &removed {
+                        r.finish();
+                    }
+                    report_order.retain(|s| s != session);
+                    // 用户可见日志只报文件名，不暴露会话 ID（线协议内部标识）。
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    eprintln!("[接收-UDP] 收到 {name} → {}", path.display());
+                    // 落盘即状态（规格 §4.2）：发布成功即记账；size/start 直接取自事件
+                    // （轮 1：不再依赖 progress hub 注入——CLI 无 hub 也记全）。
+                    if let Some(stats) = &opts.stats {
+                        stats.record(
+                            crate::stats::Direction::Recv,
+                            &peer_str,
+                            *size,
+                            1,
+                            start.elapsed().as_secs(),
+                            "UDP 接收",
+                            &path.display().to_string(),
+                        );
+                    }
+                    if let Some(tx) = &events {
+                        let _ = tx.send(ev.clone());
+                    }
+                }
+                UdpEvent::Ignored(_) => {}
             }
-            UdpEvent::Completed {
-                session,
-                path,
-                size,
-                start,
-            } => {
-                let removed = reports.remove(session);
-                if let Some((r, ..)) = &removed {
-                    r.finish();
-                }
-                report_order.retain(|s| s != session);
-                // 用户可见日志只报文件名，不暴露会话 ID（线协议内部标识）。
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                eprintln!("[接收-UDP] 收到 {name} → {}", path.display());
-                // 落盘即状态（规格 §4.2）：发布成功即记账；size/start 直接取自事件
-                // （轮 1：不再依赖 progress hub 注入——CLI 无 hub 也记全）。
-                if let Some(stats) = &opts.stats {
-                    stats.record(
-                        crate::stats::Direction::Recv,
-                        &peer.ip().to_string(),
-                        *size,
-                        1,
-                        start.elapsed().as_secs(),
-                        "UDP 接收",
-                        &path.display().to_string(),
-                    );
-                }
+            if matches!(ev, UdpEvent::Started { .. } | UdpEvent::Progress { .. }) {
                 if let Some(tx) = &events {
-                    let _ = tx.send(ev.clone());
+                    let _ = tx.send(ev);
                 }
-            }
-            UdpEvent::Ignored(_) => {}
-        }
-        if matches!(ev, UdpEvent::Started { .. } | UdpEvent::Progress { .. }) {
-            if let Some(tx) = &events {
-                let _ = tx.send(ev);
             }
         }
     }

@@ -321,6 +321,13 @@
    - **实测**：QUIC 环回 176-179 → **179.6-197 MB/s**（对齐 TCP 177-192）；真机 C# 矩阵 **14/14**（QUIC 与 C# 无互通——回归性质）；全量 **269 绿 0 告警**；
    - **登记接受**：CUBIC 保留（环回无丢包非瓶颈；BBR 实验开关未开）；压缩装饰器同步 deflate 阻塞 executor（与 TCP 共症，R7 处理）；chunked 多连接而非多流（省 TLS 握手的可选优化暂缓）。
 
+38. **性能优化 8 轮计划·轮 5（单向 UDP 引擎）**（2026-11-15）：
+   - **审查结论**（独立代理定量）：每包 ~27µs 固定成本 × 21 万包/双轮 = 13-16MB/s 的全部来源，其中收端逐包 spawn_blocking 线程池往返 ~15-25µs/包（代码注释自认「引擎仍串行」）+ 发端 1200B 粒度逐次 read_exact（每次过 blocking 池，14 万次/双轮）；设计成本仅 3× 线上放大（passes=2 × FEC 1.5×），其余 ~85% 差距是实现低效；正确性核查无 P0/P1 缺陷（组边界/乱序/parity 重建/manifest 多副本/哈希失败自愈全成立），P2 两项（parity 组号无上界、帧间 sleep 含末帧浪费）顺手修；
+   - **落地**：发端 256KB 块读游标（blocking 池往返摊薄 ~200×，摘要/进度按块累计口径不变）；收端批量抽干（512/批）+ 每批一次 spawn_blocking（事件逐 (IpAddr, UdpEvent) 保留 peer 绑定）；定位写/读 `write_at`/`read_exact_at` 替换 seek+rw 两调用（Windows `seek_write`/Unix `write_at`——**该工具链 Windows FileExt 无 write_all_at/read_exact_at，短写循环补齐 all 语义**）；发端 socket2 自建 4MB 双缓冲；START/END 帧间才 sleep（末帧后 40ms 纯浪费去除）；parity 组号上界早退；
+   - **新暴露并修复的真实缺陷**：发端去掉逐包 blocking 读后吞吐暴增，**64KB OS 收缓冲被 ~77KB 突发确定性打爆**（50KB 文件尾部 6 包/轮必丢 → 多轮重发同型再丢 → 永不收敛，e2e 2 项红）——`serve_udp_on` 入口统一升级收缓冲 4MB（GUI bind_udp / e2e 外部 socket 原本只有 OS 默认；生产 serve_udp 路径经 std_udp_listener 本就有）；
+   - **实测**：单向 UDP 环回 13-16 → **34.5-34.8 MB/s（2.2×）**——进一步上限受 1200B 包长 + 逐包 syscall 硬顶约束（~100-200MB/s 需 sendmmsg/GSO，Windows 无批量 UDP 发送 API 可走，登记为平台约束）；C# 互通矩阵 **14/14**（首次跑 13/14 系环境端口抖动自愈）；全量 **269 绿 0 告警**；
+   - **登记接受**：END 全丢（6 帧）→ TTL 600s 删半成品，无回传链路无补救（既有设计，多轮重发下概率可忽略）；抑制窗口内同键新文件误抑制（mtime 纳秒粒度概率趋零）。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |
