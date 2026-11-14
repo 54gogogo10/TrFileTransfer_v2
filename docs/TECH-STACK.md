@@ -314,6 +314,13 @@
    - **登记接受**：串行读→哈希→加密→写无流水线（SHA-NI 后残余间隙变小，双缓冲改造收益/风险比不足，暂缓）；0x00 直发路径不协商压缩（既有行为，`opts.compress` 在该路径静默无效——基准测「纯加密」以 0x00 为准）；
    - **本轮教训（登入排障手册）**：加密层改动必须先跑 `e2e_tcp` 全组（14 项含 Trickle/Dribble 半写回归）再上基准——首版长度字段错误在单元 roundtrip（seal/open 对称）下不可见，只在跨层 e2e 暴露。
 
+37. **性能优化 8 轮计划·轮 4（QUIC/quinn 配置）**（2026-11-15）：
+   - **审查结论**（独立代理对照 quinn-proto 0.11.19 源码级默认值）：**全仓零 TransportConfig 设置——客户端与服务端全部跑出厂默认**；UDP socket 缓冲仅 `::` 通配路径有 4MB（基准的 127.0.0.1 绑定与客户端全走 OS 默认 64KB）。正确性杀手：默认 `max_idle_timeout=30s` + `keep_alive=None`——数据发完后接收端 fsync/Skip 重哈希静默期 >30s 时连接被掐，发送端 300s 确认窗实际在 30s 拿到连接错误（数据已完整落盘仍报失败，TCP 槽位无此问题）；内存放大面：默认连接级收窗 `VarInt::MAX` × 100 bidi 流 × 64 并发闸 ≈ 8GB；流窗 1.25MB 把 WAN 1Gbps×40ms 单流钉在 ~31MB/s；默认 DPLPMTUD 上界 1452 把环回钉在 ~120k pps（每包一次 WSARecvMsg——quinn-udp Windows 收侧 BATCH_SIZE=1、URO 关闭，应用层只能靠大包摊薄）；
+   - **落地**：`trft_transport_config(loopback)`——idle 30s→60s + keepalive 15s（单侧即生效：PING 流量重置双方 idle 计时器，与旧对端互通也受保护）；流/连接窗 8/16MB、send_window 16MB；bidi 流上限 100→4（每连接单流）；**环回 MTU 探测上界 1452→65000**（DPLPMTUD 从 1200 合法起点爬升——**initial_mtu 直设 65000 会让首个 Initial 包超 QUIC 1200B 规范上限被对端丢弃、握手永不完成，实测挂死后修正**；非环回保持 1452 黑洞探测语义，旧对端互通零影响）；服务端自建 socket 无条件化（4MB 双缓冲）；客户端 socket2 自建（此前 Endpoint::client 全默认）；`std_udp_listener` 补发缓冲 4MB（此前只有收侧）；
+   - **0x0D 通道绑定链路复核**（审查员逐行确认无缺陷）：服务端以自身证书指纹验证明、客户端 peer_identity 提取、双臂中继必败、旧服务端降级 fail-closed 全链成立；自签证书为 ECDSA P-256（生成 1-3ms 非性能项）——**登记**：证书每启动重生成，`--pin` 钉扎身份随重启漂移（持久化证书 + 过期检查为后续打磨项；当前 `verify_server_cert` 不查有效期在「每启动新证书」模型下属合理取舍）；
+   - **实测**：QUIC 环回 176-179 → **179.6-197 MB/s**（对齐 TCP 177-192）；真机 C# 矩阵 **14/14**（QUIC 与 C# 无互通——回归性质）；全量 **269 绿 0 告警**；
+   - **登记接受**：CUBIC 保留（环回无丢包非瓶颈；BBR 实验开关未开）；压缩装饰器同步 deflate 阻塞 executor（与 TCP 共症，R7 处理）；chunked 多连接而非多流（省 TLS 握手的可选优化暂缓）。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

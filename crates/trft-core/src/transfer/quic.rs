@@ -139,6 +139,39 @@ impl AsyncWrite for QuicStream {
     }
 }
 
+/// 传输配置（性能批 2026-11-15——此前全仓跑 quinn 出厂默认）：
+/// - `max_idle_timeout` 30s→60s + `keep_alive` 15s：数据发完后接收端 fsync/重哈希
+///   静默期 >30s 时默认配置会把连接掐断——发送端 300s 确认窗实际在 30s 处拿到
+///   连接错误（数据已完整落盘仍报失败）。keepalive 单侧即生效（PING 流量重置
+///   双方 idle 计时器），与旧对端互通也受保护；
+/// - 流/连接窗口 8/16MB：默认流窗 1.25MB 把 WAN 1Gbps×40ms（BDP 5MB）单流
+///   钉在 ~31MB/s；
+/// - `max_concurrent_bidi_streams` 100→4：本应用每连接单流，100 是纯内存
+///   放大面（64 并发连接 × 100 流 × 无界连接级收窗 ≈ 8GB——显式 16MB 收紧）；
+/// - 环回 MTU 直上 65000：默认 DPLPMTUD 上界 1452 把环回钉在 ~120k pps
+///   （每包一次 WSARecvMsg）——大包摊薄后对齐 RUDP 环回口径；非环回保持
+///   默认（1452 黑洞探测语义不变，旧对端 ≤1452 依然互通）。
+fn trft_transport_config(loopback: bool) -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.max_idle_timeout(Some(
+        Duration::from_secs(60).try_into().expect("合法 IdleTimeout"),
+    ));
+    tc.keep_alive_interval(Some(Duration::from_secs(15)));
+    tc.stream_receive_window(quinn::VarInt::from_u32(8 << 20));
+    tc.receive_window(quinn::VarInt::from_u32(16 << 20));
+    tc.send_window(16 << 20);
+    tc.max_concurrent_bidi_streams(quinn::VarInt::from_u32(4));
+    if loopback {
+        // 环回放开 MTU 探测上界（DPLPMTUD 从 1200 合法起点自行爬升——
+        // initial_mtu 直设 65000 会让首个 Initial 包超 QUIC 1200B 上限被对端
+        // 丢弃，握手永不完成，实测挂死）。
+        let mut mtu = quinn::MtuDiscoveryConfig::default();
+        mtu.upper_bound(65000);
+        tc.mtu_discovery_config(Some(mtu));
+    }
+    Arc::new(tc)
+}
+
 /// 创建 QUIC 服务端 endpoint（运行时生成自签证书）。
 /// 返回 (endpoint, 证书指纹)：指纹供 0x0D 通道绑定配对校验（M6'）。
 pub async fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, [u8; 32])> {
@@ -153,21 +186,18 @@ pub async fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, [u8; 
         .map_err(|e| proto(format!("服务端证书配置失败: {e}")))?;
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .map_err(|e| proto(format!("QUIC 服务端配置失败: {e}")))?;
-    let cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    // 通配 `::` 用自建双栈 socket（quinn 默认绑定 v6only——Windows 上收不到
-    // IPv4 对端；TECH-STACK §7.31），其余走 Endpoint::server 平台默认。
-    let endpoint = if crate::transfer::is_v6_wildcard(addr.ip()) {
-        let socket = crate::transfer::std_udp_listener(addr).map_err(io_err)?;
-        quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(cfg),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )
-        .map_err(io_err)?
-    } else {
-        quinn::Endpoint::server(cfg, addr).map_err(io_err)?
-    };
+    let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+    cfg.transport_config(trft_transport_config(addr.ip().is_loopback()));
+    // 自建 socket（收/发缓冲 4MB + 通配 `::` 双栈关 v6only——Windows 上收不到
+    // IPv4 对端，TECH-STACK §7.31；此前仅通配路径自建，其余走平台默认 64KB）。
+    let socket = crate::transfer::std_udp_listener(addr).map_err(io_err)?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(cfg),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(io_err)?;
     Ok((endpoint, fp))
 }
 
@@ -184,7 +214,9 @@ pub async fn connect_quic_full(
 ) -> Result<(QuicStream, [u8; 32])> {
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls_config(pin))
         .map_err(|e| proto(format!("QUIC 客户端配置失败: {e}")))?;
-    // 按目标地址族选择本地绑定（IPv6 不可达修复）。
+    // 按目标地址族选择本地绑定（IPv6 不可达修复）；socket2 自建——收/发缓冲
+    // 4MB（Windows 默认 ~64KB ≈ 45 个 1452B 包，调度延迟毫秒级即 OS 层丢包
+    // → CUBIC 减窗抖动；与服务端 `std_udp_listener` 同口径）。
     let local: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -192,8 +224,28 @@ pub async fn connect_quic_full(
     }
     .parse()
     .unwrap();
-    let mut endpoint = quinn::Endpoint::client(local).map_err(io_err)?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(qcc)));
+    let domain = if local.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let std_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None).map_err(io_err)?;
+    std_sock
+        .bind(&socket2::SockAddr::from(local))
+        .map_err(io_err)?;
+    let _ = std_sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = std_sock.set_send_buffer_size(4 * 1024 * 1024);
+    std_sock.set_nonblocking(true).map_err(io_err)?;
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        std_sock.into(),
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(io_err)?;
+    let mut cc = quinn::ClientConfig::new(Arc::new(qcc));
+    cc.transport_config(trft_transport_config(addr.ip().is_loopback()));
+    endpoint.set_default_client_config(cc);
     let conn = endpoint
         .connect(addr, QUIC_SNI)
         .map_err(io_err)?

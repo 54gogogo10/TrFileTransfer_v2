@@ -71,6 +71,11 @@ pub fn std_udp_listener(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket
     if let Err(e) = sock.set_recv_buffer_size(4 * 1024 * 1024) {
         eprintln!("[警告] UDP 收缓冲设置失败: {e}");
     }
+    // 发缓冲同口径（性能批 2026-11-15：Windows 默认 ~64KB——高吞吐突发下
+    // 发送频繁 park；此前只设了收侧）。
+    if let Err(e) = sock.set_send_buffer_size(4 * 1024 * 1024) {
+        eprintln!("[警告] UDP 发缓冲设置失败: {e}");
+    }
     Ok(sock.into())
 }
 
