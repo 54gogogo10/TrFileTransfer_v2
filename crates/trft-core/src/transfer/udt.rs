@@ -13,7 +13,7 @@
 
 use crate::error::{proto, Error, Result};
 use crate::protocol::udt as pw;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -37,6 +37,9 @@ fn now_us_since(epoch: &Instant) -> u64 {
     epoch.elapsed().as_micros() as u64
 }
 
+/// 出口通道元素（服务端共享出口携带 dst；客户端泵忽略 dst 直发对端）。
+type OutPkt = (SocketAddr, Arc<[u8]>);
+
 /// 中位数（libudt nth_element 同效；不改原序——拷贝小窗排序）。
 fn median_of(win: &[u32; 16]) -> u32 {
     let mut c = *win;
@@ -48,6 +51,8 @@ fn median_of(win: &[u32; 16]) -> u32 {
 const RETRANS_MIN_INTERVAL: Duration = Duration::from_millis(50);
 /// 出包泵单批上限（每批一次让出——逐包让出的调度开销在大流量下占主导）。
 const UDT_BATCH_CAP: usize = 512;
+/// 读侧单次 poll 的聚合上限（把逐包唤醒拼成大块——对齐 RUDP 口径）。
+const UDT_READ_AGG: usize = 256 * 1024;
 /// 驱动节拍（libudt ACK/EXP 检查粒度 = SYN 10ms）。
 const TICK: Duration = Duration::from_millis(10);
 /// EXP 基准（libudt：count×(RTT+4RTTVar)+SYN，下限 count×300ms；RTT 初值 = 10×SYN）。
@@ -72,19 +77,29 @@ const ACK_WINDOW_CAP: usize = 1024;
 
 #[derive(Debug)]
 struct SendState {
-    /// 未被累积确认的包（front = incseq(last_ack) 的数据）。
-    pkts: VecDeque<Vec<u8>>,
+    /// 未被累积确认的包（front = incseq(last_ack) 的数据）——**已编码线包**
+    /// （含 16B 头；首发即编码，重传原地改 ts 零再编码）。
+    pkts: VecDeque<Arc<[u8]>>,
     /// 累积确认基准 seq（初始 = 本端 ISN）。
     last_ack: i32,
     /// 最后分配的 seq（初始 = ISN-1）。
     next_seq: i32,
-    /// 重传列表（升序去重）。
-    loss: BTreeSet<i32>,
+    /// 重传列表（升序去重；值 = 上次重发时刻——**每条目 50ms 节流**防 NAK 连击
+    /// 全量倾泻放大；新入列条目回填旧时刻即立即符合条件）。
+    loss: BTreeMap<i32, Instant>,
     /// 对端通告流窗（握手 + ACK 载荷 word3 持续刷新；light ACK 反向递减）。
     flow_window: i32,
-    /// 拥塞窗（慢启动近似）。
+    /// 拥塞窗（慢启动近似 + CA 速率公式）。
     cwnd: f64,
     in_slow_start: bool,
+    /// 对端 RTT（µs；ACK word1 EWMA——喂 CA 公式）。
+    peer_rtt_us: i64,
+    /// 对端测量投递速率（包/秒；ACK word4 EWMA——CA 速率公式主输入）。
+    delivery_rate: f64,
+    /// 上次 CC 收缩时的 NAK 首 seq（递减周期守卫——同周期不重复收缩）。
+    last_dec_seq: Option<i32>,
+    /// 连续收缩计数（libudt 上限 5——丢包风暴下不得把窗口打到 16）。
+    dec_count: u32,
     shutdown_req: bool,
     shutdown_resends: u32,
 }
@@ -95,10 +110,14 @@ impl SendState {
             pkts: VecDeque::new(),
             last_ack: isn,
             next_seq: pw::seq_dec(isn),
-            loss: BTreeSet::new(),
+            loss: BTreeMap::new(),
             flow_window,
             cwnd: CWND_INIT,
             in_slow_start: true,
+            peer_rtt_us: 0,
+            delivery_rate: 0.0,
+            last_dec_seq: None,
+            dec_count: 0,
             shutdown_req: false,
             shutdown_resends: 0,
         }
@@ -145,6 +164,10 @@ struct RecvState {
     pkt_win: [u32; 16],
     pkt_ptr: usize,
     last_arr_us: u64,
+    /// 最近一次 NAK 发出时刻（µs——缺口未恢复时的周期重报保活：NAK 只报
+    /// 新缺口后，首个 NAK 本身丢失会永久丢缺口——发送端 loss 表不知情且其
+    /// EXP 兜底仅在 loss 为空时全量补插 → 死锁。周期重发全量 loss 表有界保活）。
+    last_nak_us: u64,
     /// 探测对间隔窗（µs，16 槽——seq&0xF==0/1 成对到达测链路容量，喂 word5）。
     probe_win: [u32; 16],
     probe_ptr: usize,
@@ -178,6 +201,7 @@ impl RecvState {
             probe_win: [1_000; 16],
             probe_ptr: 0,
             probe_time_us: 0,
+            last_nak_us: 0,
             epoch: Instant::now(),
         }
     }
@@ -258,8 +282,8 @@ pub(crate) struct UdtConn {
     start: Instant,
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
-    /// 已编码出包出口（socket 泵/转发消费；close 摘除）。
-    out_tx: Mutex<Option<UnboundedSender<Vec<u8>>>>,
+    /// 已编码出包出口（socket 泵/转发消费；close 摘除）。共享注入时携带 dst。
+    out_tx: Mutex<Option<UnboundedSender<OutPkt>>>,
     /// 有序载荷出口（读侧消费；EOF/错误摘除 → 读侧见 EOF）。
     data_tx: Mutex<Option<UnboundedSender<Vec<u8>>>>,
     /// 写侧窗口等待（notify_waiters 唤醒已注册等待者；写侧「先注册后查窗」的顺序
@@ -284,22 +308,15 @@ impl UdtConn {
         self.start.elapsed().as_micros() as u32
     }
 
-    fn outbound(&self, pkt: Vec<u8>) {
+    fn outbound(&self, pkt: Arc<[u8]>) {
         if let Some(tx) = self.out_tx.lock().expect("出包锁").clone() {
-            let _ = tx.send(pkt);
+            let _ = tx.send((self.peer, pkt));
         }
     }
 
     fn send_ctrl(&self, ctype: u16, add: i32, words: &[u32]) {
         let pkt = pw::encode_ctrl(ctype, add, self.ts(), self.peer_id, words);
-        self.outbound(pkt);
-    }
-
-    fn send_data_pkt(&self, seq: i32, data: &[u8]) {
-        let msg_no = pw::MSG_SOLO | (seq as u32 & 0x1FFF_FFFF);
-        if let Ok(pkt) = pw::encode_data(seq, msg_no, self.ts(), self.peer_id, data) {
-            self.outbound(pkt);
-        }
+        self.outbound(pkt.into());
     }
 
     fn notify_window(&self) {
@@ -326,7 +343,7 @@ impl UdtConn {
 
     fn handle_packet(self: &Arc<Self>, pkt: pw::Pkt) {
         match pkt {
-            pw::Pkt::Data { seq, payload, .. } => self.on_data(seq, &payload),
+            pw::Pkt::Data { seq, payload, .. } => self.on_data(seq, payload),
             pw::Pkt::Ctrl {
                 ctype, add, words, ..
             } => match ctype {
@@ -339,7 +356,7 @@ impl UdtConn {
                     // 已建立连接上对端重发的握手请求 → 幂等重发响应
                     //（libudt processCtrl case 0：req_type > 0 时重发 initdata）。
                     if let Some(resp) = self.hs_resp.lock().expect("握手锁").clone() {
-                        self.outbound(resp);
+                        self.outbound(resp.into());
                     }
                 }
                 pw::C_WARN | pw::C_DROP | pw::C_PEER_ERROR => {}
@@ -353,8 +370,10 @@ impl UdtConn {
     /* ---------- 发送方向 ---------- */
 
     /// 从写侧入队新数据（窗口允许范围内尽量多包）。返回消费的字节数（0 = 窗口满）。
+    /// **入队即编码**（一次拷贝）：队列与出口共享同一 Arc 线包——对照 libudt
+    /// CSndBuffer 块池单次 memcpy（性能批 2026-11-14；此前载荷 3 拷贝 4 分配）。
     fn enqueue(&self, buf: &[u8]) -> usize {
-        let mut jobs: Vec<(i32, Vec<u8>)> = Vec::new();
+        let mut jobs: Vec<Arc<[u8]>> = Vec::new();
         let consumed = {
             let mut s = self.send.lock().expect("发送锁");
             let win = s.window();
@@ -362,6 +381,7 @@ impl UdtConn {
                 return 0;
             }
             let budget = win - s.pkts.len();
+            let ts = self.ts();
             let mut consumed = 0usize;
             for _ in 0..budget {
                 if consumed >= buf.len() {
@@ -370,19 +390,25 @@ impl UdtConn {
                 let n = (buf.len() - consumed).min(pw::UDT_PAYLOAD_MAX);
                 let seq = pw::seq_inc(s.next_seq);
                 s.next_seq = seq;
-                s.pkts.push_back(buf[consumed..consumed + n].to_vec());
-                jobs.push((seq, buf[consumed..consumed + n].to_vec()));
+                let msg_no = pw::MSG_SOLO | (seq as u32 & 0x1FFF_FFFF);
+                if let Ok(pkt) = pw::encode_data(seq, msg_no, ts, self.peer_id, &buf[consumed..consumed + n]) {
+                    let pkt: Arc<[u8]> = pkt.into();
+                    s.pkts.push_back(pkt.clone());
+                    jobs.push(pkt);
+                }
                 consumed += n;
             }
             consumed
         };
-        for (seq, data) in jobs {
-            self.send_data_pkt(seq, &data);
+        for pkt in jobs {
+            self.outbound(pkt);
         }
         consumed
     }
 
-    /// 重传损失列表（NAK 触发即发 + 周期兜底）。`force = false` 时受节流约束。
+    /// 重传损失列表（NAK 触发即发 + 周期兜底）。每条目 50ms 节流——NAK 连击
+    /// （每个新缺口一个 NAK 包）下不得把同一批旧条目倾泻重发（对端 CSndLossList
+    /// 弹出语义的等价物；线带宽真丢包时的重传风暴放大器）。
     fn retransmit_loss(&self, force: bool) {
         let now = Instant::now();
         {
@@ -392,25 +418,41 @@ impl UdtConn {
             }
             *last = now;
         }
-        // 单次锁内取全部 (seq, data)（无 await 交错，索引不会失效）。
+        // 单次锁内取到期条目（无 await 交错，索引不会失效）。
         // 索引语义：pkts.front 的 seq == last_ack（libudt readData(offset) 同构，
         // offset = seqoff(sndLastDataAck, seq)）。
-        let jobs: Vec<(i32, Vec<u8>)> = {
-            let s = self.send.lock().expect("发送锁");
-            s.loss
+        let jobs: Vec<Arc<[u8]>> = {
+            let mut s = self.send.lock().expect("发送锁");
+            let ts = self.ts();
+            let due: Vec<i32> = s
+                .loss
                 .iter()
+                .filter(|(seq, last_sent)| {
+                    now.duration_since(**last_sent) >= RETRANS_MIN_INTERVAL
+                        && pw::seq_off(s.last_ack, **seq) >= 0
+                })
+                .map(|(seq, _)| *seq)
+                .collect();
+            due.iter()
                 .filter_map(|seq| {
                     let idx = pw::seq_off(s.last_ack, *seq);
-                    if idx >= 0 {
-                        s.pkts.get(idx as usize).map(|d| (*seq, d.clone()))
+                    let pkt = s.pkts.get(idx as usize).cloned();
+                    if let Some(p) = &pkt {
+                        if let Some(t) = s.loss.get_mut(seq) {
+                            *t = now;
+                        }
+                        // 重传改写 ts（libudt packData 语义）——Arc 不可变，克隆一份原地改。
+                        let mut owned = p.to_vec();
+                        pw::rewrite_ts(&mut owned, ts);
+                        Some(owned.into())
                     } else {
                         None
                     }
                 })
                 .collect()
         };
-        for (seq, data) in jobs {
-            self.send_data_pkt(seq, &data);
+        for pkt in jobs {
+            self.outbound(pkt);
         }
     }
 
@@ -436,7 +478,7 @@ impl UdtConn {
                             s.pkts.pop_front();
                         }
                         s.last_ack = cum;
-                        s.loss.retain(|x| pw::seq_cmp(*x, cum) >= 0);
+                        s.loss.retain(|x, _| pw::seq_cmp(*x, cum) >= 0);
                         opened = true;
                     }
                 }
@@ -452,19 +494,48 @@ impl UdtConn {
                     if words.len() >= 4 {
                         s.flow_window = words[3] as i32;
                     }
+                    // 对端 RTT / 投递速率 EWMA（ACK word1/word4——libudt core.cpp
+                    // 2057-2074 同款；CA 速率公式的主输入）。
+                    if words.len() >= 5 {
+                        let rtt = words[1] as i64;
+                        if rtt > 0 {
+                            s.peer_rtt_us = if s.peer_rtt_us == 0 {
+                                rtt
+                            } else {
+                                (7 * s.peer_rtt_us + rtt) / 8
+                            };
+                        }
+                        let rate = words[4] as f64;
+                        if rate > 0.0 {
+                            s.delivery_rate = if s.delivery_rate == 0.0 {
+                                rate
+                            } else {
+                                0.875 * s.delivery_rate + 0.125 * rate
+                            };
+                        }
+                    }
                     let off = pw::seq_off(s.last_ack, cum);
                     if off > 0 {
                         for _ in 0..off {
                             s.pkts.pop_front();
                         }
                         s.last_ack = cum;
-                        s.loss.retain(|x| pw::seq_cmp(*x, cum) >= 0);
+                        s.loss.retain(|x, _| pw::seq_cmp(*x, cum) >= 0);
                         opened = true;
+                        // 传输有进展：递减周期计数复位（libudt onACK 路径同口径）。
+                        s.dec_count = 0;
                     }
                 }
-                // CC onACK（近似 UDT4 CUDTCC）：慢启动倍增 / 拥塞避免 +1/cwnd。
+                // CC onACK（对齐 UDT4 CUDTCC ccc.cpp:207-220）：慢启动倍增 /
+                // CA 速率公式 `cwnd = rate/1e6×(RTT+RC)+16`（RC = 10ms 内部周期；
+                // 无速率样本时退 +1/cwnd）。此前 CA 用 +1/cwnd——丢包塌回后从 16
+                // 恢复到 4096 需 ~328s，真网任一次丢包即吞吐锁死。
                 if s.in_slow_start {
                     s.cwnd = (s.cwnd * 2.0).min(s.flow_window.max(CWND_INIT as i32) as f64);
+                } else if s.delivery_rate > 0.0 && s.peer_rtt_us > 0 {
+                    let rtt_ms = s.peer_rtt_us as f64 / 1000.0;
+                    let target = s.delivery_rate / 1000.0 * (rtt_ms + 10.0) + 16.0;
+                    s.cwnd = target.min(s.flow_window.max(CWND_INIT as i32) as f64).max(CWND_INIT);
                 } else {
                     s.cwnd += 1.0 / s.cwnd.max(1.0);
                 }
@@ -490,16 +561,34 @@ impl UdtConn {
         };
         {
             let mut s = self.send.lock().expect("发送锁");
-            for seq in loss_list {
-                if pw::seq_cmp(seq, s.last_ack) >= 0 && pw::seq_cmp(seq, s.next_seq) <= 0 {
-                    s.loss.insert(seq);
+            // 新入列条目回填旧时刻 → 立即符合重发条件（每条目节流只挡重复倾泻）。
+            let backdate = Instant::now() - RETRANS_MIN_INTERVAL - Duration::from_millis(1);
+            for seq in &loss_list {
+                if pw::seq_cmp(*seq, s.last_ack) >= 0 && pw::seq_cmp(*seq, s.next_seq) <= 0 {
+                    s.loss.entry(*seq).or_insert(backdate);
                 }
             }
-            // CC onLoss：慢启动退出 + 0.875 收缩（近似 CUDTCC）。
-            if s.in_slow_start {
-                s.in_slow_start = false;
+            // CC onLoss（对齐 CUDTCC ccc.cpp:271-293）：递减周期守卫（NAK 首 seq
+            // 更大才减）+ 连续递减 ≤5 + 慢启动退出。此前每个 NAK 无守卫 ×0.875
+            // ——NAK 连击把窗口塌到 16。
+            let first = s
+                .loss
+                .keys()
+                .next()
+                .copied()
+                .or_else(|| loss_list.first().copied());
+            if let Some(first) = first {
+                let new_cycle = s.last_dec_seq.is_none_or(|l| pw::seq_cmp(first, l) > 0);
+                if new_cycle {
+                    s.last_dec_seq = Some(first);
+                    if s.in_slow_start {
+                        s.in_slow_start = false;
+                    } else if s.dec_count < 5 {
+                        s.cwnd = (s.cwnd * 0.875).max(CWND_INIT);
+                        s.dec_count += 1;
+                    }
+                }
             }
-            s.cwnd = (s.cwnd * 0.875).max(CWND_INIT);
         }
         self.retransmit_loss(true);
     }
@@ -519,48 +608,59 @@ impl UdtConn {
 
     /* ---------- 接收方向 ---------- */
 
-    fn on_data(self: &Arc<Self>, seq: i32, payload: &[u8]) {
-        // 到达速率/探测对记账（libudt processData：每个到达先记时再处理）。
-        {
-            let mut r = self.recv.lock().expect("接收锁");
-            let now_us = now_us_since(&r.epoch);
-            r.on_pkt_arrival(now_us, seq);
-        }
+    fn on_data(self: &Arc<Self>, seq: i32, payload: Vec<u8>) {
+        // 到达速率/探测对记账并入主锁段（libudt processData：每个到达先记时再
+        // 处理——此前两段锁每包 2 对锁操作）。载荷按值入参（move 投递/缓存，
+        // 消灭收包侧第二次拷贝）；部分包标记在 move 前记录。
+        let partial = payload.len() != pw::UDT_PAYLOAD_MAX;
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut nak_words: Option<Vec<u32>> = None;
         let mut eof_now = false;
         {
             let mut r = self.recv.lock().expect("接收锁");
+            let now_us = now_us_since(&r.epoch);
+            r.on_pkt_arrival(now_us, seq);
             if seq == r.expected {
-                out.push(payload.to_vec());
+                out.push(payload);
                 r.expected = pw::seq_inc(r.expected);
                 r.loss.remove(&seq);
             } else if pw::seq_cmp(seq, r.expected) < 0 {
                 // 重复包（ACK 丢失后重传）——出损失表即可，不重复投递。
                 r.loss.remove(&seq);
             } else {
-                // 乱序（seq > expected）。
+                // 乱序（seq > expected）。距离界（libudt addData 前置检查：
+                // offset ≥ 收缓冲上限 → 丢弃——伪造的远距 seq 不得把 loss 表
+                // 炸成内存/带宽炸弹）。
+                if pw::seq_off(r.expected, seq) >= REORDER_CAP as i32 {
+                    return;
+                }
                 if !r.pending.contains_key(&seq) {
                     if r.pending.len() >= REORDER_CAP {
                         // 缓冲满：丢弃（保持缺失状态，发送端经 NAK/EXP 重传）。
                         r.pkt_count += 1;
-                        if payload.len() != pw::UDT_PAYLOAD_MAX {
+                        if partial {
                             r.ack_immediate = true;
                         }
                         return;
                     }
-                    r.pending.insert(seq, payload.to_vec());
+                    r.pending.insert(seq, payload);
                 }
                 r.loss.remove(&seq);
                 if pw::seq_cmp(seq, r.curr) > 0 {
-                    // 抬高水位：补记缺口，稍后即席 NAK（libudt processData 语义）。
+                    // 抬高水位：补记缺口，即席 NAK **只报本次新缺口**
+                    // （libudt core.cpp:2417-2428——此前全量重编码整个 loss 表，
+                    // 丢包场景 O(n) 重报 + 对端二次重传放大）。
                     let mut s = pw::seq_inc(r.curr);
+                    let mut new_gap: Vec<i32> = Vec::new();
                     while pw::seq_cmp(s, seq) < 0 {
                         r.loss.insert(s);
+                        new_gap.push(s);
                         s = pw::seq_inc(s);
                     }
                     r.curr = seq;
-                    nak_words = Some(pw::encode_loss(&r.loss.iter().copied().collect::<Vec<_>>()));
+                    if !new_gap.is_empty() {
+                        nak_words = Some(pw::encode_loss(&new_gap));
+                    }
                 }
             }
             // 通用收敛（含补齐缺口后 newly-contiguous 的立即投递）。
@@ -579,7 +679,7 @@ impl UdtConn {
                 r.curr = seq;
             }
             r.pkt_count += 1;
-            if payload.len() != pw::UDT_PAYLOAD_MAX {
+            if partial {
                 r.ack_immediate = true;
             }
             if r.peer_shutdown && r.loss.is_empty() && r.pending.is_empty() {
@@ -587,6 +687,9 @@ impl UdtConn {
             }
         }
         if let Some(words) = nak_words {
+            let mut r = self.recv.lock().expect("接收锁");
+            r.last_nak_us = now_us_since(&r.epoch);
+            drop(r);
             self.send_ctrl(pw::C_NAK, 0, &words);
         }
         if !out.is_empty() {
@@ -678,22 +781,40 @@ impl UdtConn {
                     r.last_ack_time = now;
                     r.pkt_count = 0;
                     r.light_count = 1;
-                } else if r.pkt_count >= pw::LIGHT_ACK_PKTS * r.light_count {
-                    // 轻量 ACK：add=0、单字 cum（libudt sendCtrl(2,…,4) 线上形态）。
+                } else if r.pkt_count >= pw::LIGHT_ACK_PKTS {
+                    // 轻量 ACK：add=0、单字 cum（libudt sendCtrl(2,…,4) 线上形态；
+                    // 固定每 64 包——`64×light_count` 递增间隔是偏离，突发下 cum
+                    // 反馈变慢）。
                     light = Some(cum);
-                    r.light_count += 1;
                     r.pkt_count = 0;
                 } else {
                     r.ack_immediate = false;
                 }
-            } else if r.pkt_count >= pw::LIGHT_ACK_PKTS * r.light_count {
+            } else if r.pkt_count >= pw::LIGHT_ACK_PKTS {
                 light = Some(cum);
-                r.light_count += 1;
                 r.pkt_count = 0;
             }
         }
         if let Some(cum) = light {
             self.send_ctrl(pw::C_ACK, 0, &[cum as u32]);
+        }
+        // 缺口保活重报：NAK 只报新缺口后，首个 NAK 丢失 = 缺口对发送端永久
+        // 不可见（发送端 EXP 兜底仅在自身 loss 为空时全量补插）——接收端
+        // 必须对未恢复缺口周期重发全量 loss 表（间隔 max(RTT+4RTTVar, 50ms)，
+        // 无缺口零开销；判别测试 loss_recovery 25% 双向丢包）。
+        {
+            let mut r = self.recv.lock().expect("接收锁");
+            if !r.loss.is_empty() {
+                let now_us = now_us_since(&r.epoch);
+                let floor = 50_000u64;
+                let guard = (r.rtt_us + 4 * r.rttvar_us).max(floor as i64) as u64;
+                if now_us.saturating_sub(r.last_nak_us) >= guard {
+                    r.last_nak_us = now_us;
+                    let words = pw::encode_loss(&r.loss.iter().copied().collect::<Vec<_>>());
+                    drop(r);
+                    self.send_ctrl(pw::C_NAK, 0, &words);
+                }
+            }
         }
     }
 
@@ -732,14 +853,17 @@ impl UdtConn {
                 // 未确认区间 = [last_ack ..= next_seq]（front.seq == last_ack，
                 // 与 pop/重传索引模型一致）。
                 let mut seq = s.last_ack;
+                let backdate = Instant::now() - RETRANS_MIN_INTERVAL - Duration::from_millis(1);
                 while pw::seq_cmp(seq, s.next_seq) <= 0 {
-                    s.loss.insert(seq);
+                    s.loss.insert(seq, backdate);
                     seq = pw::seq_inc(seq);
                 }
             }
             if unacked {
-                s.cwnd = CWND_INIT; // onTimeout：重置拥塞窗（近似 CUDTCC）
-                s.in_slow_start = true;
+                // onTimeout（对齐 CUDTCC ccc.cpp:296-314）：仅退慢启动——不把
+                // cwnd 重置 16（此前 EXP 兜底一触发窗口归零重建，恢复需数百 ms
+                // 的倍增链路；速率公式接管 CA 增长）。
+                s.in_slow_start = false;
             }
             unacked
         };
@@ -808,7 +932,10 @@ impl fmt::Debug for UdtConn {
 pub struct UdtStream {
     conn: Arc<UdtConn>,
     data_rx: UnboundedReceiver<Vec<u8>>,
+    /// 读侧聚合缓冲 + 光标（单次 poll 拼到上限再切片——逐包唤醒开销在大流量
+    /// 下占主导；消费只推进光标，耗尽才清零，消灭整段 drain memmove）。
     read_buf: Vec<u8>,
+    read_pos: usize,
     /// 窗口等待 future（每次等待期注册 waker；wake 后置 None 重建）。
     window_fut: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
@@ -833,17 +960,31 @@ impl AsyncRead for UdtStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            if !self.read_buf.is_empty() {
-                let n = self.read_buf.len().min(buf.remaining());
+            if self.read_pos < self.read_buf.len() {
+                let n = (self.read_buf.len() - self.read_pos).min(buf.remaining());
                 if n == 0 {
                     return Poll::Pending;
                 }
-                buf.put_slice(&self.read_buf[..n]);
-                self.read_buf.drain(..n);
+                buf.put_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
+                self.read_pos += n;
+                if self.read_pos == self.read_buf.len() {
+                    self.read_buf.clear();
+                    self.read_pos = 0;
+                }
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut self.data_rx).poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => self.read_buf = chunk,
+                Poll::Ready(Some(chunk)) => {
+                    self.read_buf = chunk;
+                    self.read_pos = 0;
+                    // 聚合积压（对齐 RUDP 读侧口径）：单次 poll 拼到 256KB 再切片。
+                    while self.read_buf.len() < UDT_READ_AGG {
+                        match self.data_rx.try_recv() {
+                            Ok(c) => self.read_buf.extend_from_slice(&c),
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Poll::Ready(None) => {
                     if let Some(e) = self.conn.error() {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
@@ -922,11 +1063,13 @@ impl Drop for UdtStream {
 }
 
 /// `build_conn` 返回：(状态机, 流, 入包通道发送端, 出包通道接收端, 驱动句柄)。
+/// `shared_out = Some` 时注入服务端共享出口（返回 None 出包通道——省每连接
+/// 一跳 forward 任务）；None 时建本连接专属通道（客户端/对偶测试）。
 pub(crate) type BuiltConn = (
     Arc<UdtConn>,
     UdtStream,
     UnboundedSender<pw::Pkt>,
-    UnboundedReceiver<Vec<u8>>,
+    Option<UnboundedReceiver<OutPkt>>,
     tokio::task::JoinHandle<()>,
 );
 
@@ -940,8 +1083,15 @@ pub(crate) fn build_conn(
     peer_isn: i32,
     flow_window: i32,
     hs_resp: Option<Vec<u8>>,
+    shared_out: Option<UnboundedSender<OutPkt>>,
 ) -> BuiltConn {
-    let (out_tx, out_rx) = unbounded_channel::<Vec<u8>>();
+    let (out_tx, out_rx) = match shared_out {
+        Some(tx) => (tx, None),
+        None => {
+            let (tx, rx) = unbounded_channel::<OutPkt>();
+            (tx, Some(rx))
+        }
+    };
     let (data_tx, data_rx) = unbounded_channel::<Vec<u8>>();
     let (in_tx, in_rx) = unbounded_channel::<pw::Pkt>();
     let (err_tx, err_rx) = watch::channel(None);
@@ -970,36 +1120,65 @@ pub(crate) fn build_conn(
         conn: conn.clone(),
         data_rx,
         read_buf: Vec::new(),
+        read_pos: 0,
         window_fut: None,
     };
     let driver = tokio::spawn(run_driver(conn.clone(), in_rx));
     (conn, stream, in_tx, out_rx, driver)
 }
 
-/// 驱动任务：入包处理 + 10ms 节拍扫描。
+/// 驱动任务：入包处理 + 10ms 节拍扫描。批量排空（每批一次让出）——逐包
+/// select+yield 是每秒 ~9 万次任务重调度的纯税（性能批 2026-11-14 对齐
+/// libudt 单线程事件循环形态）；扫描在批后按节拍执行（有积压时 select 会被
+/// recv 分支持续抢占，tick 饿死会让 ACK/EXP 停摆）。
 async fn run_driver(conn: Arc<UdtConn>, mut in_rx: UnboundedReceiver<pw::Pkt>) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_scan = Instant::now() - TICK;
     loop {
         if conn.closed.load(Ordering::SeqCst) {
             break;
         }
+        let mut n = 0usize;
+        while n < UDT_BATCH_CAP {
+            match in_rx.try_recv() {
+                Ok(p) => {
+                    conn.handle_packet(p);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        if n > 0 {
+            if last_scan.elapsed() >= TICK {
+                conn.send_ack_scan();
+                conn.exp_scan();
+                conn.housekeeping_scan();
+                last_scan = Instant::now();
+            }
+            // 协作让出（传输饥饿防线，与泵/出包同口径）。
+            tokio::task::yield_now().await;
+            continue;
+        }
         tokio::select! {
             pkt = in_rx.recv() => match pkt {
-                Some(p) => {
-                    conn.handle_packet(p);
-                    tokio::task::yield_now().await;
-                }
+                Some(p) => conn.handle_packet(p),
                 None => break,
             },
             _ = ticker.tick() => {
                 conn.send_ack_scan();
                 conn.exp_scan();
                 conn.housekeeping_scan();
+                last_scan = Instant::now();
             }
         }
     }
-    conn.close(None);
+    // 收尾口径（「结果未知 ≠ 成功」）：入口先关且连接未走正常收尾 → 异常中断。
+    if conn.closed.load(Ordering::SeqCst) {
+        conn.close(None);
+    } else {
+        conn.close(Some("传输通道异常中断".into()));
+    }
 }
 
 fn random_bytes(n: usize) -> Vec<u8> {
@@ -1053,7 +1232,21 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
         },
         src_port.unwrap_or(0),
     );
-    let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
+    // socket2 建栈：收/发缓冲各 4MB（Windows 默认 64KB——窗口 8192 包 ≈ 12MB
+    // 突发下 OS 层丢包引发 NAK/重传风暴；与服务端 `std_udp_listener` 同口径）。
+    let domain = if local.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let std_sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None).map_err(Error::Io)?;
+    std_sock
+        .bind(&socket2::SockAddr::from(local))
+        .map_err(Error::Io)?;
+    let _ = std_sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = std_sock.set_send_buffer_size(4 * 1024 * 1024);
+    std_sock.set_nonblocking(true).map_err(Error::Io)?;
+    let socket = UdpSocket::from_std(std_sock.into()).map_err(Error::Io)?;
     let my_id = random_u32_nonzero();
     let isn = random_isn();
     let mut req = pw::Handshake {
@@ -1127,59 +1320,110 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
         }
     }
     // 服务端以客户端 ISN 作为自己的发送 ISN（libudt acceptAndRespond 回显）。
-    let (_conn, stream, in_tx, mut out_rx, driver) =
-        build_conn(my_id, peer_id, addr, isn, isn, peer_flight.max(2), None);
+    let (pump_conn, stream, in_tx, out_rx, driver) =
+        build_conn(my_id, peer_id, addr, isn, isn, peer_flight.max(2), None, None);
+    let mut out_rx = out_rx.expect("客户端连接持专属出包通道");
     let socket = Arc::new(socket);
-    // 入包泵：全部（含握手重发响应）交给驱动。
+    // 入包泵：全部（含握手重发响应）交给驱动。批量排空 + 连接关闭退出
+    // （此前 select+100ms sleep 逐包重建定时器、且永不退出——每连接泄漏两任务）。
     let pump_sock = socket.clone();
     let pump_in = in_tx;
     let pump_my = my_id;
     tokio::spawn(async move {
         let mut b = vec![0u8; pw::UDT_DGRAM_MAX + 64];
+        let mut hard_errs = 0u32;
         loop {
-            tokio::select! {
-                r = pump_sock.recv_from(&mut b) => match r {
-                    Ok((n, src)) => {
+            if pump_conn.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut n = 0usize;
+            while n < UDT_BATCH_CAP {
+                match pump_sock.try_recv_from(&mut b) {
+                    Ok((len, src)) => {
+                        hard_errs = 0;
                         if src == addr {
-                            if let Some(p) = pw::decode(&b[..n]) {
+                            if let Some(p) = pw::decode(&b[..len]) {
                                 if p.dst() == pump_my {
                                     let _ = pump_in.send(p);
                                 }
                             }
                         }
-                        tokio::task::yield_now().await;
+                        n += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        hard_errs = 0;
+                        break;
                     }
                     Err(e) => {
-                        // Windows ICMP 毒化（10054）按瞬态继续；其余错误短暂退避。
+                        n += 1;
+                        // Windows ICMP 毒化（10054）按瞬态继续；持续硬错误限次退避。
                         if e.raw_os_error() != Some(10054) {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            hard_errs += 1;
+                            if hard_errs > 64 {
+                                return;
+                            }
                         }
-                        tokio::task::yield_now().await;
+                        continue;
                     }
-                },
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+            if n > 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            match pump_sock.recv_from(&mut b).await {
+                Ok((len, src)) => {
+                    if src == addr {
+                        if let Some(p) = pw::decode(&b[..len]) {
+                            if p.dst() == pump_my {
+                                let _ = pump_in.send(p);
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => {
+                    if e.raw_os_error() != Some(10054) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
             }
         }
     });
     // 出包泵。send 失败（ICMP 毒化瞬态）重试而非退出——通道关闭才是退出条件。
-    // 批量排空（每批一次让出；逐包让出的调度开销在大流量下占主导——§7.28）。
+    // 批量排空（每批一次让出）；先 try_send_to 快路径（多数时间 socket 可写，
+    // 免逐包 async poll 注册——IOCP 状态机开销）。
     let send_sock = socket;
     tokio::spawn(async move {
         loop {
-            let Some(first) = out_rx.recv().await else {
+            let Some((_, first)) = out_rx.recv().await else {
                 break;
             };
             let mut batch = vec![first];
             while batch.len() < UDT_BATCH_CAP {
                 match out_rx.try_recv() {
-                    Ok(next) => batch.push(next),
+                    Ok((_, next)) => batch.push(next),
                     Err(_) => break,
                 }
             }
             for pkt in batch {
-                if send_sock.send_to(&pkt, addr).await.is_err() {
-                    // ICMP 毒化等瞬态：短暂退避后继续（通道关闭才是退出条件）。
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                loop {
+                    match send_sock.try_send_to(&pkt, addr) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // 发送缓冲满：退回异步路径等待可写。
+                            if send_sock.send_to(&pkt, addr).await.is_ok() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            break;
+                        }
+                        Err(_) => {
+                            // ICMP 毒化等瞬态：短暂退避后继续（通道关闭才是退出条件）。
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            break;
+                        }
+                    }
                 }
             }
             tokio::task::yield_now().await;
@@ -1225,6 +1469,42 @@ pub async fn serve_udt_on(
     let socket = Arc::new(socket);
     // C# 方言跨连接状态（分块组装/断点会话/组归属）——serve 级共享。
     let cs_state = Arc::new(crate::transfer::cswire::CsServerState::default());
+    // 连接出包共享通道（此前每连接一跳 forward 任务——每包两次调度 + 一跳通道）。
+    let (out_tx, mut out_rx) = unbounded_channel::<OutPkt>();
+    let out_sock = Arc::clone(&socket);
+    tokio::spawn(async move {
+        loop {
+            let Some((dst, first)) = out_rx.recv().await else {
+                break;
+            };
+            let mut batch = vec![(dst, first)];
+            while batch.len() < UDT_BATCH_CAP {
+                match out_rx.try_recv() {
+                    Ok(next) => batch.push(next),
+                    Err(_) => break,
+                }
+            }
+            for (dst, pkt) in batch {
+                loop {
+                    match out_sock.try_send_to(&pkt, dst) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if out_sock.send_to(&pkt, dst).await.is_ok() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            break;
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            break;
+                        }
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    });
     // 连接表：my_id → 入口；peer_id → my_id（重复握手幂等路由）。
     let conns: Arc<Mutex<HashMap<u32, ConnEntry>>> = Arc::new(Mutex::new(HashMap::new()));
     let by_peer: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1239,7 +1519,7 @@ pub async fn serve_udt_on(
     loop {
         while finished.try_join_next().is_some() {}
         tokio::task::yield_now().await;
-        let (n, src) = tokio::select! {
+        let (mut n, mut src) = tokio::select! {
             r = socket.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(e) => {
@@ -1258,217 +1538,226 @@ pub async fn serve_udt_on(
             },
             _ = stop_rx.changed() => return Ok(()),
         };
-        let Some(pkt) = pw::decode(&buf[..n]) else {
-            continue;
-        };
-        let opts = opts.clone();
-
-        // 握手处理（dst = 0 或 listener id；已建立连接的握手重发走数据面路由）。
-        let hs_route = if let pw::Pkt::Ctrl {
-            ctype: pw::C_HANDSHAKE,
-            ref words,
-            dst,
-            ..
-        } = pkt
-        {
-            if dst == 0 || dst == listener_id {
-                pw::Handshake::from_words(words).map(|hs| hs)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(hs) = hs_route {
-            if hs.req_type == pw::HS_REQ {
-                // 阶段一：回 cookie 挑战（回显请求 + cookie 字段，req_type 仍为 1）。
-                let cookie = {
-                    let mut m = cookies.lock().expect("cookie 锁");
-                    let now = Instant::now();
-                    m.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(120));
-                    if m.len() > 4096 {
-                        m.clear();
-                    }
-                    let e = m.entry(src.ip()).or_insert_with(|| {
-                        (
-                            i32::from_le_bytes(random_bytes(4).try_into().expect("4 字节")),
-                            now,
-                        )
-                    });
-                    e.1 = now;
-                    e.0
+        // 批量排空积压（每批一次让出——对齐客户端泵口径；批内持续错误断批，
+        // 由下一轮阻塞 recv 呈报）。逐包 RecvOptions 克隆已移除（含 PathBuf/Arc
+        // ——每包 3+ 次堆分配；握手分支按需借用 opts，建连 spawn 才克隆）。
+        let mut m = 0usize;
+        loop {
+            'pkt: {
+                let Some(pkt) = pw::decode(&buf[..n]) else {
+                    break 'pkt;
                 };
-                let resp = pw::Handshake { cookie, ..hs };
-                let _ = socket.send_to(&resp.encode_ctrl(0, hs.id as u32), src).await;
-                continue;
-            }
-            if hs.req_type == pw::HS_RESP {
-                // 阶段二：cookie 校验（无签发记录/不匹配 → 静默，防伪造源）。
-                let cookie_ok = cookies
-                    .lock()
-                    .expect("cookie 锁")
-                    .get(&src.ip())
-                    .is_some_and(|(c, _)| *c == hs.cookie);
-                if !cookie_ok {
-                    continue;
-                }
-                // 版本/类型/IP 过滤门（libudt listen：不符 → 1002 拒绝）。
-                if hs.version != pw::UDT_VERSION
-                    || hs.sock_type != pw::UDT_SOCK_STREAM
-                    || !ip_allowed(src.ip(), opts.ip_filter_mode, &opts.ip_filter_list)
+                // 握手处理（dst = 0 或 listener id；已建立连接的握手重发走数据面路由）。
+                let hs_route = if let pw::Pkt::Ctrl {
+                    ctype: pw::C_HANDSHAKE,
+                    ref words,
+                    dst,
+                    ..
+                } = pkt
                 {
-                    let peer_id = hs.id;
-                    let resp = pw::Handshake {
-                        req_type: pw::HS_REJECT,
-                        ..hs
-                    };
-                    let _ = socket
-                        .send_to(&resp.encode_ctrl(0, peer_id as u32), src)
-                        .await;
-                    continue;
-                }
-                // 重复握手（客户端未收到响应而重发）→ 幂等重发该连接的响应。
-                let dup = {
-                    let my_id = by_peer
-                        .lock()
-                        .expect("peer 表锁")
-                        .get(&(hs.id as u32))
-                        .copied();
-                    my_id.and_then(|id| {
-                        conns
+                    if dst == 0 || dst == listener_id {
+                        pw::Handshake::from_words(words).map(|hs| hs)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(hs) = hs_route {
+                    if hs.req_type == pw::HS_REQ {
+                        // 阶段一：回 cookie 挑战（回显请求 + cookie 字段，req_type 仍为 1）。
+                        let cookie = {
+                            let mut cm = cookies.lock().expect("cookie 锁");
+                            let now = Instant::now();
+                            cm.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(120));
+                            if cm.len() > 4096 {
+                                cm.clear();
+                            }
+                            let e = cm.entry(src.ip()).or_insert_with(|| {
+                                (
+                                    i32::from_le_bytes(random_bytes(4).try_into().expect("4 字节")),
+                                    now,
+                                )
+                            });
+                            e.1 = now;
+                            e.0
+                        };
+                        let resp = pw::Handshake { cookie, ..hs };
+                        let _ = socket.send_to(&resp.encode_ctrl(0, hs.id as u32), src).await;
+                        break 'pkt;
+                    }
+                    if hs.req_type == pw::HS_RESP {
+                        // 阶段二：cookie 校验（无签发记录/不匹配 → 静默，防伪造源）。
+                        let cookie_ok = cookies
                             .lock()
-                            .expect("连接表锁")
-                            .get(&id)
-                            .filter(|e| e.peer == src)
-                            .map(|e| e.hs_resp.clone())
-                    })
-                };
-                if let Some(resp) = dup {
-                    let _ = socket.send_to(&resp, src).await;
-                    continue;
-                }
-                // 限量模式（--count）：串行——等现有连接结束；收满即停。
-                if let Some(max) = opts.max_count {
-                    loop {
-                        let empty = conns.lock().expect("连接表锁").is_empty();
-                        if empty {
-                            break;
+                            .expect("cookie 锁")
+                            .get(&src.ip())
+                            .is_some_and(|(c, _)| *c == hs.cookie);
+                        if !cookie_ok {
+                            break 'pkt;
                         }
-                        let _ =
-                            tokio::time::timeout(Duration::from_millis(100), ended.notified()).await;
-                    }
-                    if served.load(std::sync::atomic::Ordering::Relaxed) >= max {
-                        return Ok(());
-                    }
-                }
-                // 表容量。
-                if conns.lock().expect("连接表锁").len() >= UDT_CONN_CAP {
-                    let peer_id = hs.id;
-                    let resp = pw::Handshake {
-                        req_type: pw::HS_REJECT,
-                        ..hs
-                    };
-                    let _ = socket
-                        .send_to(&resp.encode_ctrl(0, peer_id as u32), src)
-                        .await;
-                    continue;
-                }
-                // 建连：服务端发送 ISN = 客户端 ISN（libudt acceptAndRespond 回显语义）。
-                let my_id = random_u32_nonzero();
-                let mss = hs.mss.min(pw::UDT_MSS);
-                let hs_resp = pw::Handshake {
-                    version: pw::UDT_VERSION,
-                    sock_type: pw::UDT_SOCK_STREAM,
-                    isn: hs.isn,
-                    mss,
-                    flight_flag: pw::UDT_RCV_BUF_PKTS.min(pw::UDT_FLIGHT_FLAG),
-                    req_type: pw::HS_RESP,
-                    id: my_id as i32,
-                    cookie: hs.cookie,
-                    peer_ip: peer_ip_words(src),
-                }
-                .encode_ctrl(0, hs.id as u32);
-                let (_c, stream, in_tx, out_rx_c, driver) = build_conn(
-                    my_id,
-                    hs.id as u32,
-                    src,
-                    hs.isn,
-                    hs.isn,
-                    hs.flight_flag.max(2),
-                    Some(hs_resp.clone()),
-                );
-                {
-                    let mut t = conns.lock().expect("连接表锁");
-                    t.insert(
-                        my_id,
-                        ConnEntry {
-                            peer: src,
-                            in_tx,
-                            hs_resp: hs_resp.clone(),
-                        },
-                    );
-                    by_peer
-                        .lock()
-                        .expect("peer 表锁")
-                        .insert(hs.id as u32, my_id);
-                }
-                // 连接出包 → 共享 socket（逐连接转发任务）。send 失败（ICMP 毒化
-                // 瞬态/对端已关）不得终止泵——通道关闭才是退出条件。
-                let fwd_sock = Arc::clone(&socket);
-                let fwd_peer = src;
-                tokio::spawn(async move {
-                    let mut rx = out_rx_c;
-                    while let Some(p) = rx.recv().await {
-                        if fwd_sock.send_to(&p, fwd_peer).await.is_err() {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        // 版本/类型/IP 过滤门（libudt listen：不符 → 1002 拒绝）。
+                        if hs.version != pw::UDT_VERSION
+                            || hs.sock_type != pw::UDT_SOCK_STREAM
+                            || !ip_allowed(src.ip(), opts.ip_filter_mode, &opts.ip_filter_list)
+                        {
+                            let peer_id = hs.id;
+                            let resp = pw::Handshake {
+                                req_type: pw::HS_REJECT,
+                                ..hs
+                            };
+                            let _ = socket
+                                .send_to(&resp.encode_ctrl(0, peer_id as u32), src)
+                                .await;
+                            break 'pkt;
                         }
-                        tokio::task::yield_now().await;
-                    }
-                });
-                // 立即发出握手响应（libudt：新连接响应由 accept 侧发出）。
-                let _ = socket.send_to(&hs_resp, src).await;
-                let o2 = opts.clone();
-                let served2 = served.clone();
-                let conns2 = conns.clone();
-                let by_peer2 = by_peer.clone();
-                let ended2 = ended.clone();
-                let stop2 = stop_tx.clone();
-                let serial_max = opts.max_count;
-                let peer_id_cs = hs.id as u32;
-                let cs_state2 = Arc::clone(&cs_state);
-                finished.spawn(async move {
-                    let _ = crate::transfer::cswire::handle_conn_cs(
-                        stream,
-                        src,
-                        &o2,
-                        served2.clone(),
-                        cs_state2,
-                    )
-                    .await;
-                    let _ = driver.await;
-                    conns2.lock().expect("连接表锁").remove(&my_id);
-                    by_peer2.lock().expect("peer 表锁").remove(&peer_id_cs);
-                    ended2.notify_waiters();
-                    if let Some(max) = serial_max {
-                        if served2.load(std::sync::atomic::Ordering::Relaxed) >= max {
-                            let _ = stop2.send(true);
+                        // 重复握手（客户端未收到响应而重发）→ 幂等重发该连接的响应。
+                        let dup = {
+                            let my_id = by_peer
+                                .lock()
+                                .expect("peer 表锁")
+                                .get(&(hs.id as u32))
+                                .copied();
+                            my_id.and_then(|id| {
+                                conns
+                                    .lock()
+                                    .expect("连接表锁")
+                                    .get(&id)
+                                    .filter(|e| e.peer == src)
+                                    .map(|e| e.hs_resp.clone())
+                            })
+                        };
+                        if let Some(resp) = dup {
+                            let _ = socket.send_to(&resp, src).await;
+                            break 'pkt;
                         }
+                        // 限量模式（--count）：串行——等现有连接结束；收满即停。
+                        if let Some(max) = opts.max_count {
+                            loop {
+                                let empty = conns.lock().expect("连接表锁").is_empty();
+                                if empty {
+                                    break;
+                                }
+                                let _ = tokio::time::timeout(
+                                    Duration::from_millis(100),
+                                    ended.notified(),
+                                )
+                                .await;
+                            }
+                            if served.load(std::sync::atomic::Ordering::Relaxed) >= max {
+                                return Ok(());
+                            }
+                        }
+                        // 表容量。
+                        if conns.lock().expect("连接表锁").len() >= UDT_CONN_CAP {
+                            let peer_id = hs.id;
+                            let resp = pw::Handshake {
+                                req_type: pw::HS_REJECT,
+                                ..hs
+                            };
+                            let _ = socket
+                                .send_to(&resp.encode_ctrl(0, peer_id as u32), src)
+                                .await;
+                            break 'pkt;
+                        }
+                        // 建连：服务端发送 ISN = 客户端 ISN（libudt acceptAndRespond 回显语义）。
+                        let my_id = random_u32_nonzero();
+                        let mss = hs.mss.min(pw::UDT_MSS);
+                        let hs_resp = pw::Handshake {
+                            version: pw::UDT_VERSION,
+                            sock_type: pw::UDT_SOCK_STREAM,
+                            isn: hs.isn,
+                            mss,
+                            flight_flag: pw::UDT_RCV_BUF_PKTS.min(pw::UDT_FLIGHT_FLAG),
+                            req_type: pw::HS_RESP,
+                            id: my_id as i32,
+                            cookie: hs.cookie,
+                            peer_ip: peer_ip_words(src),
+                        }
+                        .encode_ctrl(0, hs.id as u32);
+                        let (_c, stream, in_tx, _out_rx, driver) = build_conn(
+                            my_id,
+                            hs.id as u32,
+                            src,
+                            hs.isn,
+                            hs.isn,
+                            hs.flight_flag.max(2),
+                            Some(hs_resp.clone()),
+                            Some(out_tx.clone()),
+                        );
+                        {
+                            let mut t = conns.lock().expect("连接表锁");
+                            t.insert(
+                                my_id,
+                                ConnEntry {
+                                    peer: src,
+                                    in_tx,
+                                    hs_resp: hs_resp.clone(),
+                                },
+                            );
+                            by_peer
+                                .lock()
+                                .expect("peer 表锁")
+                                .insert(hs.id as u32, my_id);
+                        }
+                        // 立即发出握手响应（libudt：新连接响应由 accept 侧发出；
+                        // 连接数据出包经共享通道直发——省每连接一跳 forward 任务）。
+                        let _ = socket.send_to(&hs_resp, src).await;
+                        let o2 = opts.clone();
+                        let served2 = served.clone();
+                        let conns2 = conns.clone();
+                        let by_peer2 = by_peer.clone();
+                        let ended2 = ended.clone();
+                        let stop2 = stop_tx.clone();
+                        let serial_max = opts.max_count;
+                        let peer_id_cs = hs.id as u32;
+                        let cs_state2 = Arc::clone(&cs_state);
+                        finished.spawn(async move {
+                            let _ = crate::transfer::cswire::handle_conn_cs(
+                                stream,
+                                src,
+                                &o2,
+                                served2.clone(),
+                                cs_state2,
+                            )
+                            .await;
+                            let _ = driver.await;
+                            conns2.lock().expect("连接表锁").remove(&my_id);
+                            by_peer2.lock().expect("peer 表锁").remove(&peer_id_cs);
+                            ended2.notify_waiters();
+                            if let Some(max) = serial_max {
+                                if served2.load(std::sync::atomic::Ordering::Relaxed) >= max {
+                                    let _ = stop2.send(true);
+                                }
+                            }
+                        });
+                        break 'pkt;
                     }
-                });
-                continue;
-            }
-            continue;
-        }
+                    break 'pkt;
+                }
 
-        // 数据面：按 dst socket id 路由（peer 校验防串线）。
-        let entry = conns
-            .lock()
-            .expect("连接表锁")
-            .get(&pkt.dst())
-            .map(|e| (e.peer, e.in_tx.clone()));
-        if let Some((peer, in_tx)) = entry {
-            if peer == src {
-                let _ = in_tx.send(pkt);
+                // 数据面：按 dst socket id 路由（peer 校验防串线）。
+                let entry = conns
+                    .lock()
+                    .expect("连接表锁")
+                    .get(&pkt.dst())
+                    .map(|e| (e.peer, e.in_tx.clone()));
+                if let Some((peer, in_tx)) = entry {
+                    if peer == src {
+                        let _ = in_tx.send(pkt);
+                    }
+                }
+            }
+            m += 1;
+            if m >= UDT_BATCH_CAP {
+                break;
+            }
+            match socket.try_recv_from(&mut buf) {
+                Ok((l, s)) => {
+                    n = l;
+                    src = s;
+                }
+                Err(_) => break,
             }
         }
     }
@@ -1485,14 +1774,16 @@ mod tests {
         let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
         let isn = 123456;
-        let (c_conn, cs, c_in, mut c_out, c_drv) =
-            build_conn(100, 200, peer_s, isn, isn, 64, None);
-        let (s_conn, ss, s_in, mut s_out, s_drv) =
-            build_conn(200, 100, peer_c, isn, isn, 64, None);
+        let (c_conn, cs, c_in, c_out, c_drv) =
+            build_conn(100, 200, peer_s, isn, isn, 64, None, None);
+        let (s_conn, ss, s_in, s_out, s_drv) =
+            build_conn(200, 100, peer_c, isn, isn, 64, None, None);
+        let mut c_out = c_out.expect("对偶连接持专属出包通道");
+        let mut s_out = s_out.expect("对偶连接持专属出包通道");
         let mut seed1 = 0x1234_5678_9ABC_DEF0u64;
         let mut seed2 = 0x0FED_CBA9_8765_4321u64;
         tokio::spawn(async move {
-            while let Some(pkt) = c_out.recv().await {
+            while let Some((_, pkt)) = c_out.recv().await {
                 seed1 ^= seed1 << 13;
                 seed1 ^= seed1 >> 7;
                 seed1 ^= seed1 << 17;
@@ -1506,7 +1797,7 @@ mod tests {
             }
         });
         tokio::spawn(async move {
-            while let Some(pkt) = s_out.recv().await {
+            while let Some((_, pkt)) = s_out.recv().await {
                 seed2 ^= seed2 << 13;
                 seed2 ^= seed2 >> 7;
                 seed2 ^= seed2 << 17;
@@ -1597,7 +1888,7 @@ mod tests {
     async fn duplicate_data_delivered_once_and_reorder() {
         let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let isn = 777;
-        let (_conn, mut stream, in_tx, _out, _drv) = build_conn(1, 2, peer, isn, isn, 64, None);
+        let (_conn, mut stream, in_tx, _out, _drv) = build_conn(1, 2, peer, isn, isn, 64, None, None);
         let seq0 = isn;
         let seq1 = pw::seq_inc(seq0);
         let seq2 = pw::seq_inc(seq1);
@@ -1622,7 +1913,7 @@ mod tests {
     async fn oversized_ack_breaks_connection() {
         let peer: SocketAddr = "127.0.0.1:11".parse().unwrap();
         let isn = 42;
-        let (conn, mut stream, in_tx, _out, _drv) = build_conn(1, 2, peer, isn, isn, 64, None);
+        let (conn, mut stream, in_tx, _out, _drv) = build_conn(1, 2, peer, isn, isn, 64, None, None);
         // next_seq = isn-1 → 合法 ACK 上限 = isn。发 isn+10（超前）→ 断连。
         in_tx
             .send(pw::Pkt::Ctrl {
@@ -1645,7 +1936,8 @@ mod tests {
     async fn write_blocks_on_flow_window() {
         let peer: SocketAddr = "127.0.0.1:13".parse().unwrap();
         let isn = 5;
-        let (_conn, stream, _in_tx, mut out, _drv) = build_conn(1, 2, peer, isn, isn, 3, None);
+        let (_conn, stream, _in_tx, out, _drv) = build_conn(1, 2, peer, isn, isn, 3, None, None);
+        let mut out = out.expect("对偶连接持专属出包通道");
         let big = vec![7u8; 8 * pw::UDT_PAYLOAD_MAX];
         let mut stream = stream;
         let handle = tokio::spawn(async move {

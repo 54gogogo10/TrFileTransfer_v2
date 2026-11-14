@@ -193,6 +193,14 @@ pub fn encode_ctrl(ctype: u16, add: i32, ts: u32, dst: u32, words: &[u32]) -> Ve
     out
 }
 
+/// 原地重写数据包 ts 字（头 word2，大端）——重传复用已编码包零再编码
+/// （libudt packData 每次取包即刷新 ts，core.cpp 同语义）。
+pub fn rewrite_ts(pkt: &mut [u8], ts: u32) {
+    if pkt.len() >= 12 {
+        pkt[8..12].copy_from_slice(&ts.to_be_bytes());
+    }
+}
+
 /// 解码一个数据报；长度不足 16B / 数据载荷超限 → None（fail-closed 整包忽略）。
 pub fn decode(buf: &[u8]) -> Option<Pkt> {
     if buf.len() < UDT_HEADER_LEN {
@@ -296,7 +304,9 @@ impl Handshake {
 /// 编码 NAK 载荷：连续区间 [a..=b] 编码为 `(a | 0x80000000, b)` 两字，单包 1 字。
 /// 区间数超出载荷上限时截断（调用方按周期再报）。
 pub fn encode_loss(loss: &[i32]) -> Vec<u32> {
-    // 输入须升序（调用方 BTreeSet 产出）；合并连续段。
+    // 输入须升序（调用方 BTreeSet/BTreeMap 产出）；合并连续段。
+    // ≥2 包一律两字区间编码（对齐 libudt core.cpp:2424-2428 的 NAK 形态；
+    // 单字与区间两种编码对端解码器均兼容——性能批 2026-11-14 逐字节保真对齐）。
     let mut out = Vec::new();
     let mut i = 0;
     while i < loss.len() {
@@ -309,14 +319,8 @@ pub fn encode_loss(loss: &[i32]) -> Vec<u32> {
         if end == start {
             out.push(start as u32);
         } else {
-            // 区间长度 > 1 才用两字区间编码（libudt：差 1 的连续段仍按单字逐个编码）。
-            if seq_off(start, end) == 1 {
-                out.push(start as u32);
-                out.push(end as u32);
-            } else {
-                out.push((start as u32) | 0x8000_0000);
-                out.push(end as u32);
-            }
+            out.push((start as u32) | 0x8000_0000);
+            out.push(end as u32);
         }
         i += 1;
     }
@@ -493,9 +497,9 @@ mod tests {
         // 单包损失
         assert_eq!(encode_loss(&[5]), vec![5]);
         assert_eq!(decode_loss(&encode_loss(&[5])).unwrap(), vec![5]);
-        // 相邻两包：差 1 仍按两个单字编码（libudt 语义）
-        assert_eq!(encode_loss(&[5, 6]), vec![5, 6]);
-        assert_eq!(decode_loss(&[5, 6]).unwrap(), vec![5, 6]);
+        // 相邻两包：区间两字编码（对齐 libudt core.cpp:2424-2428——性能批修订）
+        assert_eq!(encode_loss(&[5, 6]), vec![(5u32) | 0x8000_0000, 6]);
+        assert_eq!(decode_loss(&encode_loss(&[5, 6])).unwrap(), vec![5, 6]);
         // 长区间：两字 + 高位标记
         let long: Vec<i32> = (10..=20).collect();
         let enc = encode_loss(&long);
