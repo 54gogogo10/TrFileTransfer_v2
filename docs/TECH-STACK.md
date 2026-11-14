@@ -335,6 +335,11 @@
    - **实测**：真机 C# 矩阵 **14/14**；全量 **270 绿 0 告警**（+1 跨段判别）；全协议基准无回归（TCP 198 / QUIC 186 / RUDP 247 / UDT 180 / UDP 34.8）；
    - **登记接受**：压缩接收侧 64KB 粒度临时分配、async 线程内同步盘写（量级非主因，留 R7 权衡）；0x04 接收侧无摘要缓存（重复同步整盘重读——与 C# FileHashes 对齐属独立批次）；0x0A 旧对端（<2.12）回退缺失；run_interop 的 8s 场景计时含 harness 固定等待（stop_receiver 6s 超时 + SHA 验证）——真实 send 耗时以 bench_real/A-B 口径为准。
 
+40. **性能优化 8 轮计划·轮 7（公共路径收尾：io/compress/cswire 缓冲粒度）**（2026-11-15）：
+   - **落地**：cswire 四处接收体缓冲 256KB → **4MB**（`CS_RECV_BUF`——对齐 C# WireProtocol bufferSize=4194304；压缩比率随段增大改善，UDT 引擎读侧聚合已就位）；compress.rs 读侧 64KB 增量临时 Vec → 循环外复用；protocol/io.rs 全文复核干净（read_n 小额分配、write 系直通、长短双窗口语义正确——零改动）；
+   - **审查后不动（登记）**：cswire 发送 CHUNK 1MB→4MB 不改（进度粒度跳变 4× 是用户可见副作用；UDT 窗口 11.9MB 下 1MB 已够大）；`CsEncRead::pull` 每段 Vec 分配保持（320 次/80MB，memcpy 才是大头，复用收益微小）；trackers 全局锁内盘 IO 不重构（Arc<Mutex<per-tracker>> 结构性改动风险大于收益——0x02 多连接共组真机已 14/14 验证，单连接场景无争用）；
+   - **实测**：真机 C# 矩阵 **14/14**；全量 **270 绿 0 告警**；全协议基准维持（TCP 198 / QUIC 186 / RUDP 247 / UDT 180 / UDP 34.8）。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

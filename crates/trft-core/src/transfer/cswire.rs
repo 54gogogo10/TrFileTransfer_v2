@@ -40,6 +40,9 @@ pub const CS_MAX_TEXT: usize = 1_048_576;
 pub const CS_MAX_FOLDER_FILES: usize = 1_000_000;
 /// 单文件声明上限（C# MaxTransferSize = 1 PiB）。
 pub const CS_MAX_TRANSFER: u64 = 1 << 50;
+/// 接收体缓冲（轮 7：256KB → 4MB 对齐 C# WireProtocol bufferSize——压缩比率
+/// 随段增大改善，UDT 引擎读侧聚合已就位）。
+const CS_RECV_BUF: usize = 4 * 1024 * 1024;
 /// 0x09 加密段明文上限（C# EncryptedWireStream.MaxSegment）。
 pub const ENC_SEGMENT_MAX: usize = 262_144;
 /// 0x08 压缩段线长上限（解压炸弹防线，C# CompressedWireStream.MaxSegment）。
@@ -1309,7 +1312,7 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
         .open(&temp)?;
     let mut hasher = sha2::Sha256::new();
     let mut remaining = size;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; CS_RECV_BUF];
     {
         use std::io::Write as _;
         while remaining > 0 {
@@ -1534,7 +1537,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
     let mut remaining = chunk as u64;
     let mut write_off = offset as u64;
     let mut complete = false;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; CS_RECV_BUF];
     while remaining > 0 {
         let n = buf.len().min(remaining as usize);
         wire.read_exact(&mut buf[..n]).await?;
@@ -1755,7 +1758,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
     f.seek(std::io::SeekFrom::End(0))?;
     let mut hasher = sha2::Sha256::new();
     let mut remaining = total - start;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; CS_RECV_BUF];
     while remaining > 0 {
         // 部分读：中断前的到达字节必须立即记账（C# ReadSomeAsync 同构——
         // read_exact 会让不足一块的进度滞留 socket，续点回退）。
@@ -2014,7 +2017,7 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             let mut f = std::fs::OpenOptions::new().append(true).open(&save_path)?;
             let mut hasher = sha2::Sha256::new();
             let mut remaining = e.size - start;
-            let mut buf = vec![0u8; 256 * 1024];
+            let mut buf = vec![0u8; CS_RECV_BUF];
             while remaining > 0 {
                 let n = buf.len().min(remaining as usize);
                 wire.read_exact(&mut buf[..n]).await?;

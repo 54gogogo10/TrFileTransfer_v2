@@ -177,11 +177,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Compressed<S> {
                 this.wire_left = wire_len as u64;
                 this.body_pos = 0;
             }
-            // 增量读段载荷（读到 wire_len 为止）。
+            // 增量读段载荷（读到 wire_len 为止）。临时缓冲复用（轮 7：
+            // 此前每 64KB 一次 vec![0u8; want] 分配）。
+            let mut chunk = vec![0u8; 64 * 1024];
             while this.wire_left > 0 {
                 let want = std::cmp::min(this.wire_left, 64 * 1024) as usize;
-                let mut chunk = vec![0u8; want];
-                let mut rb = ReadBuf::new(&mut chunk);
+                let mut rb = ReadBuf::new(&mut chunk[..want]);
                 match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
                     Poll::Ready(Ok(())) => {
                         let n = rb.filled().len();
