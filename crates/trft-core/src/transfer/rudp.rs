@@ -17,7 +17,7 @@
 
 use crate::error::{proto, Error, Result};
 use crate::protocol::rudp as pw;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -30,21 +30,28 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{watch, Semaphore};
 
-/// 在途包窗口（双向，256×1200B ≈ 300KB——RTT 50ms 时吞吐上限 ≈6MB/s）。
-const RUDP_WINDOW: usize = 256;
-/// 乱序重排缓冲上限（超出丢弃，等发送端重传）。
-const RUDP_PENDING_CAP: usize = 4 * RUDP_WINDOW;
+/// 在途包窗口（双向）：1024 包 × 协商 mss（环回 60000 → 高带宽；LAN 1400 →
+/// 1.4MB/RTT 50ms ≈ 28MB/s——旧值 256 在真实 RTT 链路上把吞吐钉在 6MB/s）。
+const RUDP_WINDOW: usize = 1024;
+/// 乱序重排缓冲上限（字节——超出丢弃等重传；包数上限退居次席，mss 大时防
+/// 重排内存无界：60000B mss × 无限包数曾在环回突发下放大到数十 MB/连接）。
+const RUDP_PENDING_CAP_PKTS: usize = 4 * RUDP_WINDOW;
+const RUDP_PENDING_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// 重传扫描节拍。
 const RUDP_TICK: Duration = Duration::from_millis(25);
+/// 快速重传最小间隔（SACK 空洞触发的立即重发限频——与扫描节拍同拍）。
+const RUDP_FAST_RETX_MIN: Duration = RUDP_TICK;
 /// RTO 下限/上限/初值（ms）。
 /// 单次唤醒的批量上限（泵排空/驱动处理/出包发送共用——每批一次让出，
 /// 去掉逐包调度开销；§7.28「批量收发/ACK 合批」）。
 const RUDP_BATCH_CAP: usize = 512;
-/// 读侧单次 poll 的聚合上限（把 1200B 粒度的逐块唤醒拼成大块）。
+/// 读侧单次 poll 的聚合上限（把逐块唤醒拼成大块）。
 const RUDP_READ_AGG: usize = 256 * 1024;
-const RUDP_RTO_MIN_MS: u64 = 200;
+const RUDP_RTO_MIN_MS: u64 = 50;
 const RUDP_RTO_MAX_MS: u64 = 3000;
 const RUDP_RTO_INIT_MS: u64 = 400;
+/// 非环回链路的 MSS 提案（以太网 1500 − IP/UDP 头 − 余量）。
+const RUDP_MSS_LAN: usize = 1400;
 /// 单包重传上限（超过判链路过差，断连——不无限重传放大）。
 const RUDP_RETRIES_MAX: u32 = 12;
 /// 空闲超时（对齐原版 UDT_RCVTIMEO/UDT_SNDTIMEO = 30 秒）。
@@ -60,13 +67,35 @@ const RUDP_CONN_CAP: usize = 256;
 
 type Pkt = (u8, u32, Vec<u8>); // (kind, seq, payload)
 
+/// 已编码出包（Arc 共享：首发与重传零再编码零再拷贝——重传只是克隆指针）。
+type WirePkt = Arc<[u8]>;
+/// 出口通道元素。
+type OutPkt = (SocketAddr, WirePkt);
+
+/// 序号回绕算术（u32 模 2^32 距离 <2^31 为「在前」）：多 TB 传输（4.29G 包 ×
+/// mss）必回绕，朴素整数比较在回绕点把新周期包判为旧包——接收端永久缺包、
+/// 发送端重传超限断连。全部序比较统一走这对助手。
+#[inline]
+fn seq_ge(a: u32, b: u32) -> bool {
+    a.wrapping_sub(b) < 0x8000_0000
+}
+#[inline]
+fn seq_lt(a: u32, b: u32) -> bool {
+    !seq_ge(a, b)
+}
+#[inline]
+fn seq_gt(a: u32, b: u32) -> bool {
+    a != b && seq_ge(a, b)
+}
+
 #[derive(Debug, Clone)]
 struct InFlight {
-    data: Vec<u8>,
+    /// 已编码完整数据报（头+载荷）——首发即编码，重传只克隆 Arc。
+    pkt: WirePkt,
     first_send: Instant,
     last_send: Instant,
     retries: u32,
-    /// RTO 重发过后置位：其 ACK 采样不代表真实 RTT（Karn 修正，防 RTO
+    /// RTO/快速重发过后置位：其 ACK 采样不代表真实 RTT（Karn 修正，防 RTO
     /// 正反馈膨胀到上限——大传输爬行的共因）。
     retransmitted: bool,
 }
@@ -75,25 +104,29 @@ struct InFlight {
 struct SendSide {
     inflight: HashMap<u32, InFlight>,
     next_seq: u32,
-    sacked: HashSet<u32>,
+    /// 本连接协商 mss（发送分片上限）。
+    mss: usize,
     srtt_ms: f64,
     rttvar_ms: f64,
     rto: Duration,
     shutdown_req: bool,
     fin_sent_at: Option<Instant>,
+    /// 快速重传限频基准（SACK 空洞触发的立即重发至多每拍一次）。
+    last_fast_retx: Instant,
 }
 
 impl SendSide {
-    fn new() -> Self {
+    fn new(mss: usize) -> Self {
         Self {
             inflight: HashMap::new(),
             next_seq: 0,
-            sacked: HashSet::new(),
+            mss,
             srtt_ms: 0.0,
             rttvar_ms: 0.0,
             rto: Duration::from_millis(RUDP_RTO_INIT_MS),
             shutdown_req: false,
             fin_sent_at: None,
+            last_fast_retx: Instant::now(),
         }
     }
 
@@ -115,15 +148,21 @@ impl SendSide {
 struct RecvSide {
     expected: u32,
     pending: HashMap<u32, Vec<u8>>,
+    /// 重排缓存字节数（与包数上限共同把关——mss 协商大包时防内存放大）。
+    pending_bytes: usize,
+    /// 本连接协商 mss（超限 DATA 丢弃——垃圾/攻击面收口）。
+    mss: usize,
     remote_fin: Option<u32>,
     eof_seen: bool,
 }
 
 impl RecvSide {
-    fn new() -> Self {
+    fn new(mss: usize) -> Self {
         Self {
             expected: 0,
             pending: HashMap::new(),
+            pending_bytes: 0,
+            mss,
             remote_fin: None,
             eof_seen: false,
         }
@@ -132,22 +171,25 @@ impl RecvSide {
     /// 从乱序缓存收敛连续段到输出（调用方持锁）。
     fn drain_contiguous(&mut self, out: &mut VecDeque<Vec<u8>>) {
         while let Some(p) = self.pending.remove(&self.expected) {
+            self.pending_bytes = self.pending_bytes.saturating_sub(p.len());
             out.push_back(p);
-            self.expected += 1;
+            self.expected = self.expected.wrapping_add(1);
         }
     }
 
     /// ACK 载荷用 SACK 区间（pending 键合并连续段，≤64 段）。
+    /// 排序以 `expected` 为原点按回绕距离——回绕点两侧的朴素排序会交错出错。
     fn sack_ranges(&self) -> Vec<(u32, u8)> {
         let mut keys: Vec<u32> = self.pending.keys().copied().collect();
-        keys.sort_unstable();
+        let origin = self.expected;
+        keys.sort_unstable_by_key(|k| k.wrapping_sub(origin));
         let mut out = Vec::new();
         let mut i = 0;
         while i < keys.len() && out.len() < 64 {
             let start = keys[i];
             let mut len = 1u8;
             while i + 1 < keys.len()
-                && keys[i + 1] == keys[i] + 1
+                && keys[i + 1] == keys[i].wrapping_add(1)
                 && u32::from(len) < u32::from(u8::MAX)
             {
                 i += 1;
@@ -160,8 +202,8 @@ impl RecvSide {
     }
 }
 
-/// 已编码出包出口类型（socket 发送任务消费）。
-type OutTx = Mutex<Option<UnboundedSender<(SocketAddr, Vec<u8>)>>>;
+/// 已编码出包出口类型（socket 发送任务消费；共享注入点见 `build_conn`）。
+type OutTx = Mutex<Option<UnboundedSender<OutPkt>>>;
 
 /// 连接状态机（收发双侧共享；驱动任务与 `RudpStream` 各持 Arc）。
 pub(crate) struct RudpConn {
@@ -190,29 +232,25 @@ pub(crate) struct RudpConn {
 }
 
 impl RudpConn {
-    fn outbound(&self, pkt: Vec<u8>) {
+    fn outbound(&self, pkt: WirePkt) {
         let tx = self.out_tx.lock().expect("出包锁").clone();
         if let Some(tx) = tx {
             let _ = tx.send((self.peer, pkt));
         }
     }
 
-    fn send_data(&self, seq: u32, data: &[u8]) {
-        if let Ok(p) = pw::encode(pw::U_P_DATA, self.conn, seq, data) {
-            self.outbound(p);
-        }
-    }
-
     fn send_ack(&self, recv: &RecvSide) {
         let payload = pw::encode_ack_payload(recv.expected, &recv.sack_ranges());
         if let Ok(p) = pw::encode(pw::U_P_ACK, self.conn, 0, &payload) {
-            self.outbound(p);
+            let pkt: WirePkt = p.into();
+            self.outbound(pkt);
         }
     }
 
     fn send_fin(&self, total: u32) {
         if let Ok(p) = pw::encode(pw::U_P_FIN, self.conn, 0, &total.to_le_bytes()) {
-            self.outbound(p);
+            let pkt: WirePkt = p.into();
+            self.outbound(pkt);
         }
     }
 
@@ -220,7 +258,8 @@ impl RudpConn {
         let mut payload = reason.as_bytes().to_vec();
         payload.truncate(200);
         if let Ok(p) = pw::encode(pw::U_P_RST, self.conn, 0, &payload) {
-            self.outbound(p);
+            let pkt: WirePkt = p.into();
+            self.outbound(pkt);
         }
     }
 
@@ -305,14 +344,17 @@ impl RudpConn {
         let mut out = VecDeque::new();
         let action = {
             let mut r = self.recv.lock().expect("接收锁");
-            if seq < r.expected {
+            if payload.len() > r.mss {
+                return false; // 超协商 mss → 杂包丢弃（不 ACK——发送端不会发这种包）
+            }
+            if seq_lt(seq, r.expected) {
                 Action::Dup
             } else if seq == r.expected {
                 out.push_back(payload.to_vec());
-                r.expected += 1;
+                r.expected = r.expected.wrapping_add(1);
                 r.drain_contiguous(&mut out);
                 let eof_now = match r.remote_fin {
-                    Some(total) => r.expected >= total && !r.eof_seen,
+                    Some(total) => seq_ge(r.expected, total) && !r.eof_seen,
                     None => false,
                 };
                 if eof_now {
@@ -320,8 +362,11 @@ impl RudpConn {
                 }
                 Action::Deliver(eof_now)
             } else {
-                // 乱序：入缓存（超限丢弃，等发送端重传）。
-                if r.pending.len() < RUDP_PENDING_CAP {
+                // 乱序：入缓存（包数/字节双上限，超出丢弃等发送端重传）。
+                if r.pending.len() < RUDP_PENDING_CAP_PKTS
+                    && r.pending_bytes + payload.len() <= RUDP_PENDING_CAP_BYTES
+                {
+                    r.pending_bytes += payload.len();
                     r.pending.insert(seq, payload.to_vec());
                 }
                 Action::Gap
@@ -349,7 +394,8 @@ impl RudpConn {
 
     fn send_fin_ack(&self) {
         if let Ok(p) = pw::encode(pw::U_P_FIN_ACK, self.conn, 0, &[]) {
-            self.outbound(p);
+            let pkt: WirePkt = p.into();
+            self.outbound(pkt);
         }
     }
 
@@ -357,39 +403,67 @@ impl RudpConn {
         let Some((cum, sacks)) = pw::decode_ack_payload(payload) else {
             return;
         };
-        let mut released = 0usize;
+        let now = Instant::now();
+        let released: usize;
+        // 快速重传候选：SACK 首区间之前的空洞（接收端已见其后的包——洞内
+        // 在途包大概率丢失）。限频每拍一次，避免重复 ACK 洪泛放大。
+        let mut retx: Vec<WirePkt> = Vec::new();
         {
             let mut s = self.send.lock().expect("发送锁");
-            if cum > s.next_seq {
+            if seq_gt(cum, s.next_seq) {
                 return; // 非法/超前 ACK（fail-closed 忽略）
             }
             // RTT 采样：取 cum-1 号包的首次发送时刻。Karn 修正：RTO 重发过的
             // 包不采样（重传样本 ≈ 前次 RTO，正反馈把 RTO 推到上限——大传输
             // 爬行的共因之一）。
-            if cum > 0 {
-                if let Some(inf) = s.inflight.get(&(cum - 1)) {
+            if cum != s.next_seq {
+                if let Some(inf) = s.inflight.get(&cum.wrapping_sub(1)) {
                     if !inf.retransmitted {
                         let sample = inf.first_send.elapsed().as_secs_f64() * 1000.0;
                         s.rto_update(sample.max(0.1));
                     }
                 }
             }
-            for k in s.inflight.keys().copied().collect::<Vec<_>>() {
-                if k < cum && s.inflight.remove(&k).is_some() {
-                    released += 1;
+            let before = s.inflight.len();
+            s.inflight.retain(|&k, _| !seq_lt(k, cum));
+            for (start, len) in &sacks {
+                let mut k = *start;
+                for _ in 0..*len {
+                    s.inflight.remove(&k);
+                    k = k.wrapping_add(1);
                 }
             }
-            for (start, len) in sacks {
-                for k in start..start.saturating_add(u32::from(len)) {
-                    if s.inflight.remove(&k).is_some() {
-                        released += 1;
+            released = before - s.inflight.len();
+            if !sacks.is_empty() && now.duration_since(s.last_fast_retx) >= RUDP_FAST_RETX_MIN {
+                // 空洞 = [cum, 首个 SACK 起点)：全部在途包立即重发（受窗口界）。
+                let hole_end = sacks
+                    .iter()
+                    .map(|(st, _)| *st)
+                    .min_by_key(|st| st.wrapping_sub(cum))
+                    .expect("sacks 非空");
+                if seq_lt(cum, hole_end) {
+                    s.last_fast_retx = now;
+                    let hole: Vec<u32> = s
+                        .inflight
+                        .keys()
+                        .copied()
+                        .filter(|k| seq_lt(*k, hole_end))
+                        .collect();
+                    for k in hole {
+                        if let Some(inf) = s.inflight.get_mut(&k) {
+                            inf.retransmitted = true;
+                            inf.last_send = now;
+                            retx.push(inf.pkt.clone());
+                        }
                     }
                 }
             }
-            s.sacked.retain(|k| *k >= cum);
         }
         if released > 0 {
             self.window.add_permits(released);
+        }
+        for p in retx {
+            self.outbound(p);
         }
     }
 
@@ -398,9 +472,12 @@ impl RudpConn {
         // 否则对端 shutdown 等 RUDP_FIN_WAIT——真机丢包下必踩）。
         let (finish_now, ack_fin) = {
             let mut r = self.recv.lock().expect("接收锁");
-            // 取更小的 total（重复 FIN 一致；防御性取 min）。
-            r.remote_fin = Some(r.remote_fin.map_or(total, |t| t.min(total)));
-            let complete = r.expected >= total && r.pending.is_empty();
+            // 重复 FIN 一致；total 取回绕序更靠后的一方（防御性）。
+            r.remote_fin = Some(
+                r.remote_fin
+                    .map_or(total, |t| if seq_ge(total, t) { total } else { t }),
+            );
+            let complete = seq_ge(r.expected, total) && r.pending.is_empty();
             let finish_now = complete && !r.eof_seen; // 首次达成 → 关读侧（EOF 一次性）
             if finish_now {
                 r.eof_seen = true;
@@ -429,12 +506,12 @@ impl RudpConn {
             self.close(Some("连接超时（30s 无数据）".into()));
             return;
         }
-        let mut resend: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut resend: Vec<WirePkt> = Vec::new();
         let mut resend_fin = false;
         let abort = {
             let mut s = self.send.lock().expect("发送锁");
             let rto = s.rto;
-            for (seq, inf) in s.inflight.iter_mut() {
+            for inf in s.inflight.values_mut() {
                 if now.duration_since(inf.last_send) >= rto {
                     inf.retries += 1;
                     inf.retransmitted = true;
@@ -442,7 +519,7 @@ impl RudpConn {
                     if inf.retries > RUDP_RETRIES_MAX {
                         break;
                     }
-                    resend.push((*seq, inf.data.clone()));
+                    resend.push(inf.pkt.clone());
                 }
             }
             let too_lossy = s.inflight.values().any(|i| i.retries > RUDP_RETRIES_MAX);
@@ -461,8 +538,8 @@ impl RudpConn {
             self.close(Some("重传超限（链路过差）".into()));
             return;
         }
-        for (seq, data) in resend {
-            self.send_data(seq, &data);
+        for pkt in resend {
+            self.outbound(pkt);
         }
         if resend_fin {
             let total = self.send.lock().expect("发送锁").next_seq;
@@ -490,8 +567,10 @@ pub struct RudpStream {
     acquire: Option<
         Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedSemaphorePermit> + Send>>,
     >,
-    /// poll_recv 取出但超出本次读缓冲的残余（读侧临时缓冲，下一次读先清它）。
+    /// poll_recv 取出但超出本次读缓冲的残余（`read_pos` 光标——消费只推进，
+    /// 耗尽才清零，避免每次读 drain 整段 memmove）。
     read_buf: Vec<u8>,
+    read_pos: usize,
 }
 
 impl RudpStream {
@@ -537,22 +616,27 @@ impl AsyncRead for RudpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // 先清残余（可能超出本次缓冲的部分留待下次），再从队列补包。
+        // 先清残余（光标推进，耗尽即清零——避免 drain 的整段 memmove），再从队列补包。
         loop {
-            if !self.read_buf.is_empty() {
-                let n = self.read_buf.len().min(buf.remaining());
+            if self.read_pos < self.read_buf.len() {
+                let n = (self.read_buf.len() - self.read_pos).min(buf.remaining());
                 if n == 0 {
                     return Poll::Pending; // 0 长读缓冲：不消费数据
                 }
-                buf.put_slice(&self.read_buf[..n]);
-                self.read_buf.drain(..n);
+                buf.put_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
+                self.read_pos += n;
+                if self.read_pos == self.read_buf.len() {
+                    self.read_buf.clear();
+                    self.read_pos = 0;
+                }
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut self.data_rx).poll_recv(cx) {
                 Poll::Ready(Some(chunk)) => {
                     self.read_buf = chunk;
-                    // 聚合积压（§7.28「应用写聚合」）：1200B 逐块唤醒的开销
-                    // 在大流量下占主导；单次 poll 拼到上限再切片。
+                    self.read_pos = 0;
+                    // 聚合积压（§7.28「应用写聚合」）：逐块唤醒的开销在大流量
+                    // 下占主导；单次 poll 拼到上限再切片。
                     while self.read_buf.len() < RUDP_READ_AGG {
                         match self.data_rx.try_recv() {
                             Ok(c) => self.read_buf.extend_from_slice(&c),
@@ -581,50 +665,86 @@ impl AsyncWrite for RudpStream {
         if let Some(e) = self.conn.error() {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
         }
-        if self.conn.send.lock().expect("发送锁").shutdown_req {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "写端已关闭")));
-        }
+        let mss = {
+            let s = self.conn.send.lock().expect("发送锁");
+            if s.shutdown_req {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "写端已关闭")));
+            }
+            s.mss
+        };
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // 窗口信号量：拿不到许可 = 在途满 → Pending（ACK 确认/close 兜底唤醒）。
-        if self.acquire.is_none() {
-            let sem = self.conn.window.clone();
-            self.acquire = Some(Box::pin(async move {
-                sem.acquire_owned()
-                    .await
-                    .expect("窗口信号量永不 close（close 用 add_permits 唤醒等待者）")
-            }));
-        }
-        let mut fut = self.acquire.take().expect("已插入");
-        let permit = match fut.as_mut().poll(cx) {
-            Poll::Ready(p) => p,
-            Poll::Pending => {
-                self.acquire = Some(fut);
-                return Poll::Pending;
+        // 窗口信号量（批量快速路径）：一次 acquire_many 发完窗口允许的整批
+        // ——每批一次锁一次让出；仅窗口满时走单许可慢路径（等 ACK 归还唤醒）。
+        let want = buf.len().div_ceil(mss).min(RUDP_WINDOW) as u32;
+        let sem = self.conn.window.clone();
+        let permits = match sem.clone().try_acquire_many_owned(want) {
+            Ok(p) => p,
+            Err(_) => {
+                if self.acquire.is_none() {
+                    let sem = sem.clone();
+                    self.acquire = Some(Box::pin(async move {
+                        // 等一个许可即可：下一轮 poll_write 走批量快速路径补齐。
+                        sem.acquire_owned()
+                            .await
+                            .expect("窗口信号量永不 close（close 用 add_permits 唤醒等待者）")
+                    }));
+                }
+                let mut fut = self.acquire.take().expect("已插入");
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(p) => p,
+                    Poll::Pending => {
+                        self.acquire = Some(fut);
+                        return Poll::Pending;
+                    }
+                }
             }
         };
-        permit.forget(); // 配额由 ACK 归还（add_permits）；close 兜底全量归还
-        let data = buf[..buf.len().min(pw::RUDP_PAYLOAD_MAX)].to_vec();
-        let seq;
+        permits.forget(); // 配额由 ACK 归还（add_permits）；close 兜底全量归还
+        let mut pkts: Vec<WirePkt> = Vec::new();
+        let mut sent = 0usize;
         {
             let mut s = self.conn.send.lock().expect("发送锁");
-            seq = s.next_seq;
-            s.next_seq += 1;
             let now = Instant::now();
-            s.inflight.insert(
-                seq,
-                InFlight {
-                    data: data.clone(),
-                    first_send: now,
-                    last_send: now,
-                    retries: 0,
-                    retransmitted: false,
-                },
-            );
+            let mut off = 0usize;
+            while off < buf.len() {
+                let end = (off + s.mss).min(buf.len());
+                let seq = s.next_seq;
+                s.next_seq = seq.wrapping_add(1);
+                match pw::encode(pw::U_P_DATA, self.conn.conn, seq, &buf[off..end]) {
+                    Ok(p) => {
+                        let pkt: WirePkt = p.into();
+                        s.inflight.insert(
+                            seq,
+                            InFlight {
+                                pkt: pkt.clone(),
+                                first_send: now,
+                                last_send: now,
+                                retries: 0,
+                                retransmitted: false,
+                            },
+                        );
+                        pkts.push(pkt);
+                    }
+                    Err(_) => break, // 不可能（mss ≤ CEIL 已在协商钳制）；防御
+                }
+                sent = end;
+                off = end;
+            }
         }
-        self.conn.send_data(seq, &data);
-        Poll::Ready(Ok(data.len()))
+        if sent == 0 {
+            // 编码全败（防御路径）：归还刚扣的许可，报错。
+            self.conn.window.add_permits(want as usize);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RUDP 编码失败",
+            )));
+        }
+        for p in pkts {
+            self.conn.outbound(p);
+        }
+        Poll::Ready(Ok(sent))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -656,17 +776,25 @@ impl Drop for RudpStream {
 
 /// `build_conn` 返回：(状态机, 流, 入包通道发送端, 出包通道接收端, 驱动句柄)。
 /// 入包通道发送端：客户端交给 socket 泵；服务端交给 demux；测试交给对偶注入。
+/// 出包通道接收端：`shared_out = None` 时创建本连接专属通道（客户端/测试）；
+/// 服务端注入共享出口后为 None（省掉每连接一跳 forward 任务——批量性能批）。
 type BuiltConn = (
     Arc<RudpConn>,
     RudpStream,
     UnboundedSender<Pkt>,
-    UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    Option<UnboundedReceiver<OutPkt>>,
     tokio::task::JoinHandle<()>,
 );
 
-/// 连接装配：状态机 + 流句柄 + 驱动任务（就地起）。
-fn build_conn(conn: u32, peer: SocketAddr) -> BuiltConn {
-    let (out_tx, out_rx) = unbounded_channel::<(SocketAddr, Vec<u8>)>();
+/// 连接装配：状态机 + 流句柄 + 驱动任务（就地起）。`mss` = 握手协商载荷上限。
+fn build_conn(conn: u32, peer: SocketAddr, mss: usize, shared_out: Option<UnboundedSender<OutPkt>>) -> BuiltConn {
+    let (out_tx, out_rx) = match shared_out {
+        Some(tx) => (tx, None),
+        None => {
+            let (tx, rx) = unbounded_channel::<OutPkt>();
+            (tx, Some(rx))
+        }
+    };
     let (data_tx, data_rx) = unbounded_channel::<Vec<u8>>();
     let (in_tx, in_rx) = unbounded_channel::<Pkt>();
     let (fin_tx, fin_rx) = unbounded_channel::<()>();
@@ -674,8 +802,8 @@ fn build_conn(conn: u32, peer: SocketAddr) -> BuiltConn {
     let internal = Arc::new(RudpConn {
         conn,
         peer,
-        send: Mutex::new(SendSide::new()),
-        recv: Mutex::new(RecvSide::new()),
+        send: Mutex::new(SendSide::new(mss)),
+        recv: Mutex::new(RecvSide::new(mss)),
         window: Arc::new(Semaphore::new(RUDP_WINDOW)),
         out_tx: Mutex::new(Some(out_tx)),
         data_tx: Mutex::new(Some(data_tx)),
@@ -692,6 +820,7 @@ fn build_conn(conn: u32, peer: SocketAddr) -> BuiltConn {
         fin_rx,
         acquire: None,
         read_buf: Vec::new(),
+        read_pos: 0,
     };
     let driver = tokio::spawn(run_driver(internal.clone(), in_rx));
     (internal, stream, in_tx, out_rx, driver)
@@ -750,7 +879,14 @@ async fn run_driver(conn: Arc<RudpConn>, mut in_rx: UnboundedReceiver<Pkt>) {
         // 对端泵/写端（current-thread runtime 上必现）——每批让出一次。
         tokio::task::yield_now().await;
     }
-    conn.close(None);
+    // 收尾口径（「结果未知 ≠ 成功」）：正常流是流句柄 Drop/RST/超时先把
+    // closed 置位再走到这里（close 幂等）；若入口关闭时 closed 仍为假，
+    // 说明泵/服务端先死于 socket 错误——读侧必须见错误而非干净 EOF。
+    if conn.closed.load(Ordering::SeqCst) {
+        conn.close(None);
+    } else {
+        conn.close(Some("传输通道异常中断".into()));
+    }
 }
 
 fn local_bind_addr(addr: SocketAddr, src_port: Option<u16>) -> SocketAddr {
@@ -776,7 +912,9 @@ fn random_u32() -> u32 {
 
 /* ============ 客户端 ============ */
 
-/// 建立到 `addr` 的 UDT 连接（HS 握手 + 定时重发；30s 超时）。
+/// 建立到 `addr` 的 RUDP 连接（HS 握手 + 定时重发；30s 超时）。
+/// 首发协商版 HS（nonce + mss 提案：环回 60000 / 其余 1400），重发窗口
+/// 自动降级为旧版 16B HS——旧服务端只认 16B，新服务端两种都认。
 /// `src_port`：可选本地端口绑定（与 TCP/QUIC `--srcport` 同口径）。
 pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<RudpStream> {
     let socket = UdpSocket::bind(local_bind_addr(addr, src_port))
@@ -784,17 +922,31 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
         .map_err(Error::Io)?;
     let conn_id = random_u32();
     let nonce = random_bytes(16);
-    let hs = pw::encode(pw::U_P_HS, conn_id, 0, &nonce).map_err(proto)?;
+    let propose: usize = if addr.ip().is_loopback() {
+        pw::RUDP_MSS_CEIL
+    } else {
+        RUDP_MSS_LAN
+    };
+    let mut hs_new = nonce.clone();
+    hs_new.extend_from_slice(&(propose as u16).to_le_bytes());
+    let hs_new = pw::encode(pw::U_P_HS, conn_id, 0, &hs_new).map_err(proto)?;
+    let hs_old = pw::encode(pw::U_P_HS, conn_id, 0, &nonce).map_err(proto)?;
     let deadline = Instant::now() + RUDP_HS_TIMEOUT;
     let mut buf = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
+    let mut first_round = true;
+    let mss;
     loop {
         if Instant::now() >= deadline {
             return Err(proto("RUDP 握手超时（30s）"));
         }
-        let _ = socket.send_to(&hs, addr).await;
+        // 首轮发协商版；重发窗口降级旧版（旧服务端对 18B 载荷静默忽略）。
+        let _ = socket.send_to(if first_round { &hs_new } else { &hs_old }, addr).await;
         let remain = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remain.min(RUDP_HS_RESEND), socket.recv_from(&mut buf)).await {
-            Err(_) => continue, // 重发窗口到点 → 再发 HS
+            Err(_) => {
+                first_round = false; // 重发窗口到点 → 降级重发
+                continue;
+            }
             Ok(Err(e)) => return Err(Error::Io(e)),
             Ok(Ok((n, src))) => {
                 if src != addr {
@@ -802,7 +954,12 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
                 }
                 match pw::decode(&buf[..n]) {
                     Some((h, payload)) if h.conn == conn_id => match h.kind {
-                        pw::U_P_HS_ACK if payload == nonce => break,
+                        pw::U_P_HS_ACK => {
+                            if let Some(m) = pw::hs_ack_mss(payload, &nonce, propose) {
+                                mss = m;
+                                break;
+                            }
+                        }
                         pw::U_P_RST => {
                             let reason = String::from_utf8_lossy(payload);
                             return Err(proto(if reason.is_empty() {
@@ -818,7 +975,7 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
             }
         }
     }
-    let (internal, stream, in_tx, mut out_rx, driver) = build_conn(conn_id, addr);
+    let (internal, stream, in_tx, out_rx, driver) = build_conn(conn_id, addr, mss, None);
     // socket 共享（tokio UdpSocket 无 Clone——Arc 承载；方法均取 &self）。
     let socket = Arc::new(socket);
     // socket 泵：入包 → 驱动（连接关闭即退）。
@@ -827,6 +984,9 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
     let pump_in = in_tx;
     tokio::spawn(async move {
         let mut b = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
+        // 连续非 WouldBlock 错误计数（socket 坏死后 try_recv 立即返回错误——
+        // 不设限会以满 CPU 自旋到批上限；64 次仍错即退泵，由驱动收尾报错）。
+        let mut hard_errs = 0u32;
         loop {
             if pump_conn.closed.load(Ordering::SeqCst) {
                 break;
@@ -836,6 +996,7 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
             while n < RUDP_BATCH_CAP {
                 match pump_sock.try_recv_from(&mut b) {
                     Ok((len, src)) => {
+                        hard_errs = 0;
                         if src == pump_conn.peer {
                             if let Some((h, payload)) = pw::decode(&b[..len]) {
                                 if h.conn == pump_conn.conn {
@@ -845,11 +1006,18 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
                         }
                         n += 1;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        hard_errs = 0;
+                        break;
+                    }
                     // EMSGSIZE 等杂包：丢弃本包继续（与 serve_udp 同口径——超长
-                    // 垃圾包不得杀死泵）。
+                    // 垃圾包不得杀死泵）；但持续性错误须退泵防自旋。
                     Err(_) => {
                         n += 1;
+                        hard_errs += 1;
+                        if hard_errs > 64 {
+                            return; // 泵退 → 入口关闭 → 驱动按异常中断收尾
+                        }
                         continue;
                     }
                 }
@@ -879,6 +1047,7 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
     });
     // 出包任务：驱动编码包 → socket（批量排空，每批一次让出）。
     let send_sock = socket;
+    let mut out_rx = out_rx.expect("客户端连接持专属出包通道");
     tokio::spawn(async move {
         loop {
             let Some((dst, pkt)) = out_rx.recv().await else {
@@ -913,6 +1082,8 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
 struct ConnEntry {
     peer: SocketAddr,
     in_tx: UnboundedSender<Pkt>,
+    /// 握手协商 mss（重复 HS 幂等重 ACK 需带协商值——客户端降级重发时以首答为准）。
+    mss: u16,
 }
 
 fn rst_pkt(conn: u32, reason: &str) -> Option<Vec<u8>> {
@@ -931,18 +1102,177 @@ pub async fn serve_rudp(
     serve_rudp_on(socket, opts).await
 }
 
-/// 在既有 UDP socket 上服务 UDT 连接（GUI 复用 `bind_udp` 的逐地址绑定/失败上报）。
+/// demux 循环共享上下文（廉价 Arc/引用——单次构建全循环复用，逐包零克隆）。
+struct DemuxCtx<'a> {
+    socket: Arc<UdpSocket>,
+    out_tx: UnboundedSender<OutPkt>,
+    conns: Arc<Mutex<HashMap<u32, ConnEntry>>>,
+    opts: &'a crate::transfer::receiver::RecvOptions,
+    served: Arc<std::sync::atomic::AtomicU64>,
+    ended: Arc<tokio::sync::Notify>,
+    stop_tx: watch::Sender<bool>,
+}
+
+/// 处理一个入包（HS 控制面 / 数据面路由）。
+/// 返回 Ok(true) = 接收器应优雅停止（限量收满）；Err = socket 致命错误。
+async fn demux_one(
+    ctx: &DemuxCtx<'_>,
+    finished: &mut tokio::task::JoinSet<()>,
+    pkt: &[u8],
+    src: SocketAddr,
+) -> Result<bool> {
+    use crate::transfer::receiver::{gate_check, handle_conn, ip_allowed};
+    let Some((h, payload)) = pw::decode(pkt) else {
+        return Ok(false);
+    };
+    let opts = ctx.opts;
+    if h.kind == pw::U_P_HS {
+        // 版本校验已由 pw::decode 承担（ver 不符整包忽略）；载荷 16B 旧版 /
+        // 18B 协商版（nonce + mss 提案，钳制到 [1200, CEIL]）。
+        let Some(mss) = pw::hs_mss(payload) else {
+            return Ok(false);
+        };
+        // IP 过滤先于握手（对齐 quic.rs：被拒源不进任何状态机）。
+        if !ip_allowed(src.ip(), opts.ip_filter_mode, &opts.ip_filter_list) {
+            if let Some(rst) = rst_pkt(h.conn, "被 IP 过滤规则拒绝") {
+                let _ = ctx.socket.send_to(&rst, src).await;
+            }
+            return Ok(false);
+        }
+        // 锁定门（配对失败次数过多）。
+        if gate_check(src, opts).await.is_err() {
+            if let Some(rst) = rst_pkt(h.conn, "配对失败次数过多，已临时锁定") {
+                let _ = ctx.socket.send_to(&rst, src).await;
+            }
+            return Ok(false);
+        }
+        // 限量模式（--count）：串行——等现有连接结束再接受新 HS；收满即停。
+        if let Some(max) = opts.max_count {
+            loop {
+                let empty = ctx.conns.lock().expect("连接表锁").is_empty();
+                if empty {
+                    break;
+                }
+                // 轮询兜底防 missed-notify 死锁（串行模式专属，100ms 粒度足够）。
+                let _ = tokio::time::timeout(Duration::from_millis(100), ctx.ended.notified()).await;
+            }
+            if ctx.served.load(Ordering::Relaxed) >= max {
+                return Ok(true);
+            }
+        }
+        // 重复 HS 判别与表容量检查（短锁域；await 一律在锁外——future 须 Send，
+        // 且不得让数据面路由阻塞在握手锁上）。
+        enum HsRoute {
+            Dup(u16),
+            Ignore,
+            CapFull,
+            Proceed,
+        }
+        let route = {
+            let t = ctx.conns.lock().expect("连接表锁");
+            match t.get(&h.conn) {
+                Some(e) if e.peer == src => HsRoute::Dup(e.mss),
+                Some(_) => HsRoute::Ignore, // conn 冲突（他端占用）→ 忽略
+                None if t.len() >= RUDP_CONN_CAP => HsRoute::CapFull,
+                None => HsRoute::Proceed,
+            }
+        };
+        // HS_ACK 载荷与入 HS 同形：18B 协商版带采纳 mss，16B 旧版纯 nonce 回显。
+        let ack_payload: Vec<u8> = if payload.len() == 18 {
+            let mut p = payload[..16].to_vec();
+            p.extend_from_slice(&(mss as u16).to_le_bytes());
+            p
+        } else {
+            payload.to_vec()
+        };
+        match route {
+            HsRoute::Dup(neg) => {
+                // 重复 HS（客户端重发）→ 幂等重发 HS_ACK（带建连时的协商值）。
+                let mut p = payload[..16].to_vec();
+                if neg > pw::RUDP_PAYLOAD_MAX as u16 {
+                    p.extend_from_slice(&neg.to_le_bytes());
+                }
+                if let Ok(ack) = pw::encode(pw::U_P_HS_ACK, h.conn, 0, &p) {
+                    let _ = ctx.socket.send_to(&ack, src).await;
+                }
+                return Ok(false);
+            }
+            HsRoute::Ignore => return Ok(false),
+            HsRoute::CapFull => {
+                if let Some(rst) = rst_pkt(h.conn, "连接数已达上限") {
+                    let _ = ctx.socket.send_to(&rst, src).await;
+                }
+                return Ok(false);
+            }
+            HsRoute::Proceed => {}
+        }
+        // 并发闸不在此获取：复用 `handle_conn`（TCP 入口）——0x09 加密分支与
+        // conn_precheck（IP 过滤 + 30s 闸上限）都在其内，与 TCP 语义完全一致
+        // （QUIC 入口跳过 0x09——其机密性由 TLS 承担，RUDP 无 TLS 不得复用）。
+        // 建连接并登记（短锁域，无 await；共享出口直连——省一跳 forward 任务）。
+        let (internal, stream, in_tx, _out_rx, driver) =
+            build_conn(h.conn, src, mss, Some(ctx.out_tx.clone()));
+        let _ = internal; // Arc 由 stream/驱动持有
+        {
+            let mut t = ctx.conns.lock().expect("连接表锁");
+            t.insert(
+                h.conn,
+                ConnEntry {
+                    peer: src,
+                    in_tx,
+                    mss: mss as u16,
+                },
+            );
+        }
+        // HS_ACK（回显 nonce + 采纳 mss）。
+        if let Ok(ack) = pw::encode(pw::U_P_HS_ACK, h.conn, 0, &ack_payload) {
+            let _ = ctx.socket.send_to(&ack, src).await;
+        }
+        let o2 = opts.clone();
+        let served2 = ctx.served.clone();
+        let conns2 = ctx.conns.clone();
+        let ended2 = ctx.ended.clone();
+        let stop2 = ctx.stop_tx.clone();
+        let serial_max = opts.max_count;
+        // 监督任务：帧循环（0x05 配对/0x09 加密/0x0A 能力/0x08 压缩/
+        // 分块/续传全继承 TCP）→ 驱动退出后摘表；限量模式收满即发停止信号。
+        finished.spawn(async move {
+            let _ = handle_conn(stream, src, &o2, served2.clone()).await;
+            let _ = driver.await;
+            conns2.lock().expect("连接表锁").remove(&h.conn);
+            ended2.notify_waiters();
+            // 限量模式：收满即停（demux 正阻塞在 recv_from，无人再发包时
+            // 需此信号主动唤醒退出——对齐 serve_quic_on 串行语义）。
+            if let Some(max) = serial_max {
+                if served2.load(Ordering::Relaxed) >= max {
+                    let _ = stop2.send(true);
+                }
+            }
+        });
+        return Ok(false);
+    }
+    // 数据面：按 conn_id 路由（peer 校验防串线；死连接残包/伪造 → 丢弃）。
+    let t = ctx.conns.lock().expect("连接表锁");
+    if let Some(e) = t.get(&h.conn) {
+        if e.peer == src {
+            let _ = e.in_tx.send((h.kind, h.seq, payload.to_vec()));
+        }
+    }
+    Ok(false)
+}
+
+/// 在既有 UDP socket 上服务 RUDP 连接（GUI 复用 `bind_udp` 的逐地址绑定/失败上报）。
 pub async fn serve_rudp_on(
     socket: UdpSocket,
     opts: crate::transfer::receiver::RecvOptions,
 ) -> Result<()> {
-    use crate::transfer::receiver::{cleanup_part_orphans, gate_check, handle_conn, ip_allowed};
+    use crate::transfer::receiver::cleanup_part_orphans;
     // 孤儿半成品清扫（与 TCP/QUIC/UDP 同策略 7 天）。
     cleanup_part_orphans(&opts.save_dir);
     crate::transfer::resume::cleanup_resume_orphans(&opts.save_dir);
 
     let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (out_tx, mut out_rx) = unbounded_channel::<(SocketAddr, Vec<u8>)>();
+    let (out_tx, mut out_rx) = unbounded_channel::<OutPkt>();
     // 出包任务：所有连接的编码包统一经此 socket 发出（Arc 共享，方法均取 &self）。
     let socket = Arc::new(socket);
     let send_sock = socket.clone();
@@ -976,6 +1306,15 @@ pub async fn serve_rudp_on(
     let mut finished = tokio::task::JoinSet::new();
     // 限量模式「收满即停」信号（demux 阻塞在 recv_from，无人再发包时需主动唤醒）。
     let (stop_tx, mut stop_rx) = watch::channel(false);
+    let ctx = DemuxCtx {
+        socket: socket.clone(),
+        out_tx,
+        conns: conns.clone(),
+        opts: &opts,
+        served: served.clone(),
+        ended: ended.clone(),
+        stop_tx,
+    };
     let mut buf = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
     loop {
         // 收割已结束的连接监督任务（摘表已在任务内完成）。
@@ -983,7 +1322,7 @@ pub async fn serve_rudp_on(
         // 协作让出（传输饥饿防线）：recv_from 在有积压时同步返回 Ready，
         // 循环不 await 会让 current-thread runtime 上的泵/驱动/写端全部饿死。
         tokio::task::yield_now().await;
-        let (n, src) = tokio::select! {
+        let (mut len, mut src) = tokio::select! {
             r = socket.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(e) => {
@@ -996,130 +1335,24 @@ pub async fn serve_rudp_on(
             },
             _ = stop_rx.changed() => return Ok(()),
         };
-        let Some((h, payload)) = pw::decode(&buf[..n]) else {
-            continue;
-        };
-        let opts = opts.clone();
-        if h.kind == pw::U_P_HS {
-            // 版本校验已由 pw::decode 承担（ver 不符整包忽略）；HS 载荷 = 16B nonce。
-            if payload.len() != 16 {
-                continue;
+        // 批量排空积压（性能批 2026-11-14：此前服务端每包一次阻塞 recv +
+        // 一次让出 + 一次全局表锁——与客户端泵的批量口径对齐，每批一次让出；
+        // 批内错误一律断批，持久错误由下一轮阻塞 recv 呈报）。
+        let mut m = 0usize;
+        loop {
+            if demux_one(&ctx, &mut finished, &buf[..len], src).await? {
+                return Ok(());
             }
-            // IP 过滤先于握手（对齐 quic.rs：被拒源不进任何状态机）。
-            if !ip_allowed(src.ip(), opts.ip_filter_mode, &opts.ip_filter_list) {
-                if let Some(rst) = rst_pkt(h.conn, "被 IP 过滤规则拒绝") {
-                    let _ = socket.send_to(&rst, src).await;
-                }
-                continue;
+            m += 1;
+            if m >= RUDP_BATCH_CAP {
+                break;
             }
-            // 锁定门（配对失败次数过多）。
-            if gate_check(src, &opts).await.is_err() {
-                if let Some(rst) = rst_pkt(h.conn, "配对失败次数过多，已临时锁定") {
-                    let _ = socket.send_to(&rst, src).await;
+            match socket.try_recv_from(&mut buf) {
+                Ok((l, s)) => {
+                    len = l;
+                    src = s;
                 }
-                continue;
-            }
-            // 限量模式（--count）：串行——等现有连接结束再接受新 HS；收满即停。
-            if let Some(max) = opts.max_count {
-                loop {
-                    let empty = conns.lock().expect("连接表锁").is_empty();
-                    if empty {
-                        break;
-                    }
-                    // 轮询兜底防 missed-notify 死锁（串行模式专属，100ms 粒度足够）。
-                    let _ =
-                        tokio::time::timeout(Duration::from_millis(100), ended.notified()).await;
-                }
-                if served.load(Ordering::Relaxed) >= max {
-                    return Ok(());
-                }
-            }
-            // 重复 HS 判别与表容量检查（短锁域；await 一律在锁外——future 须 Send，
-            // 且不得让数据面路由阻塞在握手锁上）。
-            enum HsRoute {
-                Dup,
-                Ignore,
-                CapFull,
-                Proceed,
-            }
-            let route = {
-                let t = conns.lock().expect("连接表锁");
-                match t.get(&h.conn) {
-                    Some(e) if e.peer == src => HsRoute::Dup,
-                    Some(_) => HsRoute::Ignore, // conn 冲突（他端占用）→ 忽略
-                    None if t.len() >= RUDP_CONN_CAP => HsRoute::CapFull,
-                    None => HsRoute::Proceed,
-                }
-            };
-            match route {
-                HsRoute::Dup => {
-                    // 重复 HS（客户端重发）→ 幂等重发 HS_ACK。
-                    if let Ok(ack) = pw::encode(pw::U_P_HS_ACK, h.conn, 0, payload) {
-                        let _ = socket.send_to(&ack, src).await;
-                    }
-                    continue;
-                }
-                HsRoute::Ignore => continue,
-                HsRoute::CapFull => {
-                    if let Some(rst) = rst_pkt(h.conn, "连接数已达上限") {
-                        let _ = socket.send_to(&rst, src).await;
-                    }
-                    continue;
-                }
-                HsRoute::Proceed => {}
-            }
-            // 并发闸不在此获取：复用 `handle_conn`（TCP 入口）——0x09 加密分支与
-            // conn_precheck（IP 过滤 + 30s 闸上限）都在其内，与 TCP 语义完全一致
-            // （QUIC 入口跳过 0x09——其机密性由 TLS 承担，UDT 无 TLS 不得复用）。
-            // 建连接并登记（短锁域，无 await）。
-            let (internal, stream, in_tx, out_rx, driver) = build_conn(h.conn, src);
-            let _ = internal; // Arc 由 stream/驱动持有
-            {
-                let mut t = conns.lock().expect("连接表锁");
-                t.insert(h.conn, ConnEntry { peer: src, in_tx });
-            }
-            // HS_ACK（回显 nonce）。
-            if let Ok(ack) = pw::encode(pw::U_P_HS_ACK, h.conn, 0, payload) {
-                let _ = socket.send_to(&ack, src).await;
-            }
-            // 连接出包 → 共享 socket 发送通道。
-            let out_fwd = out_tx.clone();
-            tokio::spawn(async move {
-                let mut rx = out_rx;
-                while let Some((dst, pkt)) = rx.recv().await {
-                    let _ = out_fwd.send((dst, pkt));
-                    // 协作让出（传输饥饿防线）。
-                    tokio::task::yield_now().await;
-                }
-            });
-            let o2 = opts.clone();
-            let served2 = served.clone();
-            let conns2 = conns.clone();
-            let ended2 = ended.clone();
-            let stop2 = stop_tx.clone();
-            let serial_max = opts.max_count;
-            // 监督任务：帧循环（0x05 配对/0x09 加密/0x0A 能力/0x08 压缩/
-            // 分块/续传全继承 TCP）→ 驱动退出后摘表；限量模式收满即发停止信号。
-            finished.spawn(async move {
-                let _ = handle_conn(stream, src, &o2, served2.clone()).await;
-                let _ = driver.await;
-                conns2.lock().expect("连接表锁").remove(&h.conn);
-                ended2.notify_waiters();
-                // 限量模式：收满即停（demux 正阻塞在 recv_from，无人再发包时
-                // 需此信号主动唤醒退出——对齐 serve_quic_on 串行语义）。
-                if let Some(max) = serial_max {
-                    if served2.load(Ordering::Relaxed) >= max {
-                        let _ = stop2.send(true);
-                    }
-                }
-            });
-            continue;
-        }
-        // 数据面：按 conn_id 路由（peer 校验防串线；死连接残包/伪造 → 丢弃）。
-        let t = conns.lock().expect("连接表锁");
-        if let Some(e) = t.get(&h.conn) {
-            if e.peer == src {
-                let _ = e.in_tx.send((h.kind, h.seq, payload.to_vec()));
+                Err(_) => break,
             }
         }
     }
@@ -1135,8 +1368,10 @@ mod tests {
     async fn pair(lossy: bool) -> (RudpStream, RudpStream) {
         let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
-        let (c_conn, cs, c_in, mut c_out, c_drv) = build_conn(1, peer_s);
-        let (s_conn, ss, s_in, mut s_out, s_drv) = build_conn(1, peer_c);
+        let (c_conn, cs, c_in, c_out, c_drv) = build_conn(1, peer_s, pw::RUDP_PAYLOAD_MAX, None);
+        let (s_conn, ss, s_in, s_out, s_drv) = build_conn(1, peer_c, pw::RUDP_PAYLOAD_MAX, None);
+        let mut c_out = c_out.expect("对偶连接持专属出包通道");
+        let mut s_out = s_out.expect("对偶连接持专属出包通道");
         // 两个独立种子的 xorshift64（确定性丢包注入，两侧互不干扰）。
         let mut seed1 = 0x1234_5678_9ABC_DEF0u64;
         let mut seed2 = 0x0FED_CBA9_8765_4321u64;
@@ -1223,8 +1458,12 @@ mod tests {
     async fn fin_ack_is_idempotent_after_first_loss() {
         let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
-        let (_c_conn, mut cs, c_in, mut c_out, _c_drv) = build_conn(1, peer_s);
-        let (_s_conn, mut ss, s_in, mut s_out, _s_drv) = build_conn(1, peer_c);
+        let (_c_conn, mut cs, c_in, c_out, _c_drv) =
+            build_conn(1, peer_s, pw::RUDP_PAYLOAD_MAX, None);
+        let (_s_conn, mut ss, s_in, s_out, _s_drv) =
+            build_conn(1, peer_c, pw::RUDP_PAYLOAD_MAX, None);
+        let mut c_out = c_out.expect("对偶连接持专属出包通道");
+        let mut s_out = s_out.expect("对偶连接持专属出包通道");
         // c_out → s_in 无损；s_out → c_in 丢弃**首个** FIN_ACK。
         tokio::spawn(async move {
             while let Some((_dst, pkt)) = c_out.recv().await {
@@ -1295,7 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_data_delivered_once_and_fin_eof() {
         let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let (_conn, mut stream, in_tx, _out, _drv) = build_conn(7, peer);
+        let (_conn, mut stream, in_tx, _out, _drv) = build_conn(7, peer, pw::RUDP_PAYLOAD_MAX, None);
         in_tx.send((pw::U_P_DATA, 0, b"he".to_vec())).unwrap();
         in_tx.send((pw::U_P_DATA, 1, b"llo".to_vec())).unwrap();
         in_tx.send((pw::U_P_DATA, 0, b"he".to_vec())).unwrap(); // 重复（ACK 丢失后重传）
@@ -1312,5 +1551,168 @@ mod tests {
             0,
             "收满 FIN 总数必须见 EOF"
         );
+    }
+
+    /// 判别（性能批 2026-11-14）：序号回绕。朴素整数比较在 u32 回绕点（4.29G
+    /// 包 ≈ 5TB@1200B）把新周期包判为旧包——接收端永久缺包、重传超限断连；
+    /// 回绕算术必须跨点续传。两侧 ISN 手工拨到 u32::MAX-5 附近强行跨点。
+    #[tokio::test]
+    async fn seq_wraparound_survives_crossing() {
+        let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let (c_conn, mut cs, c_in, c_out, _c_drv) =
+            build_conn(1, peer_s, pw::RUDP_PAYLOAD_MAX, None);
+        let (s_conn, mut ss, s_in, s_out, _s_drv) =
+            build_conn(1, peer_c, pw::RUDP_PAYLOAD_MAX, None);
+        let mut c_out = c_out.expect("出包通道");
+        let mut s_out = s_out.expect("出包通道");
+        // 拨 ISN：发送端 next_seq 与接收端 expected 同步置于回绕点前 5 包。
+        c_conn.send.lock().unwrap().next_seq = u32::MAX - 5;
+        s_conn.recv.lock().unwrap().expected = u32::MAX - 5;
+        tokio::spawn(async move {
+            while let Some((_dst, pkt)) = c_out.recv().await {
+                if let Some((h, pl)) = pw::decode(&pkt) {
+                    let _ = s_in.send((h.kind, h.seq, pl.to_vec()));
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some((_dst, pkt)) = s_out.recv().await {
+                if let Some((h, pl)) = pw::decode(&pkt) {
+                    let _ = c_in.send((h.kind, h.seq, pl.to_vec()));
+                }
+            }
+        });
+        // 30KB ≈ 26 包（1200B/包）——必跨回绕点。
+        let payload: Vec<u8> = (0..30_000u32).map(|i| (i % 253) as u8).collect();
+        cs.write_all(&payload).await.unwrap();
+        cs.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        ss.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "回绕点两侧必须逐字节一致");
+        cs.shutdown().await.unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(ss.read_to_end(&mut sink).await.unwrap(), 0, "跨回绕收尾干净");
+    }
+
+    /// 判别（性能批 2026-11-14）：SACK 空洞触发快速重传。定向丢 1 个数据包，
+    /// 旧行为只能等 RTO（初始 400ms）；SACK 快速重传在首个含空洞的 ACK 后
+    /// 立即补发。25KB 数据 + 慢速消费确保窗口未满（区分快速重传与 RTO 路径），
+    /// 总时限收紧到 250ms 判别（RTO_MIN=50ms 也兜不住持续丢 1 包的旧行为——
+    /// 丢包在窗口中段时旧路径需整窗 RTO）。
+    #[tokio::test]
+    async fn sack_hole_triggers_fast_retransmit() {
+        let peer_c: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_s: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let (c_conn, mut cs, c_in, c_out, _c_drv) =
+            build_conn(1, peer_s, pw::RUDP_PAYLOAD_MAX, None);
+        let (_s_conn, mut ss, s_in, s_out, _s_drv) =
+            build_conn(1, peer_c, pw::RUDP_PAYLOAD_MAX, None);
+        let mut c_out = c_out.expect("出包通道");
+        let mut s_out = s_out.expect("出包通道");
+        // RTO 钉在最大值：任何依赖 RTO 的恢复路径都在 3s 开外——判别只认快速重传。
+        c_conn.send.lock().unwrap().rto = Duration::from_millis(RUDP_RTO_MAX_MS);
+        tokio::spawn(async move {
+            let mut dropped = false;
+            while let Some((_dst, pkt)) = c_out.recv().await {
+                if let Some((h, _)) = pw::decode(&pkt) {
+                    // 丢第 3 个 DATA 包（一次）。
+                    if h.kind == pw::U_P_DATA && h.seq == 3 && !dropped {
+                        dropped = true;
+                        continue;
+                    }
+                }
+                if let Some((h, pl)) = pw::decode(&pkt) {
+                    let _ = s_in.send((h.kind, h.seq, pl.to_vec()));
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some((_dst, pkt)) = s_out.recv().await {
+                if let Some((h, pl)) = pw::decode(&pkt) {
+                    let _ = c_in.send((h.kind, h.seq, pl.to_vec()));
+                }
+            }
+        });
+        let payload: Vec<u8> = (0..25_000u32).map(|i| (i % 249) as u8).collect();
+        let t0 = std::time::Instant::now();
+        cs.write_all(&payload).await.unwrap();
+        cs.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        ss.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "丢 1 包必须恢复出完整流");
+        assert!(
+            t0.elapsed() < Duration::from_millis(250),
+            "恢复耗时 {:?}——SACK 快速重传未生效（RTO 已钉 3s）",
+            t0.elapsed()
+        );
+    }
+
+    /// MSS 协商回退判别：伪旧服务端对 18B 协商 HS 静默忽略、只应答 16B 旧 HS——
+    /// 客户端必须在重发窗口降级并连通；新服务端（真 serve_rudp_on）对协商 HS
+    /// 回 18B ACK 且大包传输成功。
+    #[tokio::test]
+    async fn mss_negotiation_new_server_and_legacy_fallback() {
+        use crate::transfer::receiver::RecvOptions;
+        // —— 新服务端：协商建立 + 大包（>1200B）传输 ——
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let std_sock = crate::transfer::std_udp_listener(addr).unwrap();
+        std_sock.set_nonblocking(true).unwrap();
+        let port = std_sock.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let sock = UdpSocket::from_std(std_sock).unwrap();
+            let mut o = RecvOptions::default();
+            o.save_dir = std::env::temp_dir().join("trft-rudp-mss-test");
+            let _ = std::fs::create_dir_all(&o.save_dir);
+            serve_rudp_on(sock, o).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let s = connect_rudp(format!("127.0.0.1:{port}").parse().unwrap(), None)
+            .await
+            .expect("协商握手必须成功");
+        assert_eq!(
+            s.conn.send.lock().unwrap().mss,
+            pw::RUDP_MSS_CEIL,
+            "环回新服务端必须协商到最大 mss"
+        );
+        drop(s);
+        srv.abort();
+
+        // —— 伪旧服务端：只应答 16B HS，忽略 18B ——
+        let old = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_port = old.local_addr().unwrap().port();
+        let old_task = tokio::spawn(async move {
+            let mut b = vec![0u8; pw::RUDP_DATAGRAM_MAX + 64];
+            loop {
+                let Ok((n, src)) = old.recv_from(&mut b).await else {
+                    return;
+                };
+                let Some((h, payload)) = pw::decode(&b[..n]) else {
+                    continue;
+                };
+                if h.kind == pw::U_P_HS {
+                    if payload.len() != 16 {
+                        continue; // 旧服务端对协商版 HS 静默忽略
+                    }
+                    if let Ok(ack) = pw::encode(pw::U_P_HS_ACK, h.conn, 0, payload) {
+                        let _ = old.send_to(&ack, src).await;
+                    }
+                }
+            }
+        });
+        let t0 = std::time::Instant::now();
+        let s2 = connect_rudp(format!("127.0.0.1:{old_port}").parse().unwrap(), None)
+            .await
+            .expect("降级重发后必须连通旧服务端");
+        assert!(
+            s2.conn.send.lock().unwrap().mss == pw::RUDP_PAYLOAD_MAX,
+            "旧服务端连接必须回落默认 mss"
+        );
+        assert!(
+            t0.elapsed() >= RUDP_HS_RESEND,
+            "降级应发生在首个重发窗口（实际 {:?}）",
+            t0.elapsed()
+        );
+        old_task.abort();
     }
 }
