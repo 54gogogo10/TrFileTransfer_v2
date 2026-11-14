@@ -37,6 +37,25 @@ impl SegmentCipher {
         Ok(out)
     }
 
+    /// 就地封段到 `out`（性能批 2026-11-14：布局 `[len(4)][iv][ct][tag]` 一次
+    /// 预分配，载荷仅一次拷贝 + 原地 keystream——此前 drain 收编 + ct 复制 +
+    /// sealed 拼装 + env 再拼共 4 次大拷贝/段）。`out` 追加写入（不清空）。
+    pub fn seal_into(&self, seq: u64, plaintext: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        out.reserve(4 + SEAL_OVERHEAD + plaintext.len());
+        // 长度字段 = 密文段长（iv+ct+tag，与读侧 open 的期待一致——首版误写明文长）。
+        out.extend_from_slice(&((SEAL_OVERHEAD + plaintext.len()) as u32).to_le_bytes());
+        let iv_at = out.len();
+        out.resize(out.len() + IV_LEN, 0);
+        OsRng.fill_bytes(&mut out[iv_at..iv_at + IV_LEN]);
+        let iv: [u8; IV_LEN] = out[iv_at..iv_at + IV_LEN].try_into().unwrap();
+        let ct_at = out.len();
+        out.extend_from_slice(plaintext);
+        Self::crypt(&self.aes_key, &iv, &mut out[ct_at..]);
+        let tag = self.tag(seq, &iv, &out[ct_at..]);
+        out.extend_from_slice(&tag);
+        Ok(())
+    }
+
     /// 解密一段；HMAC 先行恒时校验，篡改/乱序/截断一律失败。
     pub fn open(&self, seq: u64, sealed: &[u8]) -> Result<Vec<u8>> {
         if sealed.len() < SEAL_OVERHEAD {
@@ -87,6 +106,27 @@ mod tests {
         let msg = "你好, TrFileTransfer!".as_bytes();
         let sealed = c.seal(1, msg).unwrap();
         assert_eq!(c.open(1, &sealed).unwrap(), msg);
+    }
+
+    /// 判别（性能批 2026-11-14）：seal_into 的长度字段必须是密文段长
+    /// （iv+ct+tag），且与 seal 输出布局逐字节同构——首版误写明文长，e2e
+    /// 全线「加密段长度非法」。
+    #[test]
+    fn seal_into_layout_matches_seal() {
+        let c = cipher();
+        let msg = vec![0xABu8; 1000];
+        let mut env = Vec::new();
+        c.seal_into(7, &msg, &mut env).unwrap();
+        let len = u32::from_le_bytes(env[..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            len,
+            SEAL_OVERHEAD + msg.len(),
+            "长度字段 = 密文段长（iv+ct+tag），非明文长"
+        );
+        assert_eq!(env.len(), 4 + len);
+        // 与 seal 同构：剥掉 4B 长度头后 open 成功且还原。
+        let pt = c.open(7, &env[4..]).unwrap();
+        assert_eq!(pt, msg);
     }
 
     #[test]

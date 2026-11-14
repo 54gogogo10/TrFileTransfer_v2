@@ -14,7 +14,7 @@ use crate::protocol::frame::{
     T_SINGLE_FILE, T_TEXT,
 };
 use crate::protocol::io::{
-    read_n, read_u8, write_all, write_str_u16, write_u32, write_u64, write_u8,
+    read_n, read_u8, read_u8_long, write_all, write_str_u16, write_u32, write_u64, write_u8,
 };
 use crate::transfer::compress::Compressed;
 use crate::transfer::encrypted;
@@ -106,12 +106,24 @@ pub struct StackPlan {
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) async fn connect(addr: SocketAddr, src_port: Option<u16>) -> Result<TcpStream> {
+    // 收/发缓冲 4MB（规格 §6.2；§7.16 登记项闭环——Windows 默认 ~64KB 在
+    // 高 BDP 链路把发送窗钉在 64KB/RTT（30ms ≈ 2.1MB/s），环回也把 256KB
+    // 密文信封切成 4+ 次部分写）。失败仅告警（与 UDP 侧同口径）。
+    const TCP_BUF: usize = 4 * 1024 * 1024;
+    let tune = |s: &TcpStream| {
+        let _ = s.set_nodelay(true);
+        let sock = socket2::SockRef::from(s);
+        let _ = sock.set_recv_buffer_size(TCP_BUF);
+        let _ = sock.set_send_buffer_size(TCP_BUF);
+    };
     match src_port {
-        None => Ok(
-            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        None => {
+            let s = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
                 .await
-                .map_err(|_| proto("连接超时（10s）"))??,
-        ),
+                .map_err(|_| proto("连接超时（10s）"))??;
+            tune(&s);
+            Ok(s)
+        }
         Some(port) => {
             let local = SocketAddr::new(
                 if addr.is_ipv4() {
@@ -127,9 +139,11 @@ pub(crate) async fn connect(addr: SocketAddr, src_port: Option<u16>) -> Result<T
                 TcpSocket::new_v6()?
             };
             sock.bind(local)?;
-            Ok(tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(addr))
+            let s = tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(addr))
                 .await
-                .map_err(|_| proto("连接超时（10s）"))??)
+                .map_err(|_| proto("连接超时（10s）"))??;
+            tune(&s);
+            Ok(s)
         }
     }
 }
@@ -342,8 +356,9 @@ where
     }
     s.write_all(&dig.finalize()).await?;
 
-    // 完成确认：接收端权威，结果未知 ≠ 成功。
-    let st = read_u8(s).await?;
+    // 完成确认：接收端权威，结果未知 ≠ 成功。长窗（300s）——接收端回执前
+    // 可能做 fsync + Skip 策略全文件重哈希（慢介质冷缓存可达数十秒）。
+    let st = read_u8_long(s).await?;
     let _ = s.shutdown().await; // 干净收尾：让对端读到 EOF 而非连接重置
     if st != STATUS_OK {
         return Err(Error::Rejected("接收端拒绝了本次传输".into()));
@@ -362,7 +377,7 @@ where
     write_u8(s, T_TEXT).await?;
     write_u32(s, bytes.len() as u32).await?;
     write_all(s, bytes).await?;
-    let st = read_u8(s).await?;
+    let st = read_u8_long(s).await?;
     let _ = s.shutdown().await;
     if st != STATUS_OK {
         return Err(Error::Rejected("对端拒绝接收文本消息".into()));

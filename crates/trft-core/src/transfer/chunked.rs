@@ -18,7 +18,7 @@ use crate::protocol::frame::{
 };
 use crate::protocol::io::{
     read_exact_long, read_n, read_str_u16, read_u32, read_u64, read_u8, read_u8_long, write_all,
-    write_str_u16, write_u32, write_u64, write_u8,
+    write_u32, write_u64, write_u8,
 };
 use crate::transfer::receiver::{publish_part, RecvOptions};
 use crate::transfer::resume;
@@ -536,6 +536,8 @@ pub(crate) fn complement_of(ranges: &[(u64, u64)], size: u64) -> Vec<(u64, u64)>
 }
 
 /// 单连接发送一组连续区间的全部块 + 收尾判决字节。
+/// `lim` = 组级共享限速桶（轮 3 修复：每连接独立桶会让 N 连接并发 = N× 限额，
+/// 与「按面板限速」的独立客户端口径不符——§7.8 已登记每连接一桶语义，本批收敛）。
 async fn send_chunks_conn(
     mut s: BoxStream,
     gid: [u8; 16],
@@ -543,26 +545,34 @@ async fn send_chunks_conn(
     size: u64,
     ranges: &[(u64, u64)],
     path: &Path,
-    speed_limit_bps: u64,
+    lim: &tokio::sync::Mutex<TokenBucket>,
     report: Option<&crate::progress::Reporter>,
 ) -> Result<u8> {
     let mut f = tokio::fs::File::open(path).await?;
-    let mut lim = TokenBucket::new(speed_limit_bps);
     let mut buf = vec![0u8; CHUNK];
+    // 帧头一次拼装（性能批：逐字段 write 经加密层各自成独立密文段——
+    // 每块多 6 次 syscall 与 6 次 HMAC 初始化）。
+    let mut hdr = Vec::with_capacity(1 + 16 + 8 + 8 + 2 + name.len() + 4);
+    hdr.push(T_CHUNKED);
+    hdr.extend_from_slice(&gid);
+    hdr.extend_from_slice(&0u64.to_le_bytes()); // pos 占位（每块重写）
+    hdr.extend_from_slice(&size.to_le_bytes());
+    hdr.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    hdr.extend_from_slice(name.as_bytes());
+    hdr.extend_from_slice(&0u32.to_le_bytes()); // len 占位（每块重写）
+    let len_at = hdr.len() - 4;
+    let pos_at = 1 + 16;
     for &(start, end) in ranges {
         f.seek(SeekFrom::Start(start)).await?;
         let mut pos = start;
         while pos < end {
             let want = (CHUNK as u64).min(end - pos) as usize;
             f.read_exact(&mut buf[..want]).await?;
-            // 所有分块（含最后一块）都必须过限速（规格 §3.1）。
-            lim.acquire(want as u64).await;
-            write_u8(&mut s, T_CHUNKED).await?;
-            write_all(&mut s, &gid).await?;
-            write_u64(&mut s, pos).await?;
-            write_u64(&mut s, size).await?;
-            write_str_u16(&mut s, name).await?;
-            write_u32(&mut s, want as u32).await?;
+            // 所有分块（含最后一块）都必须过限速（规格 §3.1）——组级桶。
+            lim.lock().await.acquire(want as u64).await;
+            hdr[pos_at..pos_at + 8].copy_from_slice(&pos.to_le_bytes());
+            hdr[len_at..len_at + 4].copy_from_slice(&(want as u32).to_le_bytes());
+            write_all(&mut s, &hdr).await?;
             write_all(&mut s, &buf[..want]).await?;
             if let Some(r) = report {
                 r.add(want as u64);
@@ -633,6 +643,10 @@ pub async fn send_file_chunked(
     // 此前 tokio::spawn 的游离句柄在取消后继续把文件传完（取消语义失效）。
     let mut set = tokio::task::JoinSet::new();
     let mut first_conn = Some(s0); // 探询连接复用为首个发送连接
+    // 组级共享限速桶（聚合上限 = 面板限额，非 N×）。
+    let lim = std::sync::Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
+        opts.speed_limit_bps,
+    )));
     for r in ranges.iter() {
         let s_conn = match first_conn.take() {
             Some(s) => s,
@@ -640,6 +654,7 @@ pub async fn send_file_chunked(
         };
         let (gid2, name3, path3, opts3) = (gid, name2.clone(), path2.clone(), opts2.clone());
         let range = *r;
+        let lim2 = lim.clone();
         set.spawn(async move {
             let rep = opts3.progress.clone();
             send_chunks_conn(
@@ -649,7 +664,7 @@ pub async fn send_file_chunked(
                 size,
                 &[range],
                 &path3,
-                opts3.speed_limit_bps,
+                &lim2,
                 rep.as_ref(),
             )
             .await
@@ -759,7 +774,7 @@ async fn send_complement(
         size,
         &complement,
         path,
-        opts.speed_limit_bps,
+        &tokio::sync::Mutex::new(TokenBucket::new(opts.speed_limit_bps)),
         opts.progress.as_ref(),
     )
     .await?;

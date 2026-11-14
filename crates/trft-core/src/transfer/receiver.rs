@@ -495,6 +495,17 @@ pub fn cleanup_part_orphans(dir: &Path) {
     walk(dir, 0);
 }
 
+/// accepted socket 调优：TCP_NODELAY（服务端小写——状态/能力/盐——在 Nagle +
+/// 对端延迟 ACK 交互下可迟到 ~40-200ms，文件夹多小文件逐文件放大）+ 收/发
+/// 缓冲 4MB（规格 §6.2；发送侧 `sender::connect` 同口径——Linux accepted
+/// socket 不继承 listener 选项，逐连接设最稳；失败仅忽略）。
+fn tune_tcp(s: &tokio::net::TcpStream) {
+    let _ = s.set_nodelay(true);
+    let sock = socket2::SockRef::from(s);
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+}
+
 pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
     cleanup_part_orphans(&opts.save_dir);
     resume::cleanup_resume_orphans(&opts.save_dir);
@@ -508,6 +519,7 @@ pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
             }
             match listener.accept().await {
                 Ok((s, peer)) => {
+                    tune_tcp(&s);
                     if let Err(e) = handle_conn(s, peer, &opts, served.clone()).await {
                         eprintln!("[连接失败] {e}");
                     }
@@ -523,6 +535,7 @@ pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
                     Ok((stream, peer)) => {
                         // 收割已完成任务（轮 5 P2-3 组：JoinSet 完成条目驻留
                         // ~190B/连接——仅 accept 出错分支 join 的话万级连接 ≈ 2MB）。
+                        tune_tcp(&stream);
                         while set.try_join_next().is_some() {}
                         let o = opts.clone();
                         let counter = served.clone();

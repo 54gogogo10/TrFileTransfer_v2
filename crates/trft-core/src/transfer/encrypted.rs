@@ -160,7 +160,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for Encrypted<S> {
                 if len < 32 || len > MAX_SEGMENT {
                     return Poll::Ready(Err(std::io::Error::other("加密段长度非法")));
                 }
-                *sealed = vec![0u8; len];
+                // 容量复用（clear+resize 保容量——每段 256KB 分配归零；memset 便宜）。
+                sealed.clear();
+                sealed.resize(len, 0);
                 *sealed_pos = 0;
             }
             while *sealed_pos < sealed.len() {
@@ -186,9 +188,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for Encrypted<S> {
             *recv_seq += 1;
             *header_pos = 0;
             // 段消费完毕：清空 sealed 回到「读新头」状态，否则下一次循环会用
-            // 旧段长度继续读体，造成段错位（HMAC 失败）。
+            // 旧段长度继续读体，造成段错位（HMAC 失败）。clear 保容量（复用）。
             *sealed_pos = 0;
-            *sealed = Vec::new();
+            sealed.clear();
             *plain = pt;
             *plain_pos = 0;
         }
@@ -211,7 +213,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Encrypted<S> {
             ..
         } = this;
         // write_all 契约：Pending 后以同一 buf 重试。首次进入时把输入收进
-        // 状态机，之后按 256KB 分段依次封段写出。
+        // 状态机，之后按 256KB 分段依次封段写出（seal_into 一次预分配整个信封
+        // ——每段仅一次载荷拷贝 + 原地 keystream）。
         if pending_in.is_none() && pending.is_none() {
             *pending_in = Some(buf.to_vec());
         }
@@ -237,14 +240,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Encrypted<S> {
             match pending_in.as_mut() {
                 Some(rest) if !rest.is_empty() => {
                     let take = rest.len().min(SEGMENT_PLAIN);
-                    let chunk: Vec<u8> = rest.drain(..take).collect();
-                    let sealed = send
-                        .seal(*send_seq, &chunk)
+                    let mut env = Vec::with_capacity(4 + 32 + take);
+                    send.seal_into(*send_seq, &rest[..take], &mut env)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    rest.drain(..take);
                     *send_seq += 1;
-                    let mut env = Vec::with_capacity(4 + sealed.len());
-                    env.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
-                    env.extend_from_slice(&sealed);
                     let mut pos = 0usize;
                     while pos < env.len() {
                         match Pin::new(&mut *inner).poll_write(cx, &env[pos..]) {

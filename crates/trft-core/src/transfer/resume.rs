@@ -684,7 +684,7 @@ async fn send_resume_once(
                 remaining -= want as u64;
             }
             write_all(&mut s, &claimed).await?;
-            let st = read_u8(&mut s).await?;
+            let st = read_u8_long(&mut s).await?;
             let _ = s.shutdown().await;
             if st != STATUS_OK {
                 return Err(Error::Rejected("接收端拒绝了本次传输".into()));
