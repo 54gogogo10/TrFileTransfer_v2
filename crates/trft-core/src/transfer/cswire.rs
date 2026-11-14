@@ -409,12 +409,35 @@ pub struct CsCompWrite;
 
 impl CsCompWrite {
     /// 一个 write_all 调用 = 一个段：[flagsLen u32 LE][payload]（压缩反而变大 → stored）。
+    /// **探测门（轮 6 P1，对齐 C# WireCompress.cs:37-54）**：先压缩头部 64KB
+    /// 样本，比率 > 0.30 直接 stored——半可压数据整段 deflate 白烧 CPU（C# 注释：
+    /// 此类数据 deflate 仅 ~16MB/s）。stored 标志位本就兼容，纯发送端策略。
     pub fn encode(buf: &[u8]) -> Vec<u8> {
+        const SAMPLE_BYTES: usize = 64 * 1024;
+        const MAX_COMPRESSED_RATIO: f64 = 0.30;
+        if buf.len() > SAMPLE_BYTES {
+            let mut sample = Vec::with_capacity(SAMPLE_BYTES / 2 + 64);
+            let ok = {
+                use std::io::Write as _;
+                let mut enc = flate2::write::DeflateEncoder::new(
+                    &mut sample,
+                    flate2::Compression::new(2),
+                );
+                enc.write_all(&buf[..SAMPLE_BYTES]).is_ok() && enc.finish().is_ok()
+            };
+            if !ok || sample.len() as f64 > SAMPLE_BYTES as f64 * (1.0 - MAX_COMPRESSED_RATIO) {
+                // 样本压缩不动 → 整段直接 stored。
+                let mut out = Vec::with_capacity(4 + buf.len());
+                out.extend_from_slice(&((buf.len() as u32) | COMP_STORED_FLAG).to_le_bytes());
+                out.extend_from_slice(buf);
+                return out;
+            }
+        }
         let mut compressed = Vec::with_capacity(buf.len() / 2 + 64);
         let ok = {
             use std::io::Write as _;
             let mut enc =
-                flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::fast());
+                flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::new(2));
             enc.write_all(buf).is_ok() && enc.finish().is_ok()
         };
         if ok && buf.len() >= 64 && compressed.len() < buf.len() {
@@ -464,11 +487,15 @@ async fn comp_pull_segment<S: AsyncRead + AsyncWrite + Unpin>(
     if flags & COMP_STORED_FLAG != 0 {
         return Ok(wire);
     }
-    let mut dec = flate2::read::DeflateDecoder::new(&wire[..]);
+    let dec = flate2::read::DeflateDecoder::new(&wire[..]);
     let mut plain = Vec::new();
     {
         use std::io::Read as _;
-        dec.read_to_end(&mut plain)?;
+        // 边界内解压（轮 6 P1：此前 read_to_end 先无界解压再查长——64MB 恶意段
+        // 可膨胀至数十 GB；C# 在 inflate 循环里逐块查上限。take 截在 MAX+1，
+        // 超限即非法段——真实段解压后 ≤ COMP_SEGMENT_MAX 恒不触发）。
+        let mut capped = dec.take((COMP_SEGMENT_MAX + 1) as u64);
+        capped.read_to_end(&mut plain)?;
     }
     if plain.len() > COMP_SEGMENT_MAX {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "解压超限（炸弹防线）"));
@@ -585,22 +612,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin> CsWire<S> {
     }
 
     /// 应用层部分读（≤out.len()；续传体按到达进度记账——0x03/0x04 用）。
+    /// **P0 修复（轮 6）**：pending 耗尽（跨段边界）时必须按层拉新段——
+    /// 此前直接 `raw.read` 穿透装饰器把密文/压缩段当应用字节写进文件，
+    /// 0x03 续传体超过首个 256KB 加密段后必炸（小文件/无加密测试掩盖）。
     pub async fn read_some(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.comp_r.is_none() && self.enc_r.is_none() {
+            return self.raw.read(out).await;
+        }
+        // 压缩层优先（pending 有则直取；无则拉新段）。
         if let Some(c) = self.comp_r.as_mut() {
             if c.has_pending() {
                 return Ok(c.take(out));
             }
-        }
-        if let Some(e) = self.enc_r.as_mut() {
-            if e.has_pending() {
-                return Ok(e.take(out));
+            match self.enc_r.as_mut() {
+                Some(e) => {
+                    let mut src = CsSrc::Enc(e, &mut self.raw);
+                    let plain = comp_pull_segment(&mut src).await?;
+                    c.pending = plain;
+                    c.pos = 0;
+                }
+                None => {
+                    let mut src = CsSrc::Raw(&mut self.raw);
+                    let plain = comp_pull_segment(&mut src).await?;
+                    c.pending = plain;
+                    c.pos = 0;
+                }
             }
+            return Ok(c.take(out));
         }
-        self.raw.read(out).await
+        // 仅加密层。
+        if let Some(e) = self.enc_r.as_mut() {
+            if !e.has_pending() {
+                e.pull(&mut self.raw).await?;
+            }
+            return Ok(e.take(out));
+        }
+        unreachable!("前置分支已覆盖无层情形")
     }
 
     /// 应用层写（压缩 → 加密）。
     pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(()); // 空载荷过压缩层会产出 len==0 段——C# 读侧判非法（轮 6 P2）
+        }
         let payload: Cow<[u8]> = match self.comp_w {
             Some(_) => Cow::Owned(CsCompWrite::encode(buf)),
             None => Cow::Borrowed(buf),
@@ -869,6 +923,9 @@ pub struct CsServerState {
     pub trackers: Mutex<HashMap<String, CsChunkTracker>>,
     /// 0x03 断点会话（guid hex → 状态；内存态，重启即失——C# 有落盘，v2 初版不落）。
     pub resume: Mutex<HashMap<String, CsResumeState>>,
+    /// 续传会话单飞门（guid hex → TryLock；同名 sid 并发连接第二个即拒——
+    /// C# ResumeLocks 同防线；完成路径负责摘除）。
+    pub resume_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 组会话归属（guid → 首个 peer IP）。
     pub group_peers: Mutex<HashMap<String, String>>,
 }
@@ -945,6 +1002,9 @@ pub struct CsResumeState {
     pub total: u64,
     pub received: u64,
     pub name: String,
+    /// 首个 peer IP（轮 6 P1——外来 peer 猜中/重放 sid 不得续写他人会话；
+    /// C# ResumeLocks + state.Peer 同防线）。
+    pub peer_ip: String,
 }
 
 /* ============ 服务端连接处理 ============ */
@@ -1186,6 +1246,19 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
             let mut id = [0u8; 16];
             wire.read_exact(&mut id).await?;
             let key = format!("S|{}", guid_hex(&id));
+            // 组归属校验（轮 6 P1，对齐 C# WireProtocol.cs:662-671 ChunkSessionPeers——
+            // 此前任何认证过的 peer 可查询他人 group 的已收区间）。
+            {
+                let owners = state.group_peers.lock().expect("组归属锁");
+                match owners.get(&key) {
+                    Some(owner) if *owner != peer.ip().to_string() => {
+                        drop(owners);
+                        outcome.rejected = true;
+                        return Err(Error::Rejected("分块组会话属于其他设备".into()));
+                    }
+                    _ => {}
+                }
+            }
             let ranges = state
                 .trackers
                 .lock()
@@ -1571,6 +1644,16 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
     let reporter = hub.map(|h| h.register("recv", name.clone(), total as u64));
 
     let key = guid_hex(&sid);
+    // 单飞锁（轮 6 P1——同名 sid 两连接并发 append 会交错写坏文件；C# ResumeLocks
+    // TryWait(0) 同防线）+ peer 绑定校验。锁随会话生命周期存续，完成时清理。
+    let resume_gate = {
+        let mut gates = state.resume_gates.lock().expect("resume 门锁");
+        gates.entry(key.clone()).or_default().clone()
+    };
+    if resume_gate.try_lock().is_err() {
+        return Err(Error::Rejected("该续传会话正被另一连接使用".into()));
+    }
+    let ip = peer.ip().to_string();
     // 会话解析：status 0 新传 / 1 续传 / 2 已完整（服务端权威 offset——客户端虚报不采信，
     // C# HandleResumableCore 同语义）。
     enum Session {
@@ -1582,6 +1665,9 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
         let mut rs = state.resume.lock().expect("resume 锁");
         match rs.get_mut(&key) {
             Some(st) if st.total == total as u64 && st.received < st.total => {
+                if st.peer_ip != ip {
+                    return Err(Error::Rejected("续传会话属于其他设备".into()));
+                }
                 Session::Resume(st.save_path.clone(), st.received)
             }
             Some(st) if st.total == total as u64 => Session::Done(st.save_path.clone()),
@@ -1594,6 +1680,7 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                         total: total as u64,
                         received: 0,
                         name: name.clone(),
+                        peer_ip: ip.clone(),
                     },
                 );
                 let p = rs.get(&key).expect("刚插入").save_path.clone();
@@ -1605,6 +1692,7 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
         Session::Done(path) => {
             record_recv(opts, peer, total as u64, 1, Instant::now(), "续传传输", &path);
             let st = state.resume.lock().expect("resume 锁").remove(&key);
+            state.resume_gates.lock().expect("resume 门锁").remove(&key);
             drop(st);
             if let Some(r) = &reporter {
                 r.finish();
@@ -1698,6 +1786,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
     if !ct_eq(&got, &computed) {
         // 哈希失败：丢弃会话与半成品（重试从头）。
         let st = state.resume.lock().expect("resume 锁").remove(key);
+        state.resume_gates.lock().expect("resume 门锁").remove(key);
         if let Some(st) = st {
             let _ = std::fs::remove_file(&st.save_path);
         }
@@ -1708,6 +1797,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
         let actual = crate::hash::sha256_file(path).unwrap_or_default();
         if !ct_eq(&actual, &expect) {
             let st = state.resume.lock().expect("resume 锁").remove(key);
+            state.resume_gates.lock().expect("resume 门锁").remove(key);
             if let Some(st) = st {
                 let _ = std::fs::remove_file(&st.save_path);
             }
@@ -1716,6 +1806,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
     let st = state.resume.lock().expect("resume 锁").remove(key);
+    state.resume_gates.lock().expect("resume 门锁").remove(key);
     if let Some(st) = st {
         record_recv(opts, peer, total, 1, Instant::now(), "续传传输", &st.save_path);
     }

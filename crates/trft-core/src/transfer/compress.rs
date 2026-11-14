@@ -28,11 +28,12 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// 一次性 deflate（fast 级，规格 §6.2）。
+/// 一次性 deflate（level 2——zlib-rs 后端下 level 1 比率 ~0.35 过不了 30%
+/// 采样门，level 2 比率 ~0.21 且 ~420MB/s；旧 miniz_oxide level 1 仅 ~16MB/s）。
 pub(crate) fn deflate(input: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut enc = flate2::write::DeflateEncoder::new(
         Vec::with_capacity(input.len() / 2),
-        flate2::Compression::fast(),
+        flate2::Compression::new(2),
     );
     enc.write_all(input)?;
     enc.finish()

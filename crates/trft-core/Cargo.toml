@@ -30,7 +30,9 @@ socket2 = "0.6"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
-flate2 = "1.1.10"
+# zlib-rs 后端（轮 6 P1：miniz_oxide 纯 Rust 慢速 deflate 是 80MB 压缩路径
+# 8.3s 的主因——zlib-rs 压缩吞吐典型 3-5×，纯 Rust 无 cmake 依赖，线格式不变）。
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize", "alloc"] }
 webpki-roots = "1.0.11"

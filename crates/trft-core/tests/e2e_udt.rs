@@ -353,6 +353,105 @@ async fn cs_dialect_resume_0x03_continues() {
     );
 }
 
+/// 判别（轮 6 P0）：**加密栈**下 0x03 续传体跨 256KB 加密段边界。
+/// `read_some` 在段间 pending 耗尽时旧实现直接 `raw.read` 穿透装饰器把
+/// 密文当应用字节写盘——第二连接补发体 >256KB（首个加密段边界）后必炸
+/// （增量哈希失配）。无加密/小文件测试掩盖了它。去修复必红。
+#[tokio::test]
+async fn cs_dialect_resume_encrypted_crosses_segment_boundary() {
+    use sha2::Digest;
+    use trft_core::transfer::cswire::{F_RESUME, R_RESUME};
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let (sock, addr) = ephemeral_udp().await;
+    let server = tokio::spawn(serve_udt_on(sock, common::opts_resident(out.clone(), Some("135790"))));
+
+    let total: usize = 600_000;
+    let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let full_hash: [u8; 32] = {
+        let mut h = sha2::Sha256::new();
+        h.update(&payload);
+        h.finalize().into()
+    };
+    let name = "res_enc.bin";
+    let session: [u8; 16] = [0x88; 16];
+    let half = (total / 2) as u64; // 300KB > 256KB 首段界
+
+    let client_opts = SendOptions {
+        transport: Transport::Udt,
+        pairing_code: Some("135790".into()),
+        encrypt: true,
+        ..Default::default()
+    };
+    // 连接一：加密声明 + 发前一半，断开。
+    {
+        let (mut wire, _) =
+            trft_core::transfer::cswire::cs_connect_stack_full(addr, &client_opts, 0)
+                .await
+                .unwrap();
+        assert!(wire.encrypted(), "前奏必须建立加密层");
+        let mut header = Vec::new();
+        header.push(F_RESUME);
+        header.extend_from_slice(&session);
+        header.extend_from_slice(&(total as i64).to_le_bytes());
+        header.extend_from_slice(&(0i64).to_le_bytes());
+        header.extend_from_slice(&(name.len() as i32).to_le_bytes());
+        header.extend_from_slice(name.as_bytes());
+        header.push(0); // verifyFlag=0
+        wire.write_all(&header).await.unwrap();
+        let mut resp = [0u8; 10];
+        wire.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], R_RESUME);
+        assert_eq!(resp[9], 0);
+        wire.write_all(&payload[..half as usize]).await.unwrap();
+        drop(wire); // 不发尾哈希——模拟中断
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // 连接二：加密续传——补发体 300KB **跨段**。
+    {
+        let (mut wire, _) =
+            trft_core::transfer::cswire::cs_connect_stack_full(addr, &client_opts, 0)
+                .await
+                .unwrap();
+        let mut header = Vec::new();
+        header.push(F_RESUME);
+        header.extend_from_slice(&session);
+        header.extend_from_slice(&(total as i64).to_le_bytes());
+        header.extend_from_slice(&(half as i64).to_le_bytes());
+        header.extend_from_slice(&(name.len() as i32).to_le_bytes());
+        header.extend_from_slice(name.as_bytes());
+        header.push(0);
+        wire.write_all(&header).await.unwrap();
+        let mut resp = [0u8; 10];
+        wire.read_exact(&mut resp).await.unwrap();
+        let from = i64::from_le_bytes(resp[1..9].try_into().unwrap());
+        assert_eq!(from, half as i64, "服务端权威续点");
+        assert_eq!(resp[9], 1, "status 1 = 续传");
+        wire.write_all(&payload[half as usize..]).await.unwrap();
+        let increment_hash: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update(&payload[half as usize..]);
+            h.finalize().into()
+        };
+        wire.write_all(&increment_hash).await.unwrap();
+        let mut fin = [0u8; 10];
+        wire.read_exact(&mut fin).await.unwrap();
+        assert_eq!(fin[0], R_RESUME);
+        assert_eq!(fin[9], 2, "终态 status 2（跨段哈希必须通过）");
+        let _ = wire.shutdown().await;
+    }
+    // 服务端处理完第二条连接（落盘即状态——abort 前给处理时间，与明文 resume 同口径）。
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    server.abort();
+    assert_eq!(
+        sha256_file(&out.join(name)).unwrap(),
+        full_hash,
+        "加密续传跨段后必须逐字节一致"
+    );
+}
+
 /* ============ 版本门（握手层 fail-closed） ============ */
 
 /// 服务端对版本/类型不符的握手回 1002 拒绝（libudt listen 语义）。

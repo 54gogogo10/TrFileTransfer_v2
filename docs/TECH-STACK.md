@@ -328,6 +328,13 @@
    - **实测**：单向 UDP 环回 13-16 → **34.5-34.8 MB/s（2.2×）**——进一步上限受 1200B 包长 + 逐包 syscall 硬顶约束（~100-200MB/s 需 sendmmsg/GSO，Windows 无批量 UDP 发送 API 可走，登记为平台约束）；C# 互通矩阵 **14/14**（首次跑 13/14 系环境端口抖动自愈）；全量 **269 绿 0 告警**；
    - **登记接受**：END 全丢（6 帧）→ TTL 600s 删半成品，无回传链路无补救（既有设计，多轮重发下概率可忽略）；抑制窗口内同键新文件误抑制（mtime 纳秒粒度概率趋零）。
 
+39. **性能优化 8 轮计划·轮 6（cswire C# 方言应用层）**（2026-11-15）：
+   - **P0 正确性缺陷**：`CsWire::read_some` 在装饰器 pending 耗尽（跨段边界）时直接 `raw.read` 穿透加密/压缩层——0x03 续传体超过首个 256KB 加密段后**密文直写文件**、增量哈希必挂（无加密/小文件测试掩盖；80MB 断点续传必炸）。修复为按层拉段（与 read_exact 共用分支逻辑）；判别 e2e `cs_dialect_resume_encrypted_crosses_segment_boundary`（加密 0x03 续传体 300KB 跨段——**A/B 实证旧代码必红**：服务端权威续点 300056 = 密文垃圾混入）；
+   - **压缩双杠杆（80MB 压缩路径 v2→C# 8.3s → 0.44s，178-180 MB/s——比明文 142-151 还快）**：① flate2 后端 miniz_oxide → **zlib-rs**（纯 Rust 无 cmake；level 1 比率 0.35 过不了 30% 采样门——定档 **level 2：比率 0.21 + 419MB/s**，比旧后端 ~16MB/s 快 ~25×）；② `CsCompWrite::encode` 补 C# 同款**探测门**（64KB 样本比率 >0.70 → 整段 stored——随机数据零 deflate 开销；WireCompress.cs:37-54 同款）；cswire/compress 两处编码器同步 level 2；
+   - **防线补齐**：解压 `Take(MAX+1)` 边界内解压（此前 read_to_end 先无界解压再查长——64MB 恶意段可膨胀数十 GB；C# 同款逐块查上限）；0x0B 覆盖查询补组归属校验（`group_peers`——此前任何认证 peer 可查询他人组；C# ChunkSessionPeers 同防线）；0x03 续传单飞门（`resume_gates` TryLock——同名 sid 并发连接交错写坏文件）+ peer IP 绑定（外来 peer 重放 sid 不得续写他人会话；C# ResumeLocks+state.Peer 同防线；四处会话终结路径同步摘门）；空 write_all 过压缩层产出 len==0 段的防御；
+   - **实测**：真机 C# 矩阵 **14/14**；全量 **270 绿 0 告警**（+1 跨段判别）；全协议基准无回归（TCP 198 / QUIC 186 / RUDP 247 / UDT 180 / UDP 34.8）；
+   - **登记接受**：压缩接收侧 64KB 粒度临时分配、async 线程内同步盘写（量级非主因，留 R7 权衡）；0x04 接收侧无摘要缓存（重复同步整盘重读——与 C# FileHashes 对齐属独立批次）；0x0A 旧对端（<2.12）回退缺失；run_interop 的 8s 场景计时含 harness 固定等待（stop_receiver 6s 超时 + SHA 验证）——真实 send 耗时以 bench_real/A-B 口径为准。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |
