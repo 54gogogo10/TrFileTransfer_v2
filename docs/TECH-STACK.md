@@ -359,7 +359,7 @@
    - **回归修复 ×2**：① **UDT 客户端泵泄漏**（轮 2 批量化时删掉了 select+sleep 兜底）——连接专属 socket 上对端静默后阻塞 recv_from 永不醒，GUI 长驻每连接泄漏任务+socket；恢复 100ms 兜底唤醒；② **RUDP 驱动收尾误判**（轮 1）——对端正常关闭（FIN 已到/数据尚在缓冲）被当成「通道异常中断」报 ConnectionReset；clean 判定补 `eof_seen || fin_flag`；
    - **背压牵出的两个引擎级修复**（判别测试 66s 慢恢复暴露）：① **「重传超限」判据改无进展时长**——`retries > 12` 且 **`last_progress`（最近 cum 推进）超 (MAX+1)×RTO** 才断连（背压丢弃不是丢包，ACK 推进即复位；真丢包无推进保持原语义）；scan 超限块 `continue` 不断批；② **RTT 采样背压滞留守卫**——ACK 语义=投递确认，慢读者样本含对端缓冲滞留（秒级），采了把 RTO 推到 3s 上限（恢复每轮 3s，66s 实测）；样本 >4×srtt+200ms 判滞留不采；③ **重发限流**——每轮 scan 最旧优先取 64 块（此前全量到期重发 = 洪水，每块 129 轮实测）；
    - **验证**：全量 **272 绿 0 告警**（+1 背压判别）；RUDP 环回 **255.7 MB/s**（无回归）、UDT 163 / TCP 177（日内波动区间）；真机 C# 矩阵 **14/14**；
-   - **登记接受**：cipher `open` 的 ct 拷贝（返回值语义最少一次，~0.4% CPU）；compress RAW 模式 `input.to_vec()`（~0.8%；零拷贝需状态机双段写改造）；compress 同步 deflate 阻塞 executor（zlib-rs level 2 下 1MB 段 2.4ms、64MB 理论上限 128ms——C# 客户端大段接收侧可感知非灾难）；RUDP scan O(inflight) 每 25ms（1024 窗口 × 256 连接 = 26 万次/25ms 可接受，扩窗需堆化）；RUDP 客户端泵 100ms sleep 定时器每批重建（对偶量级可忽略）。
+   - **登记接受**：cipher `open` 的 ct 拷贝（返回值语义最少一次，~0.4% CPU）；compress RAW 模式 `input.to_vec()`（~0.8%；零拷贝需状态机双段写改造）；compress 同步 deflate 阻塞 executor（zlib-rs level 2 下 1MB 段 2.4ms、64MB 理论上限 128ms——C# 客户端大段接收侧可感知非灾难）；RUDP scan O(inflight) 每 25ms（1024 窗口 × 256 连接 = 26 万次/25ms 可接受，扩窗需堆化）；RUDP 客户端泵 100ms sleep 定时器每批重建（对偶量级可忽略）；Encrypted 写侧 `buf.to_vec()` 收编（input_pos 游标替代可消，1MiB CHUNK 每调用一次非每段）；RUDP 窗口配置化 + 服务端全局在途字节闸（当前固定 1024 满足 LAN 28MB/s@50ms，扩窗场景再开）；UDT/RUDP 服务端连接表 Mutex→RwLock（读多写少，单连接无争用）；0x03 去重捷径（C# fullHash+同盘文件直接回 status 2——v2 需扩展应答语义，收益场景窄）。
 
 ## 8. 记录在案的否决项
 
