@@ -172,14 +172,56 @@ fn trft_transport_config(loopback: bool) -> Arc<quinn::TransportConfig> {
     Arc::new(tc)
 }
 
+/// 证书持久化文件名（`persist_dir` 下；DER + PKCS8 各一）。
+const CERT_FILE: &str = "quic-cert.der";
+const KEY_FILE: &str = "quic-key.pk8";
+
 /// 创建 QUIC 服务端 endpoint（运行时生成自签证书）。
+/// `persist_dir`：Some 时证书持久化到该目录（轮 9——`--pin` 钉扎与 0x0D
+/// 绑定的身份随重启漂移的登记项闭环；损坏/缺失 fail-open 重新生成——证书
+/// 只是传输层身份，认证权威是配对码）；None 保持每启动新生成（e2e 免清理）。
 /// 返回 (endpoint, 证书指纹)：指纹供 0x0D 通道绑定配对校验（M6'）。
-pub async fn server_endpoint(addr: SocketAddr) -> Result<(quinn::Endpoint, [u8; 32])> {
-    let ck = rcgen::generate_simple_self_signed(vec![QUIC_SNI.to_string()])
-        .map_err(|e| proto(format!("自签证书生成失败: {e}")))?;
-    let cert: rustls::pki_types::CertificateDer<'static> = ck.cert.into();
+pub async fn server_endpoint(addr: SocketAddr, persist_dir: Option<&std::path::Path>) -> Result<(quinn::Endpoint, [u8; 32])> {
+    // 证书获取：加载持久化文件 → 构造失败（损坏/不匹配）或缺失 → 重新生成并
+    // 原子落盘（fail-open——证书只是传输层身份，认证权威是配对码；写失败仅告警）。
+    let (cert, key_der): (Vec<u8>, Vec<u8>) = 'cert_src: {
+        if let Some(dir) = persist_dir {
+            if let (Ok(c), Ok(k)) = (std::fs::read(dir.join(CERT_FILE)), std::fs::read(dir.join(KEY_FILE))) {
+                let try_cfg = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![rustls::pki_types::CertificateDer::from(c.clone())],
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(k.clone()).into(),
+                    );
+                if try_cfg.is_ok() {
+                    break 'cert_src (c, k);
+                }
+                eprintln!("[警告] QUIC 持久化证书不可用，重新生成");
+            }
+        }
+        let ck = rcgen::generate_simple_self_signed(vec![QUIC_SNI.to_string()])
+            .map_err(|e| proto(format!("自签证书生成失败: {e}")))?;
+        let c = ck.cert.der().to_vec();
+        let k = ck.key_pair.serialize_der();
+        if let Some(dir) = persist_dir {
+            let cp = dir.join(CERT_FILE);
+            let kp = dir.join(KEY_FILE);
+            let _ = std::fs::create_dir_all(dir);
+            let tmp_c = cp.with_extension("tmp");
+            let tmp_k = kp.with_extension("tmp");
+            let ok = std::fs::write(&tmp_c, &c).is_ok()
+                && std::fs::write(&tmp_k, &k).is_ok()
+                && std::fs::rename(&tmp_c, &cp).is_ok()
+                && std::fs::rename(&tmp_k, &kp).is_ok();
+            if !ok {
+                eprintln!("[警告] QUIC 证书持久化失败（下次启动将重新生成）");
+            }
+        }
+        (c, k)
+    };
+    let cert: rustls::pki_types::CertificateDer<'static> = cert.into();
     let fp = crate::hash::sha256(cert.as_ref());
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
     let server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key.into())
@@ -266,7 +308,8 @@ pub async fn connect_quic_full(
 }
 
 pub async fn serve_quic(addr: SocketAddr, opts: RecvOptions) -> Result<()> {
-    let (endpoint, fp) = server_endpoint(addr).await?;
+    // 证书持久化到保存目录（--pin 身份跨重启稳定；save_dir 与半成品/缓存同盘清理语义）。
+    let (endpoint, fp) = server_endpoint(addr, Some(&opts.save_dir)).await?;
     serve_quic_on(endpoint, fp, opts).await
 }
 

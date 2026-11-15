@@ -43,6 +43,9 @@ pub const CS_MAX_TRANSFER: u64 = 1 << 50;
 /// 接收体缓冲（轮 7：256KB → 4MB 对齐 C# WireProtocol bufferSize——压缩比率
 /// 随段增大改善，UDT 引擎读侧聚合已就位）。
 const CS_RECV_BUF: usize = 4 * 1024 * 1024;
+/// 前奏静默窗（轮 9 P1-4：对齐 C# SetTimeout(30000,30000)——活而静默的
+/// peer 不得无限占用连接与并发闸）。
+const PRELUDE_IDLE: Duration = Duration::from_secs(30);
 /// 0x09 加密段明文上限（C# EncryptedWireStream.MaxSegment）。
 pub const ENC_SEGMENT_MAX: usize = 262_144;
 /// 0x08 压缩段线长上限（解压炸弹防线，C# CompressedWireStream.MaxSegment）。
@@ -929,6 +932,10 @@ pub struct CsServerState {
     /// 续传会话单飞门（guid hex → TryLock；同名 sid 并发连接第二个即拒——
     /// C# ResumeLocks 同防线；完成路径负责摘除）。
     pub resume_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 0x04 接收侧摘要缓存（轮 9 P1-5——(path_fnv, size, mtime_ns) → hash；
+    /// C# FileHashes 进程内存 Dictionary 同语义：重复同步免整盘重读；不落盘，
+    /// 无磁盘产物副作用，服务端重启即失 = 保守方向）。
+    pub sync_hashes: Mutex<HashMap<(u64, u64, u64), [u8; 32]>>,
     /// 组会话归属（guid → 首个 peer IP）。
     pub group_peers: Mutex<HashMap<String, String>>,
 }
@@ -1008,6 +1015,45 @@ pub struct CsResumeState {
     /// 首个 peer IP（轮 6 P1——外来 peer 猜中/重放 sid 不得续写他人会话；
     /// C# ResumeLocks + state.Peer 同防线）。
     pub peer_ip: String,
+}
+
+
+/// 文件 mtime 纳秒（缓存键；§7.31 纳秒粒度口径——秒粒度同秒同长改写漏判）。
+fn mtime_nanos(p: &Path) -> u64 {
+    std::fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 0x04 接收侧哈希核对：进程缓存优先，miss 才读盘并回填（轮 9 P1-5——
+/// 重复同步此前整盘重读，差量同步核心收益被接收端吃掉；C# HaveIdenticalAsync
+/// 经 FileHashes 免读盘同款）。
+fn sync_hash_of(
+    state: &Arc<CsServerState>,
+    p: &Path,
+    size: u64,
+) -> [u8; 32] {
+    let key_path = fnv1a(p.to_string_lossy().as_bytes());
+    let mtime = mtime_nanos(p);
+    let key = (key_path, size, mtime);
+    if let Some(h) = state.sync_hashes.lock().expect("同步缓存锁").get(&key) {
+        return *h;
+    }
+    let h = crate::hash::sha256_file(p).unwrap_or_default();
+    state.sync_hashes.lock().expect("同步缓存锁").insert(key, h);
+    h
 }
 
 /* ============ 服务端连接处理 ============ */
@@ -1093,10 +1139,14 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let code = opts.pairing_code.clone().unwrap_or_default();
 
     // ---- 前奏循环（任意顺序的 0x05/0x09/0x08/0x0A 混合，≤8 帧——C# MaxPreludeFrames）----
+    // **30s 静默窗（轮 9 P1-4，对齐 C# SetTimeout(30000,30000)）**：前奏是纯
+    // 静默间隙——发一半即停的 peer 此前可无限占用连接与并发闸（活而静默）。
     let mut prelude_frames = 0u32;
     let transfer_type = loop {
         let mut t = [0u8; 1];
-        wire.read_exact(&mut t).await?;
+        tokio::time::timeout(PRELUDE_IDLE, wire.read_exact(&mut t))
+            .await
+            .map_err(|_| proto("前奏静默超时（30s）"))??;
         let t = t[0];
         match t {
             F_ECDH => {
@@ -1228,6 +1278,7 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 wire,
                 peer,
                 opts,
+                state,
                 &save_dir,
                 *per_file_skip,
                 confirmed,
@@ -1313,11 +1364,21 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
     let mut hasher = sha2::Sha256::new();
     let mut remaining = size;
     let mut buf = vec![0u8; CS_RECV_BUF];
+    // 首块静默窗（轮 9 P1-4）：宣大 size 后不发体的 peer 不得占闸——首块
+    // 30s；后续块保持无窗（限速 <68KB/s 的合法慢速兼容，30s 会误断）。
+    let mut first_block = true;
     {
         use std::io::Write as _;
         while remaining > 0 {
             let n = buf.len().min(remaining as usize);
-            wire.read_exact(&mut buf[..n]).await?;
+            if first_block {
+                tokio::time::timeout(PRELUDE_IDLE, wire.read_exact(&mut buf[..n]))
+                    .await
+                    .map_err(|_| proto("传输体首块静默超时（30s）"))??;
+                first_block = false;
+            } else {
+                wire.read_exact(&mut buf[..n]).await?;
+            }
             if let Some(l) = limiter {
                 l.acquire(n as u64).await;
             }
@@ -1825,6 +1886,7 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut CsWire<S>,
     peer: SocketAddr,
     opts: &RecvOptions,
+    state: &Arc<CsServerState>,
     save_dir: &Path,
     per_file_skip: bool,
     confirmed: &mut bool,
@@ -1903,7 +1965,7 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         if len == e.size {
-            let actual = crate::hash::sha256_file(&p).unwrap_or_default();
+            let actual = sync_hash_of(state, &p, e.size);
             if ct_eq(&actual, &e.hash) {
                 continue;
             }
@@ -1968,9 +2030,7 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             let p = dir.join(cs_sanitize_rel(&String::from_utf8_lossy(&pb)));
             let identical = p.exists()
                 && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) == e.size
-                && crate::hash::sha256_file(&p)
-                    .map(|x| ct_eq(&x, &e.hash))
-                    .unwrap_or(false);
+                && ct_eq(&sync_hash_of(state, &p, e.size), &e.hash);
             answers.push(if identical { 0u8 } else { 1u8 });
         }
         wire.write_all(&answers).await?;
@@ -2006,7 +2066,10 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
                     std::fs::rename(&temp, &save_path)?;
                 }
                 Err(_) => {
-                    let _ = std::fs::remove_file(&temp);
+                    // 残件保留（轮 9 P2-5，对齐 C# WireProtocol "Keep the partial
+                    // file"——改名入续点扫描视野，下一轮 0x04 以 len<size 续传；
+                    // 收到的损坏字节由续传分支的全文件复核兜底，不会假成功）。
+                    let _ = std::fs::rename(&temp, &save_path);
                     return Ok((false, 0, files));
                 }
             }

@@ -1064,7 +1064,7 @@ pub async fn recv_start(
                 }
                 Err(e) => failed.push((addr, e.to_string())),
             },
-            Proto::Quic => match trft_core::transfer::quic::server_endpoint(addr).await {
+            Proto::Quic => match trft_core::transfer::quic::server_endpoint(addr, Some(&dir)).await {
                 Ok((endpoint, cert_fp)) => {
                     let o = shared.as_ref().expect("QUIC 选项已建").clone();
                     let a2 = app2.clone();

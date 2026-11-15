@@ -20,7 +20,7 @@ async fn quic_single_file_roundtrip() {
     std::fs::write(&src, &data).unwrap();
     let out = dir.path().join("out");
 
-    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap(), None)
         .await
         .unwrap();
     let addr = endpoint.local_addr().unwrap();
@@ -50,7 +50,7 @@ async fn quic_pairing_required() {
     std::fs::write(&src, b"secret over quic").unwrap();
     let out = dir.path().join("out");
 
-    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+    let (endpoint, cert_fp) = server_endpoint("127.0.0.1:0".parse().unwrap(), None)
         .await
         .unwrap();
     let addr = endpoint.local_addr().unwrap();
@@ -94,7 +94,7 @@ async fn mitm_dual_arm_relay_rejected_by_channel_binding() {
     use std::sync::Arc;
 
     // 真实服务端：配对码 987654（限量 1——拒绝路径不计数，收尾由 abort 兜底）。
-    let (ep, real_fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+    let (ep, real_fp) = server_endpoint("127.0.0.1:0".parse().unwrap(), None)
         .await
         .unwrap();
     let real_addr = ep.local_addr().unwrap();
@@ -106,7 +106,7 @@ async fn mitm_dual_arm_relay_rejected_by_channel_binding() {
     ));
 
     // MITM：自签 endpoint（客户端看到的是 MITM 证书，不是真实服务端证书）。
-    let (mitm_ep, _mfp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+    let (mitm_ep, _mfp) = server_endpoint("127.0.0.1:0".parse().unwrap(), None)
         .await
         .unwrap();
     let mitm_addr = mitm_ep.local_addr().unwrap();
@@ -179,7 +179,7 @@ async fn blind_accept_fake_server_rejected_by_s2c_proof() {
     use trft_core::protocol::{frame::R_PAIRING_SALT, frame::T_PAIRING_BOUND};
 
     // 假服务端：自签证书，不知道配对码——走完 0x0D 流程并「盲接受」。
-    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap(), None)
         .await
         .unwrap();
     let addr = ep.local_addr().unwrap();
@@ -258,7 +258,7 @@ async fn forced_downgrade_to_plain_pairing_rejected_by_default() {
     use trft_core::protocol::frame::{T_PAIRING, T_PAIRING_BOUND};
     use trft_core::protocol::io::{read_n, read_str_u16, read_u64, read_u8, write_all, write_u8};
 
-    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap())
+    let (ep, _fp) = server_endpoint("127.0.0.1:0".parse().unwrap(), None)
         .await
         .unwrap();
     let addr = ep.local_addr().unwrap();
@@ -372,7 +372,7 @@ async fn quic_v6_wildcard_accepts_v4_client() {
     std::fs::write(&src, b"quic dual-stack").unwrap();
     let out = dir.path().join("out");
 
-    let (endpoint, cert_fp) = server_endpoint("[::]:0".parse().unwrap()).await.unwrap();
+    let (endpoint, cert_fp) = server_endpoint("[::]:0".parse().unwrap(), None).await.unwrap();
     let addr = endpoint.local_addr().unwrap();
     let v4 = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port());
     let server = tokio::spawn(serve_quic_on(endpoint, cert_fp, opts(out.clone(), None, 1)));
@@ -391,4 +391,50 @@ async fn quic_v6_wildcard_accepts_v4_client() {
         sha256_file(&out.join("q6.bin")).unwrap(),
         sha256_file(&src).unwrap()
     );
+}
+
+/// 判别（轮 9）：证书持久化——同一目录两次建 endpoint 指纹稳定（`--pin`
+/// 钉扎跨重启有效）；不同目录各自生成不同身份；文件落盘为 DER+PKCS8。
+/// 去掉持久化（每启动新生成）本测必红。
+#[tokio::test]
+async fn cert_persists_across_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdir = dir.path().join("persist");
+    let (_, fp1) = server_endpoint("127.0.0.1:0".parse().unwrap(), Some(&pdir))
+        .await
+        .unwrap();
+    // 文件已落盘（DER + PKCS8 均非空）。
+    let cert = std::fs::read(pdir.join("quic-cert.der")).unwrap();
+    let key = std::fs::read(pdir.join("quic-key.pk8")).unwrap();
+    assert!(!cert.is_empty() && !key.is_empty());
+    assert_eq!(
+        crate_sha(&cert),
+        fp1,
+        "落盘 DER 的指纹 = endpoint 指纹"
+    );
+    // 同目录二次实例：复用 → 同指纹。
+    let (_, fp2) = server_endpoint("127.0.0.1:0".parse().unwrap(), Some(&pdir))
+        .await
+        .unwrap();
+    assert_eq!(fp1, fp2, "同目录跨实例指纹必须稳定（--pin 依赖）");
+    // 损坏文件：fail-open 重新生成（新指纹、新文件）。
+    std::fs::write(pdir.join("quic-cert.der"), b"garbage").unwrap();
+    let (_, fp3) = server_endpoint("127.0.0.1:0".parse().unwrap(), Some(&pdir))
+        .await
+        .unwrap();
+    assert_ne!(fp1, fp3, "损坏证书必须 fail-open 重新生成");
+    // 不同目录：独立身份。
+    let pdir2 = dir.path().join("persist2");
+    let (_, fp4) = server_endpoint("127.0.0.1:0".parse().unwrap(), Some(&pdir2))
+        .await
+        .unwrap();
+    assert_ne!(fp1, fp4, "不同目录各自独立生成");
+}
+
+/// SHA-256 助手（避免引入重复依赖别名）。
+fn crate_sha(b: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b);
+    h.finalize().into()
 }
