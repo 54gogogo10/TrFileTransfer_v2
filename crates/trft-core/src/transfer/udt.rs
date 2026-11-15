@@ -1371,22 +1371,28 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
                 tokio::task::yield_now().await;
                 continue;
             }
-            match pump_sock.recv_from(&mut b).await {
-                Ok((len, src)) => {
-                    if src == addr {
-                        if let Some(p) = pw::decode(&b[..len]) {
-                            if p.dst() == pump_my {
-                                let _ = pump_in.send(p);
+            // 阻塞收必须有 100ms 兜底唤醒（轮 10 回归修复——R2 批量化时删掉了
+            // select+sleep）：连接专属 socket 上对端静默后，closed 置位也无人
+            // 唤醒阻塞的 recv_from → 泵任务与 socket 永久泄漏（GUI 长驻每连接一个）。
+            tokio::select! {
+                r = pump_sock.recv_from(&mut b) => match r {
+                    Ok((len, src)) => {
+                        if src == addr {
+                            if let Some(p) = pw::decode(&b[..len]) {
+                                if p.dst() == pump_my {
+                                    let _ = pump_in.send(p);
+                                }
                             }
                         }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    if e.raw_os_error() != Some(10054) {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    Err(e) => {
+                        if e.raw_os_error() != Some(10054) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                     }
-                }
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
     });

@@ -17,7 +17,7 @@
 
 use crate::error::{proto, Error, Result};
 use crate::protocol::rudp as pw;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -47,6 +47,9 @@ const RUDP_FAST_RETX_MIN: Duration = RUDP_TICK;
 const RUDP_BATCH_CAP: usize = 512;
 /// 读侧单次 poll 的聚合上限（把逐块唤醒拼成大块）。
 const RUDP_READ_AGG: usize = 256 * 1024;
+/// 按序待读缓冲上限（块数，轮 10 P1-3——≥2× 窗口；满即「投不进则不确认」，
+/// 对端重传背压，读者消化后 ACK 恢复）。
+const RUDP_DATA_CAP: usize = 2 * 1024;
 const RUDP_RTO_MIN_MS: u64 = 50;
 const RUDP_RTO_MAX_MS: u64 = 3000;
 const RUDP_RTO_INIT_MS: u64 = 400;
@@ -113,6 +116,9 @@ struct SendSide {
     fin_sent_at: Option<Instant>,
     /// 快速重传限频基准（SACK 空洞触发的立即重发至多每拍一次）。
     last_fast_retx: Instant,
+    /// 最近一次累计确认推进时刻（轮 10——「重传超限」断连的判据改为
+    /// **无进展时长**：背压丢弃不是丢包，读者消化后 ACK 推进即复位）。
+    last_progress: Instant,
 }
 
 impl SendSide {
@@ -127,12 +133,20 @@ impl SendSide {
             shutdown_req: false,
             fin_sent_at: None,
             last_fast_retx: Instant::now(),
+            last_progress: Instant::now(),
         }
     }
 
     /// RFC 6298 简化 EWMA：srtt = 7/8 s + 1/8 x；rttvar = 3/4 v + 1/4 |x−s|。
     /// （重传包的采样偏大 → RTO 偏保守，方向安全。）
+    /// **背压滞留守卫（轮 10）**：ACK 语义 = 投递确认，慢读者场景样本含
+    /// 对端缓冲滞留（秒级）——采了会把 RTO 推到 3s 上限，恢复每轮 3s
+    /// （10MB 慢读者恢复 66s 实测）。样本显著高于当前 srtt（>4×+200ms）
+    /// 判为滞留不采；真 RTT 激增按低估方向偏差（过度重传无害）。
     fn rto_update(&mut self, sample_ms: f64) {
+        if self.srtt_ms > 0.0 && sample_ms > self.srtt_ms * 4.0 + 200.0 {
+            return;
+        }
         if self.srtt_ms <= 0.0 {
             self.srtt_ms = sample_ms;
         } else {
@@ -165,15 +179,6 @@ impl RecvSide {
             mss,
             remote_fin: None,
             eof_seen: false,
-        }
-    }
-
-    /// 从乱序缓存收敛连续段到输出（调用方持锁）。
-    fn drain_contiguous(&mut self, out: &mut VecDeque<Vec<u8>>) {
-        while let Some(p) = self.pending.remove(&self.expected) {
-            self.pending_bytes = self.pending_bytes.saturating_sub(p.len());
-            out.push_back(p);
-            self.expected = self.expected.wrapping_add(1);
         }
     }
 
@@ -216,7 +221,9 @@ pub(crate) struct RudpConn {
     /// 已编码出包出口（socket 发送任务消费；close 时摘除）。
     out_tx: OutTx,
     /// 有序载荷出口（读侧 poll_recv 消费；EOF/错误时摘除关闭 → 读侧见 EOF）。
-    data_tx: Mutex<Option<UnboundedSender<Vec<u8>>>>,
+    /// **有界**（轮 10 P1-3：unbounded 下慢读者内存无界增长——TCP 是内核缓冲
+    /// 满→窗口收缩→写端阻塞，此处等价语义 =「投不进则不确认」，重传背压）。
+    data_tx: Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
     /// FIN 已被对端确认（scan 停止重发 FIN 的依据）。
     fin_flag: AtomicBool,
     /// FIN_ACK 唤醒通道（poll_shutdown 的 waker 挂在 Receiver 上——常驻注册，
@@ -334,14 +341,61 @@ impl RudpConn {
         self.send_ack(&r);
     }
 
-    fn on_data(&self, seq: u32, payload: &[u8]) -> bool {
-        // 单次加锁完成状态变更与判定；出包/投递一律放锁外（std Mutex 不可重入）。
-        enum Action {
-            Dup,           // 重复包（ACK 丢失）→ 状态不变（批末 ACK 与上次同型，省略）
-            Gap,           // 乱序 → 已入缓存，ACK 告知空洞
-            Deliver(bool), // 连续段就绪 → 投递读侧；bool = FIN 达成（EOF）
+    /// 背压续投（轮 10 P1-3）：读者消费后把 pending 连续段补投进有界缓冲。
+    /// on_data 的链投递只在收包时触发——对端关闭（FIN 已到）后丢弃重传源
+    /// 消失，此处是唯一能把回填块送出的通道；EOF 收满判定也在此收口。
+    fn pump_pending(&self) {
+        let tx_slot = self.data_tx.lock().expect("数据锁").clone();
+        let Some(tx) = tx_slot else { return }; // 已 EOF/关闭
+        let eof_now = {
+            let mut r = self.recv.lock().expect("接收锁");
+            let mut eof_now = false;
+            loop {
+                let exp = r.expected;
+                let Some(p) = r.pending.remove(&exp) else {
+                    break;
+                };
+                r.pending_bytes = r.pending_bytes.saturating_sub(p.len());
+                match tx.try_send(p) {
+                    Ok(()) => {
+                        r.expected = exp.wrapping_add(1);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(p)) => {
+                        // 满（慢读者）：回填原位，等下次消费后再试。
+                        r.pending_bytes += p.len();
+                        r.pending.insert(exp, p);
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(p)) => {
+                        // 收尾中：回填（close 幂等兜底会归还窗口）。
+                        r.pending_bytes += p.len();
+                        r.pending.insert(exp, p);
+                        break;
+                    }
+                }
+            }
+            if let Some(total) = r.remote_fin {
+                if seq_ge(r.expected, total) && !r.eof_seen {
+                    r.eof_seen = true;
+                    eof_now = true;
+                }
+            }
+            eof_now
+        };
+        if eof_now {
+            let _ = self.data_tx.lock().expect("数据锁").take();
+            self.send_fin_ack();
         }
-        let mut out = VecDeque::new();
+    }
+
+    fn on_data(&self, seq: u32, payload: &[u8]) -> bool {
+        // 单次加锁完成状态变更与判定；出包一律放锁外（std Mutex 不可重入）。
+        enum Action {
+            Dup,   // 重复包（ACK 丢失）→ 状态不变（批末 ACK 与上次同型，省略）
+            Gap,   // 乱序 → 已入缓存，ACK 告知空洞
+            Eof,   // FIN 收满 → 关读侧（EOF）
+            Plain, // 投递/背压推进已完成（含部分推进）→ 批末 ACK
+        }
         let action = {
             let mut r = self.recv.lock().expect("接收锁");
             if payload.len() > r.mss {
@@ -350,9 +404,42 @@ impl RudpConn {
             if seq_lt(seq, r.expected) {
                 Action::Dup
             } else if seq == r.expected {
-                out.push_back(payload.to_vec());
-                r.expected = r.expected.wrapping_add(1);
-                r.drain_contiguous(&mut out);
+                // ---- 背压投递（轮 10 P1-3）----
+                // 链 = 本块 + pending 里的连续段。逐块 try_send 进**有界**读缓冲；
+                // 满即停：未投递块回填 pending、expected 只推进到最后已投递块——
+                // 「投不进则不确认」，对端重传背压，读者消化后 ACK 恢复（等价
+                // TCP 内核缓冲满→窗口收缩→写端阻塞，用户态闭环版）。
+                let tx_slot = self.data_tx.lock().expect("数据锁").clone();
+                let mut chain: Vec<(u32, Vec<u8>)> = vec![(seq, payload.to_vec())];
+                let mut nxt = seq.wrapping_add(1);
+                while let Some(p) = r.pending.remove(&nxt) {
+                    r.pending_bytes = r.pending_bytes.saturating_sub(p.len());
+                    chain.push((nxt, p));
+                    nxt = nxt.wrapping_add(1);
+                }
+                let mut delivered = 0usize;
+                if let Some(tx) = tx_slot.as_ref() {
+                    for (_, chunk) in &chain {
+                        match tx.try_send(chunk.clone()) {
+                            Ok(()) => delivered += 1,
+                            Err(_) => break, // Full（慢读者背压）/ Closed（收尾中）
+                        }
+                    }
+                }
+                // 回填纪律（轮 10 P1-3 二次修正）：**本批新块（chain[0]）投递
+                // 失败一律丢弃不回填**——回填 + SACK 确认会让写端 inflight 移除
+                // 该块且无人重传（永久丢字节）；丢弃则写端 RTO 重传自然重试。
+                // chain[1..] 是原本就在 pending 的乱序块——必须回填（它们的
+                // SACK 确认早已发出，丢弃即真丢），由后续 in-order 投递时的
+                // chain 收集带出（本函数顶部的 remove 循环）。
+                for (k, chunk) in &chain[delivered.max(1)..] {
+                    r.pending_bytes += chunk.len();
+                    r.pending.insert(*k, chunk.clone());
+                }
+                if delivered > 0 {
+                    let last = chain[delivered - 1].0;
+                    r.expected = last.wrapping_add(1);
+                }
                 let eof_now = match r.remote_fin {
                     Some(total) => seq_ge(r.expected, total) && !r.eof_seen,
                     None => false,
@@ -360,10 +447,18 @@ impl RudpConn {
                 if eof_now {
                     r.eof_seen = true;
                 }
-                Action::Deliver(eof_now)
+                if eof_now {
+                    Action::Eof
+                } else {
+                    // 部分推进也算「状态已变」——批末 ACK 释放对端窗口（含
+                    // 背压场景：投了几块就确认几块，窗口不因满缓冲而僵死）。
+                    if delivered > 0 { Action::Plain } else { Action::Gap }
+                }
             } else {
                 // 乱序：入缓存（包数/字节双上限，超出丢弃等发送端重传）。
-                if r.pending.len() < RUDP_PENDING_CAP_PKTS
+                // contains_key 先查：重传的回填块同键覆盖不得双计字节。
+                if !r.pending.contains_key(&seq)
+                    && r.pending.len() < RUDP_PENDING_CAP_PKTS
                     && r.pending_bytes + payload.len() <= RUDP_PENDING_CAP_BYTES
                 {
                     r.pending_bytes += payload.len();
@@ -373,22 +468,13 @@ impl RudpConn {
             }
         };
         match action {
-            Action::Dup => true,
-            Action::Gap => true,
-            Action::Deliver(eof_now) => {
-                let tx = self.data_tx.lock().expect("数据锁").clone();
-                if let Some(tx) = tx {
-                    for chunk in out {
-                        let _ = tx.send(chunk);
-                    }
-                }
-                if eof_now {
-                    // 先关读侧（EOF 可见）再回 FIN_ACK。
-                    let _ = self.data_tx.lock().expect("数据锁").take();
-                    self.send_fin_ack();
-                }
+            Action::Eof => {
+                // 先关读侧（EOF 可见）再回 FIN_ACK。
+                let _ = self.data_tx.lock().expect("数据锁").take();
+                self.send_fin_ack();
                 true
             }
+            _ => true, // Dup/Gap/Plain 状态均已变更（或同型）→ 批末合并 ACK
         }
     }
 
@@ -434,6 +520,9 @@ impl RudpConn {
                 }
             }
             released = before - s.inflight.len();
+            if released > 0 {
+                s.last_progress = now; // 任何确认推进 = 链路有进展（背压丢弃不复位）
+            }
             if !sacks.is_empty() && now.duration_since(s.last_fast_retx) >= RUDP_FAST_RETX_MIN {
                 // 空洞 = [cum, 首个 SACK 起点)：全部在途包立即重发（受窗口界）。
                 let hole_end = sacks
@@ -493,6 +582,9 @@ impl RudpConn {
             // 有空洞：ACK 告知缺口，收满后由 on_data/on_fin 触发 EOF。
             let r = self.recv.lock().expect("接收锁");
             self.send_ack(&r);
+            drop(r);
+            // FIN 已宣告别再发——立即尝试排空 pending（data_tx 有空间时直接推进）。
+            self.pump_pending();
         }
     }
 
@@ -511,18 +603,29 @@ impl RudpConn {
         let abort = {
             let mut s = self.send.lock().expect("发送锁");
             let rto = s.rto;
+            let mut due: Vec<(std::time::Instant, WirePkt)> = Vec::new();
             for inf in s.inflight.values_mut() {
                 if now.duration_since(inf.last_send) >= rto {
                     inf.retries += 1;
                     inf.retransmitted = true;
                     inf.last_send = now;
                     if inf.retries > RUDP_RETRIES_MAX {
-                        break;
+                        continue; // 轮 10：超限块跳过不断批（其余到期块照常重发）
                     }
-                    resend.push(inf.pkt.clone());
+                    due.push((inf.last_send, inf.pkt.clone()));
                 }
             }
-            let too_lossy = s.inflight.values().any(|i| i.retries > RUDP_RETRIES_MAX);
+            // 重发限流（轮 10）：背压场景丢弃块每 RTO 到期——全量重发 = 洪水
+            //（实测每块重传 129 轮、恢复 66s）。每轮最旧优先取 64 块；无损场景
+            // RTO 到期罕见不受影响；真丢包恢复 1000 块 = 16 轮 × 25ms = 400ms。
+            due.sort_by(|a, b| a.0.cmp(&b.0));
+            resend.extend(due.into_iter().map(|(_, p)| p).take(64));
+            let too_lossy = s.inflight.values().any(|i| i.retries > RUDP_RETRIES_MAX)
+                // 轮 10：**无进展**超 (MAX+1)×RTO 才真断——背压场景下丢弃块的
+                // 重传计数会累积，但读者消化后 ACK 推进即复位 last_progress；
+                // 真丢包链路无 ACK 推进 → 原 12 次语义保持。
+                && now.duration_since(s.last_progress)
+                    >= rto.mul_f64((RUDP_RETRIES_MAX + 1) as f64);
             // FIN 重发只在未被对端确认时进行（fin_flag 置位即停）。
             if !too_lossy
                 && s.shutdown_req
@@ -560,7 +663,7 @@ impl std::fmt::Debug for RudpConn {
 /// 可靠流句柄（帧层读写对象；同一连接在本端仅一个实例）。
 pub struct RudpStream {
     conn: Arc<RudpConn>,
-    data_rx: UnboundedReceiver<Vec<u8>>,
+    data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     /// FIN_ACK 唤醒通道（waker 常驻注册在 Receiver 上；None 消息 = 关闭兜底放行）。
     fin_rx: UnboundedReceiver<()>,
     /// poll_write 的窗口许可等待（每次 poll 重建；就绪后置 None）。
@@ -574,6 +677,12 @@ pub struct RudpStream {
 }
 
 impl RudpStream {
+    /// 按序待读缓冲的当前块数（轮 10 P1-3 观测口；≤ `RUDP_DATA_CAP`——
+    /// 背压上限的直接证据）。
+    pub fn buffered_chunks(&self) -> usize {
+        self.data_rx.len()
+    }
+
     /// 等价 TCP 的 shutdown：发 FIN 并等 FIN_ACK（RUDP_FIN_WAIT 兜底放行）。
     fn do_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
@@ -590,13 +699,18 @@ impl RudpStream {
         if this.conn.fin_flag.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
         }
-        let deadline = this
-            .conn
-            .send
-            .lock()
-            .expect("发送锁")
-            .fin_sent_at
-            .map(|t| t + RUDP_FIN_WAIT);
+        // 兜底基准 = max(FIN 发出, 对端最后活跃) + FIN_WAIT——对端还活着
+        //（缺口 ACK 在来、重传在恢复）时不得提前放弃：背压大流量场景下
+        // 读者消化 5s+ 是常态（轮 10）；对端真失联 → 静默 5s 放行（原语义）。
+        let deadline = {
+            let last_rsp = *this.conn.last_rx.lock().expect("活性锁");
+            this.conn
+                .send
+                .lock()
+                .expect("发送锁")
+                .fin_sent_at
+                .map(|t| t.max(last_rsp) + RUDP_FIN_WAIT)
+        };
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Poll::Ready(Ok(())); // 尽力收尾（对端失联等）
         }
@@ -629,6 +743,9 @@ impl AsyncRead for RudpStream {
                     self.read_buf.clear();
                     self.read_pos = 0;
                 }
+                // 背压续投（轮 10 P1-3）：消费释放容量后补投 pending 连续段
+                //（对端已关闭场景下这是唯一投递通道；多数时候空链零开销）。
+                self.conn.pump_pending();
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut self.data_rx).poll_recv(cx) {
@@ -795,7 +912,7 @@ fn build_conn(conn: u32, peer: SocketAddr, mss: usize, shared_out: Option<Unboun
             (tx, Some(rx))
         }
     };
-    let (data_tx, data_rx) = unbounded_channel::<Vec<u8>>();
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(RUDP_DATA_CAP);
     let (in_tx, in_rx) = unbounded_channel::<Pkt>();
     let (fin_tx, fin_rx) = unbounded_channel::<()>();
     let (err_tx, err_rx) = watch::channel(None);
@@ -879,13 +996,21 @@ async fn run_driver(conn: Arc<RudpConn>, mut in_rx: UnboundedReceiver<Pkt>) {
         // 对端泵/写端（current-thread runtime 上必现）——每批让出一次。
         tokio::task::yield_now().await;
     }
-    // 收尾口径（「结果未知 ≠ 成功」）：正常流是流句柄 Drop/RST/超时先把
-    // closed 置位再走到这里（close 幂等）；若入口关闭时 closed 仍为假，
-    // 说明泵/服务端先死于 socket 错误——读侧必须见错误而非干净 EOF。
+    // 收尾口径（「结果未知 ≠ 成功」）：入口关闭且本端从未走正常收尾
+    // （shutdown_req / 已见对端 FIN / FIN 已确认）→ 泵/服务端先死于 socket
+    // 错误，读侧必须见错误；任一正常收尾迹象（含对端 FIN 已到、数据尚在
+    // 缓冲待读——慢读者场景）→ 干净 EOF。
     if conn.closed.load(Ordering::SeqCst) {
         conn.close(None);
     } else {
-        conn.close(Some("传输通道异常中断".into()));
+        let clean = conn.send.lock().expect("发送锁").shutdown_req
+            || conn.recv.lock().expect("接收锁").eof_seen
+            || conn.fin_flag.load(Ordering::SeqCst);
+        if clean {
+            conn.close(None);
+        } else {
+            conn.close(Some("传输通道异常中断".into()));
+        }
     }
 }
 
@@ -1646,6 +1771,42 @@ mod tests {
             "恢复耗时 {:?}——SACK 快速重传未生效（RTO 已钉 3s）",
             t0.elapsed()
         );
+    }
+
+    /// 判别（轮 10 P1-3）：读侧背压。写 10MB（8740 块，远超窗口+读缓冲+
+    /// 乱序缓存的总吸收量），读侧延迟 300ms——期间接收侧按序待读缓冲必须
+    /// 钳在 `RUDP_DATA_CAP`（unbounded 旧行为会无界涨到全量 8740 块）；
+    /// 随后全速读完，逐字节一致（背压不得丢字节——丢弃重传/乱序回填/SACK
+    /// 的交织路径全覆盖）。
+    #[tokio::test]
+    async fn slow_reader_backpressure_bounds_memory() {
+        let (mut c, mut s) = pair(false).await;
+        let payload: Vec<u8> = (0..10_000_000u32).map(|i| (i % 199) as u8).collect();
+        let total = payload.len();
+        let writer = {
+            let data = payload.clone();
+            tokio::spawn(async move {
+                c.write_all(&data).await.unwrap();
+                c.flush().await.unwrap();
+                // 干净收尾（未 shutdown 的 drop = RST 异常中止——会打断慢读者）。
+                c.shutdown().await.unwrap();
+            })
+        };
+        // 读侧延迟期间采样：缓冲必须恒 ≤ CAP（背压上限；unbounded 会涨过 CAP）。
+        let mut peak = 0usize;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            peak = peak.max(s.buffered_chunks());
+        }
+        assert!(
+            peak <= RUDP_DATA_CAP,
+            "按序待读缓冲峰值 {peak} 超 CAP {RUDP_DATA_CAP}——背压失效（unbounded 旧行为）"
+        );
+        let mut got = vec![0u8; total];
+        s.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "背压恢复后必须逐字节一致");
+        writer.await.unwrap();
+        s.shutdown().await.unwrap();
     }
 
     /// MSS 协商回退判别：伪旧服务端对 18B 协商 HS 静默忽略、只应答 16B 旧 HS——
