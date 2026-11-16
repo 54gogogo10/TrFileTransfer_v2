@@ -215,6 +215,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Encrypted<S> {
         // write_all 契约：Pending 后以同一 buf 重试。首次进入时把输入收进
         // 状态机，之后按 256KB 分段依次封段写出（seal_into 一次预分配整个信封
         // ——每段仅一次载荷拷贝 + 原地 keystream）。
+        // 轮 UI-2 安全收尾：契约升级为 debug 断言——违约（Pending 后换 buf 重调）
+        // 会静默覆盖未发完的旧输入（丢数据），debug 构建即时暴露。
+        debug_assert!(
+            pending_in.is_none() || pending.is_some(),
+            "Encrypted::poll_write 违约：Pending 后须以同一 buf 重试"
+        );
         if pending_in.is_none() && pending.is_none() {
             *pending_in = Some(buf.to_vec());
         }

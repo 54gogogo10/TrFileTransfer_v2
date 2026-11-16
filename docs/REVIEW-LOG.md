@@ -598,3 +598,43 @@ checkTimers ACK 分支）；`m_ullLastAckTime` 单字段语义同步。
 **实测**：RUDP <0.13 → **126.1 MB/s**；UDT v2→C# 10 → **167.5 MB/s**；环回
 TCP 199 / QUIC 179 / UDT 161；真机矩阵 14/14 + GUI 0x02 复验全 SHA-256 一致；
 264 测试全绿 0 告警（判别 2 项均实测去修复必红）。
+
+
+---
+
+## UI 高级感升级 + 审查迭代批（2026-11-16，第 9-13 轮：界面美化 → 代码审查 → 安全审查 × 5 闭环）
+
+| 轮 | 视角 | P0 | P1 | P2 | P3 | 状态 |
+|---|---|---|---|---|---|---|
+| 9 | 前端 + GUI crate 代码/安全 | — | 1 | 10 | 20+ | ✅ P1/P2 全修，P3 择要 |
+| 10 | core 传输层 + 密码学/协议安全 | — | 1 | 3 | 2 | ✅ 全修/登记（P1=UDT 槽位码哈希上线，协议固有→§5.2 登记 + GUI 告警） |
+| 11 | CLI/支撑模块 + 更新链/路径穿越安全 | — | 1 | 1 | 8 | ✅ 全修（P1=cs_safe_name ADS 冒号） |
+| 12 | 改动集回归审查 + 威胁模型复扫 | — | 1 | 4 | 5 | ✅ 全修（P1=resume 覆盖路径声明量泄漏） |
+| 13 | 终扫（clippy + 修复验证） | — | — | — | — | ✅ deny 级清零；验证 12 项安全修复在位 |
+
+**界面**（同批交付）：GUI 设计系统重写——渐变 accent/分层阴影/图标页签/玻璃拟态/进度条动效/控件基线统一/共享页两栏/暗色日志沉底/响应式与无障碍。VLM 截图评审从 ~6 分收敛 8-8.5 分；预览 harness `.zcode/ui-preview`（stub + 截图 + DOM 断言）。
+
+**关键修复**（完整清单见 TECH-STACK §7.44）：
+- **轮 9**：前端 activeTransfers 双扣（语言锁被提前解除）、暂停/继续/取消三处理器裸奔、群发/按钮乱序终态；GUI monitor_stop abort 兜底不存在（JoinHandle 脱管）、窗口隐藏停共享漏刷防睡眠、队列把用户暂停当失败重试。
+- **轮 10**：cswire 0x03 单飞锁 guard 即 drop；RUDP 慢路径 1 许可发整批（背压架空）；UDT data_tx 无界（慢读者无界内存）；cswire 残件命名/TTL/磁盘预检/首块窗四防线对齐。
+- **轮 11**：cs_safe_name 冒号 → NTFS ADS/MotW 抹除（实测复现）；cs_publish 发布竞态；monitor watcher 半死通道热自旋 + swap(0,1) 震荡饿死；CLI sync 缺 --pin。
+- **轮 12（改动集自审）**：resume 会话覆盖泄漏声明量（远程持久 DoS）；declare/create 顺序；tracker 最终名残件；cs_publish 拷贝回退无 error-guard；0x04 会话内重发替换语义被 cs_publish 破坏（e2e_udt 拦截）。
+- **轮 13**：clippy never_loop deny ×2（UDT 泵死循环结构）；触及文件风格告警清零；12 项安全修复 grep 验证在位。
+
+**判别纪律**：本批新增修复未全部配备「去修复必红」判别测试（e2e_udt 的 0x04 重发用例实际拦截了发布语义回归）；cswire 声明量记账、monitor 交错队列、UDT 队列计数的专项判别列为后续测试债，登记在案。
+
+**残余风险登记**：UDT 互通槽位配对认证（PRODUCT-SPEC §5.2 新增）；UTC 日志时间戳、RUDP 接收热路径拷贝、scrub 文件符号链接、PBKDF2 50k 维持——取舍理由见 TECH-STACK §7.44「登记接受」。
+
+---
+
+## 真机冒烟补录（2026-11-16，R13 后收口）
+
+**方式**：`cargo build -p trft-gui` 后以 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port` 启动真机 exe，CDP 直连 WebView2 实测（非 stub harness）。
+
+**抓获（P1，静态截图无法发现）**：dist/app.js zh 字典第 69 行在死键清理轮被写坏为 `cf_un`（键名截断+值丢失的非法简写属性）→ 运行时 `ReferenceError` 使 app.js 顶层初始化中断，**全部事件监听器未挂载，UI 整体无响应**；`node --check` 语法合法，e2e/stub 截图均不覆盖此路径。同轮 en 侧死键 `known` 漏删。
+
+**修复**：`cf_unknown: "仅未知设备（已知放行）"` 复原 + en 死键删除。
+
+**判别检查**：新增 `.zcode/check_l10n.js`（zh/en 字典损坏简写键、data-i18n/t() 引用缺键、两侧键不对称三类校验，bad=0 为过；本 bug 在该脚本下必红）。
+
+**复测全绿**：页面异常 0、控制台错误 0、6/6 标签切换 PASS、IPC 三命令（get_app_state/list_addresses/stats_summary）真实回数、设置页 19 项回填、qr-address 下拉 JS 填充=4（初始化完整证据）、错误 toast 0；亮/暗双主题截图归档 `.zcode/ui-preview/shots/real-smoke2-*`。VLM 亮色误判为深色一事再次印证：程序化验证优先于 VLM 臆测。

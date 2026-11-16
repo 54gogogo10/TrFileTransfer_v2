@@ -15,6 +15,11 @@ fn main() {
     // 友好提示——对齐原 C# 版，此前后端只有 UI 日志事件、进程崩溃零痕迹）。
     trft_gui::logging::init_file_logging();
     install_panic_hook();
+    // 更新残备份清扫（轮 UI-3 安全 P3-2）：换版后旧 exe 改名为 .exe.old，
+    // 运行中删除恒 sharing violation——更新路径的清理在下次启动兜底。
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+    }
 
     // 离线便携版（TECH-STACK §7.20）：exe 旁存在 WebView2Runtime\ 固定版运行时
     // 则优先加载（须在 WebView2 检测/窗口创建前设置——loader 读环境变量定加载路径），
@@ -35,7 +40,12 @@ fn main() {
     let cfg = match trft_core::config::Config::load(&cfg_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[警告] 配置加载失败，已回退默认值（安全项=关闭状态）: {e}");
+            // UI-1 P3-8：release（windows_subsystem=windows）无控制台，eprintln
+            // 无处可去——安全面静默降级必须留痕，改走文件日志（logging 已初始化）。
+            trft_gui::logging::log_line(
+                "err",
+                &format!("[警告] 配置加载失败，已回退默认值（安全项=关闭状态）: {e}"),
+            );
             Default::default()
         }
     };
@@ -119,6 +129,8 @@ fn main() {
 /// 与 `http_stop` 同逻辑但不依赖前端调用；未运行时为空操作。
 /// 轮 7 F4：补发 `trft://sync-state`——前端复位共享页（死二维码/假「运行中」
 /// 假象）并在窗口重显时同步。
+/// UI-1 P2-2：停后刷新防睡眠计数——命令路径（http_stop）有 update_awake，
+/// 此路径此前漏刷，ES_SYSTEM_REQUIRED 可残留至下个任务事件。
 fn stop_http_share<R: tauri::Runtime>(window: &tauri::Window<R>) {
     use tauri::Emitter as _;
     let app = window.app_handle();
@@ -132,6 +144,7 @@ fn stop_http_share<R: tauri::Runtime>(window: &tauri::Window<R>) {
             .unwrap_or(false);
         if stopped {
             trft_gui::commands::emit_log(&app, "ok", "窗口已隐藏，HTTP 共享已停止");
+            trft_gui::commands::update_awake(app);
             let _ = app.emit("trft://sync-state", ());
         }
     }

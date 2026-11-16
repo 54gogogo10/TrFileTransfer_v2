@@ -281,7 +281,7 @@ async fn health() -> &'static str {
 }
 
 async fn login_page() -> Html<String> {
-    Html(format!(
+    Html(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>登录 - TrFileTransfer</title></head>\
          <body style=\"font-family:sans-serif;max-width:24rem;margin:10vh auto\">\
          <h1>TrFileTransfer</h1><p>请输入配对码访问共享。</p>\
@@ -290,7 +290,8 @@ async fn login_page() -> Html<String> {
          style=\"width:100%;padding:.5rem;box-sizing:border-box\">\
          <button type=\"submit\" style=\"width:100%;padding:.5rem;margin-top:.5rem\">登录</button>\
          </form></body></html>"
-    ))
+            .to_string(),
+    )
 }
 
 async fn login_submit(
@@ -371,7 +372,7 @@ fn url_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'%' if i + 2 < b.len() + 1 && i + 2 < b.len() + 1 => {
+            b'%' => {
                 let hex = |c: u8| (c as char).to_digit(16);
                 if i + 2 < b.len() {
                     if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
@@ -432,10 +433,22 @@ async fn view(st: &WebState, rel: &str) -> Response {
     if !full.is_dir() {
         return (StatusCode::NOT_FOUND, "目录不存在").into_response();
     }
-    let mut entries: Vec<_> = std::fs::read_dir(&full)
-        .map(|rd| rd.flatten().collect::<Vec<_>>())
-        .unwrap_or_default();
-    entries.sort_by_key(|e| (!e.path().is_dir(), e.file_name()));
+    // 预取 is_dir/metadata（轮 UI-1：sort_by_key 每次比较都调 path().is_dir()
+    // ——大目录 O(n log n) 次元数据系统调用；一次取齐后排序纯内存）。
+    let mut entries: Vec<(bool, u64, std::ffi::OsString, std::fs::DirEntry)> = std::fs::read_dir(
+        &full,
+    )
+    .map(|rd| {
+        rd.flatten()
+            .map(|e| {
+                let is_dir = e.path().is_dir();
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                (is_dir, size, e.file_name(), e)
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    entries.sort_by(|a, b| (!a.0, &a.2).cmp(&(!b.0, &b.2)));
     let mut rows = String::new();
     if !rel.is_empty() {
         let parent = Path::new(rel)
@@ -447,10 +460,8 @@ async fn view(st: &WebState, rel: &str) -> Response {
             view_url(&parent)
         ));
     }
-    for e in &entries {
-        let name = e.file_name().to_string_lossy().to_string();
-        let is_dir = e.path().is_dir();
-        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+    for (is_dir, size, os_name, _e) in entries {
+        let name = os_name.to_string_lossy().to_string();
         let sub = if rel.is_empty() {
             name.clone()
         } else {

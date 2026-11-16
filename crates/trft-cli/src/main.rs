@@ -108,7 +108,7 @@ enum Cmd {
         proto: Proto,
         #[arg(long)]
         code: Option<String>,
-        /// 收满 N 个文件（次传输）后退出（仅 tcp/quic/rudp）
+        /// 收满 N 个文件（次传输）后退出（仅 tcp/quic/rudp/udt）
         #[arg(long)]
         count: Option<u64>,
         /// 拒绝接收端的传输加密升级（默认接受）
@@ -127,12 +127,15 @@ enum Cmd {
         proto: Proto,
         #[arg(long)]
         code: Option<String>,
-        /// 发送限速 KB/s（0=不限）
+        /// 发送限速 KB/s（0=不限，上限 10000000）
         #[arg(long)]
         limit: Option<u64>,
         /// 关闭压缩（默认开启）
         #[arg(long)]
         nocompress: bool,
+        /// QUIC 服务器证书指纹钉扎（64 位十六进制；不提供则不防主动中间人）
+        #[arg(long = "pin")]
+        quic_pin: Option<String>,
         /// 显式放行旧版对端的明文配对（默认拒绝）
         #[arg(long = "allow-legacy-pair")]
         allow_legacy_pair: bool,
@@ -261,6 +264,11 @@ fn usage_fail(msg: &str) -> i32 {
 }
 
 fn main() {
+    // 更新残备份清扫（轮 UI-3 安全 P3-2）：换版后旧 exe 改名为 .exe.old，
+    // 运行中删除恒 sharing violation——更新路径的清理在下次启动兜底。
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("exe.old"));
+    }
     // Windows 主线程默认栈仅 1MB：debug 构建的异步发送调用链（0x03 → 加密/压缩
     // 装饰器 → 帧循环）栈帧膨胀会溢出（cli_transfer 集成测试实测，100B 小文件
     // 即崩；release 裕量同样无保障）。挪 16MB 大栈线程执行——rustc 自身同款做法。
@@ -364,6 +372,16 @@ async fn run() -> i32 {
                 }
                 if nocompress {
                     return usage_fail("单向 UDP 不支持压缩协商（无握手通道）");
+                }
+                // 轮 UI-3 P3-6：同族参数显式报错（旧实现静默吞掉）。
+                if chunks.is_some() {
+                    return usage_fail("--chunks 不适用于 --proto udp（无握手通道）");
+                }
+                if noencrypt {
+                    return usage_fail("--noencrypt 不适用于 --proto udp（恒为明文）");
+                }
+                if allow_legacy_pair {
+                    return usage_fail("--allow-legacy-pair 不适用于 --proto udp");
                 }
                 let Some(f) = file else {
                     return usage_fail("send 需要 --file（单向 UDP）");
@@ -517,6 +535,7 @@ async fn run() -> i32 {
             code,
             limit,
             nocompress,
+            quic_pin,
             allow_legacy_pair,
         } => {
             if proto == Proto::Udp {
@@ -535,6 +554,12 @@ async fn run() -> i32 {
                 speed_limit_bps: limit.unwrap_or(0).min(10_000_000) * 1024,
                 compress: !nocompress,
                 allow_legacy_pair,
+                // 轮 UI-3 P3-4：sync 暴露 --pin（消费链路 send_folder_resume →
+                // connect_quic_auth 完整存在，此前入口缺失 = 防护无条件降级）。
+                quic_pin: match parse_pin(&quic_pin) {
+                    Ok(p) => p,
+                    Err(e) => return usage_fail(&e),
+                },
                 // CLI 与 GUI 同享 stats.log（TECH-STACK §7.10；轮 5 P2：sync 此前漏注）。
                 stats: Some(std::sync::Arc::new(
                     trft_core::stats::StatsLog::default_log(),

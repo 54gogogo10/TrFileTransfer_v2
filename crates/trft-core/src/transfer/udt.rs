@@ -25,12 +25,15 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 /// 发送侧拥塞窗初值（UDT4 慢启动起点）。
 const CWND_INIT: f64 = 16.0;
 /// 接收重排缓冲上限（对端 libudt 收缓冲默认 8192 包；本地对等取同值）。
 const REORDER_CAP: usize = 8192;
+/// 有序投递队列容量（轮 UI-2 P1-3：≥ 2× 对端流窗 8192——窗口满载直达时
+/// 队列不先于通告窗耗尽；投不进 = 不推进 expected/不 ACK，对端重传兜底）。
+const UDT_DATA_QUEUE_CAP: usize = 16384;
 
 /// 连接本地 µs 时钟（Instant 单调；探测/到达窗与 SYN 节流共用）。
 fn now_us_since(epoch: &Instant) -> u64 {
@@ -138,6 +141,8 @@ struct RecvState {
     loss: BTreeSet<i32>,
     /// 乱序缓存。
     pending: HashMap<i32, Vec<u8>>,
+    /// 已投递进 data 队列、尚未被读侧消费的块数（avail_buf 通告收缩依据）。
+    queued: usize,
     peer_shutdown: bool,
     // -- ACK 发送状态 --
     ack_no: i32,
@@ -183,6 +188,7 @@ impl RecvState {
             curr: pw::seq_dec(peer_isn),
             loss: BTreeSet::new(),
             pending: HashMap::new(),
+            queued: 0,
             peer_shutdown: false,
             ack_no: 0,
             ack_window: HashMap::new(),
@@ -262,8 +268,10 @@ impl RecvState {
     }
 
     /// 可用接收缓冲（包数，下限 2 防 deadlock——libudt 同语义）。
+    /// 轮 UI-2 P1-3：投递队列计入——只看重排缓存时投递后 pending 恒空、
+    /// avail 恒满，对端在全速发送 vs 慢读者下把 data_rx 堆到无界。
     fn avail_buf(&self) -> i32 {
-        ((REORDER_CAP - self.pending.len()) as i32).max(2)
+        ((REORDER_CAP + UDT_DATA_QUEUE_CAP - self.pending.len() - self.queued) as i32).max(2)
     }
 
     /// ACK2 采样 → RTT EWMA（libudt：var=3/4v+1/4|x-rtt|，rtt=7/8rtt+1/8x）。
@@ -285,7 +293,9 @@ pub(crate) struct UdtConn {
     /// 已编码出包出口（socket 泵/转发消费；close 摘除）。共享注入时携带 dst。
     out_tx: Mutex<Option<UnboundedSender<OutPkt>>>,
     /// 有序载荷出口（读侧消费；EOF/错误摘除 → 读侧见 EOF）。
-    data_tx: Mutex<Option<UnboundedSender<Vec<u8>>>>,
+    /// 轮 UI-2 P1-3：unbounded → 有界（投不进则不推进 expected/不 ACK——对齐
+    /// RUDP 轮 10 背压口径；慢读者内存从无界收敛为 有界队列 + 重排缓存）。
+    data_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// 写侧窗口等待（notify_waiters 唤醒已注册等待者；写侧「先注册后查窗」的顺序
     /// 保证开窗通知不丢——错过的一次由后续 SYN 周期 ACK 的通知兜底，停顿 ≤10ms）。
     window_notify: Arc<Notify>,
@@ -612,8 +622,10 @@ impl UdtConn {
         // 到达速率/探测对记账并入主锁段（libudt processData：每个到达先记时再
         // 处理——此前两段锁每包 2 对锁操作）。载荷按值入参（move 投递/缓存，
         // 消灭收包侧第二次拷贝）；部分包标记在 move 前记录。
+        // 轮 UI-2 P1-3：投递走有界 try_send——满则不推进 expected/不 ACK
+        // （对端视作丢失经 NAK/EXP 重传；慢读者下通告窗随 queued 收缩）。
         let partial = payload.len() != pw::UDT_PAYLOAD_MAX;
-        let mut out: Vec<Vec<u8>> = Vec::new();
+        let tx = self.data_tx.lock().expect("数据锁").clone();
         let mut nak_words: Option<Vec<u32>> = None;
         let mut eof_now = false;
         {
@@ -621,9 +633,21 @@ impl UdtConn {
             let now_us = now_us_since(&r.epoch);
             r.on_pkt_arrival(now_us, seq);
             if seq == r.expected {
-                out.push(payload);
-                r.expected = pw::seq_inc(r.expected);
-                r.loss.remove(&seq);
+                match &tx {
+                    Some(t) if t.try_send(payload).is_ok() => {
+                        r.queued += 1;
+                        r.expected = pw::seq_inc(r.expected);
+                        r.loss.remove(&seq);
+                    }
+                    _ => {
+                        // 队列满/已关：整包不收（不推进 expected——对端重传兜底）。
+                        r.pkt_count += 1;
+                        if partial {
+                            r.ack_immediate = true;
+                        }
+                        return;
+                    }
+                }
             } else if pw::seq_cmp(seq, r.expected) < 0 {
                 // 重复包（ACK 丢失后重传）——出损失表即可，不重复投递。
                 r.loss.remove(&seq);
@@ -669,9 +693,25 @@ impl UdtConn {
                 let Some(p) = r.pending.remove(&exp) else {
                     break;
                 };
-                r.loss.remove(&exp);
-                out.push(p);
-                r.expected = pw::seq_inc(exp);
+                match &tx {
+                    Some(t) => match t.try_send(p) {
+                        Ok(()) => {
+                            r.queued += 1;
+                            r.loss.remove(&exp);
+                            r.expected = pw::seq_inc(exp);
+                        }
+                        Err(e) => {
+                            // 满：载荷放回重排缓存，水位停住（读侧消费后 pump 续投）。
+                            let p = e.into_inner();
+                            r.pending.insert(exp, p);
+                            break;
+                        }
+                    },
+                    None => {
+                        r.pending.insert(exp, p);
+                        break;
+                    }
+                }
             }
             // 最高已见 seq 无条件更新（libudt processData 2442：seqcmp(seq, curr) > 0
             // 即抬 curr——顺序到达同样要抬，否则 ACK cum 永远停在 ISN，发送端窗口卡死）。
@@ -692,12 +732,39 @@ impl UdtConn {
             drop(r);
             self.send_ctrl(pw::C_NAK, 0, &words);
         }
-        if !out.is_empty() {
-            let tx = self.data_tx.lock().expect("数据锁").clone();
-            if let Some(tx) = tx {
-                for chunk in out {
-                    let _ = tx.send(chunk);
+        if eof_now {
+            let _ = self.data_tx.lock().expect("数据锁").take();
+        }
+    }
+
+    /// 重排缓存续投（轮 UI-2 P1-3）：读侧消费释放队列预算后，把因满停住的
+    /// pending 链继续投进 data 队列；补检 EOF（peer_shutdown 且排空 → 摘 tx）。
+    /// 读侧 poll_read 与驱动 ACK 扫描各调一次（空转即两次加锁，量级可忽略）。
+    fn pump_pending(&self) {
+        let tx = self.data_tx.lock().expect("数据锁").clone();
+        let Some(tx) = tx else { return };
+        let mut eof_now = false;
+        {
+            let mut r = self.recv.lock().expect("接收锁");
+            loop {
+                let exp = r.expected;
+                let Some(p) = r.pending.remove(&exp) else {
+                    break;
+                };
+                match tx.try_send(p) {
+                    Ok(()) => {
+                        r.queued += 1;
+                        r.loss.remove(&exp);
+                        r.expected = pw::seq_inc(exp);
+                    }
+                    Err(e) => {
+                        r.pending.insert(exp, e.into_inner());
+                        break;
+                    }
                 }
+            }
+            if r.peer_shutdown && r.loss.is_empty() && r.pending.is_empty() {
+                eof_now = true;
             }
         }
         if eof_now {
@@ -720,6 +787,9 @@ impl UdtConn {
 
     /// ACK 发送（接收方向）：SYN 周期 + 即席标记 + light ACK（libudt checkTimers 语义）。
     fn send_ack_scan(&self) {
+        // 轮 UI-2 P1-3：驱动侧续投（读侧长期不 poll 时 pending 链不悬死；
+        // 空转一次加锁，SYN 周期量级下开销可忽略）。
+        self.pump_pending();
         let now = Instant::now();
         let mut light: Option<i32> = None;
         {
@@ -759,7 +829,7 @@ impl UdtConn {
                     // 时 cwnd 恒 16 包，C# 发送端塌陷到 ~750 pkt/s（实机 80MB 1MB/s
                     // vs C#↔C# 63MB/s，TECH-STACK §7.31）。
                     let now_us = now_us_since(&r.epoch);
-                    let six = now_us - r.last_full_us > pw::SYN_US as u64;
+                    let six = now_us - r.last_full_us > pw::SYN_US;
                     if six {
                         r.last_full_us = now_us;
                     }
@@ -931,7 +1001,7 @@ impl fmt::Debug for UdtConn {
 /// 可靠流句柄（C# 方言应用层读写对象；同一连接本端仅一个实例）。
 pub struct UdtStream {
     conn: Arc<UdtConn>,
-    data_rx: UnboundedReceiver<Vec<u8>>,
+    data_rx: mpsc::Receiver<Vec<u8>>,
     /// 读侧聚合缓冲 + 光标（单次 poll 拼到上限再切片——逐包唤醒开销在大流量
     /// 下占主导；消费只推进光标，耗尽才清零，消灭整段 drain memmove）。
     read_buf: Vec<u8>,
@@ -977,13 +1047,24 @@ impl AsyncRead for UdtStream {
                 Poll::Ready(Some(chunk)) => {
                     self.read_buf = chunk;
                     self.read_pos = 0;
+                    let mut popped = 1usize;
                     // 聚合积压（对齐 RUDP 读侧口径）：单次 poll 拼到 256KB 再切片。
                     while self.read_buf.len() < UDT_READ_AGG {
                         match self.data_rx.try_recv() {
-                            Ok(c) => self.read_buf.extend_from_slice(&c),
+                            Ok(c) => {
+                                popped += 1;
+                                self.read_buf.extend_from_slice(&c);
+                            }
                             Err(_) => break,
                         }
                     }
+                    // 轮 UI-2 P1-3：消费回填——释放队列预算（avail_buf 通告回张）
+                    // 并驱动 pump 续投因满停住的 pending 链 / 补 EOF。
+                    {
+                        let mut r = self.conn.recv.lock().expect("接收锁");
+                        r.queued = r.queued.saturating_sub(popped);
+                    }
+                    self.conn.pump_pending();
                 }
                 Poll::Ready(None) => {
                     if let Some(e) = self.conn.error() {
@@ -1092,7 +1173,7 @@ pub(crate) fn build_conn(
             (tx, Some(rx))
         }
     };
-    let (data_tx, data_rx) = unbounded_channel::<Vec<u8>>();
+    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(UDT_DATA_QUEUE_CAP);
     let (in_tx, in_rx) = unbounded_channel::<pw::Pkt>();
     let (err_tx, err_rx) = watch::channel(None);
     let conn = Arc::new(UdtConn {
@@ -1413,22 +1494,17 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
                 }
             }
             for pkt in batch {
-                loop {
-                    match send_sock.try_send_to(&pkt, addr) {
-                        Ok(_) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // 发送缓冲满：退回异步路径等待可写。
-                            if send_sock.send_to(&pkt, addr).await.is_ok() {
-                                break;
-                            }
+                match send_sock.try_send_to(&pkt, addr) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // 发送缓冲满：退回异步路径等待可写。
+                        if send_sock.send_to(&pkt, addr).await.is_err() {
                             tokio::time::sleep(Duration::from_millis(5)).await;
-                            break;
                         }
-                        Err(_) => {
-                            // ICMP 毒化等瞬态：短暂退避后继续（通道关闭才是退出条件）。
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                            break;
-                        }
+                    }
+                    Err(_) => {
+                        // ICMP 毒化等瞬态：短暂退避后继续（通道关闭才是退出条件）。
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
             }
@@ -1491,20 +1567,15 @@ pub async fn serve_udt_on(
                 }
             }
             for (dst, pkt) in batch {
-                loop {
-                    match out_sock.try_send_to(&pkt, dst) {
-                        Ok(_) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if out_sock.send_to(&pkt, dst).await.is_ok() {
-                                break;
-                            }
+                match out_sock.try_send_to(&pkt, dst) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if out_sock.send_to(&pkt, dst).await.is_err() {
                             tokio::time::sleep(Duration::from_millis(5)).await;
-                            break;
                         }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                            break;
-                        }
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
             }
@@ -1562,7 +1633,7 @@ pub async fn serve_udt_on(
                 } = pkt
                 {
                     if dst == 0 || dst == listener_id {
-                        pw::Handshake::from_words(words).map(|hs| hs)
+                        pw::Handshake::from_words(words)
                     } else {
                         None
                     }

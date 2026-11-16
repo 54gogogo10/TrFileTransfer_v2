@@ -31,16 +31,25 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// spawn_hidden 的收尾动作留痕（UI-1 P3-7）：失败写 warn 日志。
+fn log_spawn(app: &tauri::AppHandle, r: std::io::Result<()>, what: &str) {
+    if let Err(e) = r {
+        emit_log(app, "warn", &format!("{what}启动失败: {e}"));
+    }
+}
+
 /// 静默启动子进程（Windows CREATE_NO_WINDOW，不闪控制台）。
-fn spawn_hidden(mut c: std::process::Command) {
+/// UI-1 P3-7：返回 spawn 结果——完成后动作（关机/休眠/命令）失败必须留痕，
+/// 否则用户以为收尾动作已执行。
+fn spawn_hidden(mut c: std::process::Command) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let _ = c.creation_flags(0x0800_0000).spawn();
+        c.creation_flags(0x0800_0000).spawn().map(|_| ())
     }
     #[cfg(not(windows))]
     {
-        let _ = c.spawn();
+        c.spawn().map(|_| ())
     }
 }
 
@@ -50,7 +59,7 @@ fn spawn_hidden(mut c: std::process::Command) {
 /// 此前从任意 tokio worker 调用——worker A 置位、worker B 清零时 B 清不掉 A 的
 /// 状态，ES_SYSTEM_REQUIRED 残留令系统永久不得休眠。统一经 Tauri 主线程执行
 /// （生命周期与进程一致，设置/清除同线程）。
-fn update_awake(app: &tauri::AppHandle) {
+pub fn update_awake<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let st = app.state::<AppState>();
     let active = {
         let receivers = st.receivers.lock().expect("接收器锁").len();
@@ -294,6 +303,9 @@ fn finish_task(app: &tauri::AppHandle, id: u64, settled: Option<&std::sync::atom
         let mut t = st.tasks.lock().expect("任务锁");
         t.remove(&id);
         st.task_progress.lock().expect("映射锁").remove(&id);
+        // UI-4 P3-5：取消记账兜底回收（队列完成/竞争完结路径不消费该集合，
+        // 条目只增不减——量级微小，但统一在收尾点清理最稳）。
+        st.user_cancelled.lock().expect("取消记账锁").remove(&id);
         if let Some(s) = settled {
             s.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -591,6 +603,12 @@ pub fn send_cancel(app: tauri::AppHandle, id: u64, paused: Option<bool>) {
         g.remove(&id)
     };
     if let Some(t) = t {
+        // 轮 UI-4 F5：先记账后 abort——另一 worker 在 insert 前消费到 done 断流
+        // 会把已取消任务误判失败并重试复活（窗口极窄，对调即闭合）。
+        {
+            let st = app.state::<AppState>();
+            st.user_cancelled.lock().expect("取消记账锁").insert(id);
+        }
         t.handle.abort();
         // 补发终态事件（轮 7 P2）：abort 掐断的 future 不会走 settle_send——
         // 群发汇总（groupPending）依赖 trft://task 收敛。
@@ -639,7 +657,18 @@ pub async fn send_queue(
         let mut ok_n = 0u32;
         for (i, item) in items.into_iter().enumerate() {
             let label = format!("队列 {}/{}", i + 1, item.display_name());
-            let mut sub = run_single_send(app2.clone(), item.clone()).await;
+            // UI-1 P2-3/P3-12：参数错误与用户终止不进重试环（确定性结局）。
+            let mut sub = match run_single_send(app2.clone(), item.clone()).await {
+                QueueItemResult::ParamErr(e) => {
+                    emit_log(&app2, "warn", &format!("{label} 参数错误，跳过重试：{e}"));
+                    continue;
+                }
+                QueueItemResult::UserCancelled => {
+                    emit_log(&app2, "warn", &format!("{label} 已被用户终止，跳过"));
+                    continue;
+                }
+                QueueItemResult::Outcome(r) => r,
+            };
             let mut attempt = 0u32;
             while sub.is_err() && attempt < retries {
                 attempt += 1;
@@ -648,7 +677,18 @@ pub async fn send_queue(
                     "warn",
                     &format!("{label} 失败，重试 {attempt}/{retries}"),
                 );
-                sub = run_single_send(app2.clone(), item.clone()).await;
+                sub = match run_single_send(app2.clone(), item.clone()).await {
+                    QueueItemResult::Outcome(r) => r,
+                    // 重试等待期间用户终止/参数变化 → 尊重，不再继续重试。
+                    QueueItemResult::UserCancelled => {
+                        emit_log(&app2, "warn", &format!("{label} 已被用户终止，停止重试"));
+                        break;
+                    }
+                    QueueItemResult::ParamErr(e) => {
+                        emit_log(&app2, "warn", &format!("{label} 参数错误，停止重试：{e}"));
+                        break;
+                    }
+                };
             }
             if sub.is_ok() {
                 ok_n += 1;
@@ -673,19 +713,19 @@ pub async fn send_queue(
             Some("shutdown") => {
                 let mut c = std::process::Command::new("cmd");
                 c.args(["/C", "shutdown", "/s", "/t", "60"]);
-                spawn_hidden(c);
+                log_spawn(&app2, spawn_hidden(c), "关机命令");
                 emit_log(&app2, "warn", "系统将在 60 秒后关机（shutdown /a 可取消）");
             }
             Some("sleep") => {
                 let mut c = std::process::Command::new("rundll32.exe");
                 c.args(["powrprof.dll,SetSuspendState", "0,1,0"]);
-                spawn_hidden(c);
+                log_spawn(&app2, spawn_hidden(c), "休眠命令");
             }
             Some("command") => {
                 if let Some(cmd) = after_command.filter(|c| !c.trim().is_empty()) {
                     let mut c = std::process::Command::new("cmd");
                     c.args(["/C", cmd.trim()]);
-                    spawn_hidden(c);
+                    log_spawn(&app2, spawn_hidden(c), "完成后命令");
                 }
             }
             _ => {}
@@ -703,13 +743,39 @@ pub async fn send_queue(
 /// 于是重试恒不触发、失败恒被计成完成、全失败仍执行完成后动作（关机/休眠）。
 const QUEUE_ITEM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
-async fn run_single_send(app: tauri::AppHandle, req: SendRequest) -> Result<(), String> {
-    let (_id, done) = spawn_send(app, req).await?;
+/// 单条执行结局（UI-1 P2-3/P3-12）：
+/// - `ParamErr`：spawn 前置校验失败（地址/参数错）——确定性失败，不重试；
+/// - `UserCancelled`：用户暂停/取消（send_cancel 记账）——不重试不计失败重发；
+/// - `Outcome`：传输真实结果（失败可按配置重试）。
+enum QueueItemResult {
+    ParamErr(String),
+    UserCancelled,
+    Outcome(Result<(), String>),
+}
+
+async fn run_single_send(app: tauri::AppHandle, req: SendRequest) -> QueueItemResult {
+    let (id, done) = match spawn_send(app.clone(), req).await {
+        Ok(v) => v,
+        Err(e) => return QueueItemResult::ParamErr(e),
+    };
     match tokio::time::timeout(QUEUE_ITEM_TIMEOUT, done).await {
-        Ok(Ok(res)) => res,
-        // 发送端被 abort/进程收尾：通道断开 = 结果未知，按失败处理（判错方向）。
-        Ok(Err(_)) => Err("传输任务未回报结果（被取消或异常结束）".into()),
-        Err(_) => Err("等待传输结果超时（24 小时）".into()),
+        Ok(Ok(res)) => QueueItemResult::Outcome(res),
+        // 发送端被 abort/进程收尾：通道断开 = 结果未知，按失败处理（判错方向）；
+        // 但用户主动终止（暂停/取消）除外——重试会复活用户刚掐掉的传输。
+        Ok(Err(_)) => {
+            let cancelled = app
+                .state::<AppState>()
+                .user_cancelled
+                .lock()
+                .expect("取消记账锁")
+                .remove(&id);
+            if cancelled {
+                QueueItemResult::UserCancelled
+            } else {
+                QueueItemResult::Outcome(Err("传输任务未回报结果（被取消或异常结束）".into()))
+            }
+        }
+        Err(_) => QueueItemResult::Outcome(Err("等待传输结果超时（24 小时）".into())),
     }
 }
 
@@ -1399,15 +1465,17 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
     {
         let st = app.state::<AppState>();
         // 重入守卫（轮 7 F6）：tasks 表仍有校验任务 → 拒绝（双击会并发两个
-        // 扫描、双份进度/结果事件互踩）。先清 stop 残留标志再建任务。
+        // 扫描、双份进度/结果事件互踩）。
+        // UI-1 P3-2：busy 判定先行——先 store(false) 会把用户刚点的「停止」
+        // 请求静默吞掉（旧任务继续跑、新任务被拒）。
         let busy = {
             let t = st.tasks.lock().expect("任务锁");
             !t.is_empty()
         };
-        st.verify_stop.store(false, Ordering::Relaxed);
         if busy {
             return Err("校验已在进行中".into());
         }
+        st.verify_stop.store(false, Ordering::Relaxed);
     }
     let cfg = app.state::<AppState>().config();
     // 去重 + 仅存在的根（规格 §3.5）。
@@ -1682,8 +1750,9 @@ pub fn confirm_reply(app: tauri::AppHandle, id: u64, allow: bool) -> Result<(), 
         .remove(&id);
     match reply {
         Some(tx) => {
-            let _ = tx.send(allow);
-            Ok(())
+            // UI-1 P3-11：条目在表但 core 侧 30s 看门狗已超时、接收端 drop 时
+            // send 静默失败——不得回 Ok 让前端以为已确认。
+            tx.send(allow).map_err(|_| "确认请求已超时".to_string())
         }
         None => Err("确认请求不存在或已超时".into()),
     }
@@ -1904,9 +1973,17 @@ pub async fn monitor_stop(app: tauri::AppHandle) -> Result<(), String> {
         let mut g = st.monitor_handle.lock().expect("监控锁");
         g.take()
     };
-    if let Some(t) = h {
-        // 给循环最多 2s 自然退出（abort 兜底——半成品由孤儿清扫兜底口径不变）。
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), t.handle).await;
+    if let Some(mut t) = h {
+        // 给循环最多 2s 自然退出；超时则显式 abort（UI-1 P2-1：JoinHandle 被
+        // move 进 timeout future 后随其 drop = 脱管而非 abort——注释里宣称的
+        // 「abort 兜底」此前并不存在，慢速目录上的同步 IO 可让监控变僵尸：
+        // 槽位已空、状态已停、任务仍在归档/外发。按引用等待保留句柄）。
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut t.handle)
+            .await
+            .is_err()
+        {
+            t.handle.abort();
+        }
     }
     let _ = app.emit(
         "trft://log",
@@ -2063,6 +2140,10 @@ fn text_history_path() -> PathBuf {
 /// ~200MB，且每条触发全量重读+重写（磁盘写放大 200:1、async worker 阻塞）；
 /// 前端展示只取 120 字符，2KB 足够。
 pub fn text_history_append(text: &str) {
+    // UI-4 P3-10：进程级串行化——每条接收器各有一个文本消费任务并发做
+    // 「全量读→改→原子重写」，后写覆盖前写丢一条历史（两协议同收文本即触发）。
+    static APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = APPEND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = text_history_path();
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
         .map(|t| t.lines().rev().map(String::from).collect())

@@ -96,17 +96,20 @@ fn is_reserved_name(name: &str) -> bool {
 }
 
 /// C# SafeName：取裸文件名、去尾点/空格、保留名加前缀。
+/// 轮 UI-3 安全 P1-1：冒号必须替换——`victim.exe:Zone.Identifier` 会以 NTFS
+/// 备用数据流落盘（覆写 MotW，SmartScreen 防线失效；挂隐藏流同向量）。与
+/// `cs_sanitize_rel` 的冒号替换同语义（v2 帧 sanitize_name 则直接拒绝）。
 pub fn cs_safe_name(raw: &str, fallback: &str) -> String {
     let name = raw.rsplit(['\\', '/']).next().unwrap_or("");
-    let mut name = if name.trim().is_empty() { fallback } else { name };
-    name = name.trim_end_matches(['.', ' ']);
+    let name = if name.trim().is_empty() { fallback } else { name };
+    let name = name.trim_end_matches(['.', ' ']).replace(':', "_");
     if name.is_empty() {
         return fallback.to_string();
     }
-    if is_reserved_name(name) {
+    if is_reserved_name(&name) {
         return format!("_{name}");
     }
-    name.to_string()
+    name
 }
 
 /// C# SanitizeRelativePath：'/' 归一、去 '..'/'.'、':' 替换、保留名加前缀。
@@ -133,6 +136,8 @@ pub fn cs_sanitize_rel(path: &str) -> String {
 }
 
 /// C# GetUniqueSavePath：`name` → `name_1.ext` → `name_2.ext` …
+/// 探测上限 10000（轮 UI-3 P3-6：攻击者预填同族文件不再把探测拖成无界
+/// O(N) 系统调用风暴；耗尽走随机后缀兜底名）。
 pub fn cs_unique_save_path(dir: &Path, name: &str) -> PathBuf {
     let p = dir.join(name);
     if !p.exists() {
@@ -147,14 +152,78 @@ pub fn cs_unique_save_path(dir: &Path, name: &str) -> PathBuf {
         .and_then(|s| s.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
-    let mut i = 1;
-    loop {
+    for i in 1..=10000u32 {
         let cand = dir.join(format!("{stem}_{i}{ext}"));
         if !cand.exists() {
             return cand;
         }
-        i += 1;
     }
+    dir.join(format!("{stem}.{}{ext}", random_hex(8)))
+}
+
+/// 半成品 → 最终名发布（轮 UI-3 安全 P2-1：对齐 v2 publish_part 纪律——
+/// Windows rename 静默替换既有目标，探测与发布之间的拷贝窗口可被并发发布者
+/// 利用做完整性冒充；hard_link fail-if-exists + 冲突名重取 + 非硬链接卷
+/// create_new 拷贝回退）。返回实际落盘路径（冲突时为 `name_N`）。
+fn cs_publish(temp: &Path, save_path: &Path) -> io::Result<PathBuf> {
+    let dir = save_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = save_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stem = Path::new(&name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&name)
+        .to_string();
+    let ext = Path::new(&name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    for i in 0..10000u32 {
+        let cand = if i == 0 {
+            save_path.to_path_buf()
+        } else {
+            dir.join(format!("{stem}_{i}{ext}"))
+        };
+        match std::fs::hard_link(temp, &cand) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temp);
+                return Ok(cand);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                // 卷不支持硬链接：create_new 拷贝回退（fail-if-exists 语义不变）。
+                // 轮 UI-4 F4：candidate error-guard——拷贝/sync 中途失败先删候选，
+                // 不以最终名残留半成品（对齐 publish_part 轮 8 修复）。
+                let copied = (|| -> io::Result<()> {
+                    let mut src = std::fs::File::open(temp)?;
+                    let mut dst = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&cand)?;
+                    std::io::copy(&mut src, &mut dst)?;
+                    dst.sync_all()?;
+                    Ok(())
+                })();
+                match copied {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(temp);
+                        return Ok(cand);
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&cand);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "冲突名解析耗尽",
+    ))
 }
 
 fn random_hex(n: usize) -> String {
@@ -936,9 +1005,22 @@ pub struct CsServerState {
     /// C# FileHashes 进程内存 Dictionary 同语义：重复同步免整盘重读；不落盘，
     /// 无磁盘产物副作用，服务端重启即失 = 保守方向）。
     pub sync_hashes: Mutex<HashMap<(u64, u64, u64), [u8; 32]>>,
-    /// 组会话归属（guid → 首个 peer IP）。
-    pub group_peers: Mutex<HashMap<String, String>>,
+    /// 组会话归属（guid → (首个 peer IP, 最后活跃)）。
+    pub group_peers: Mutex<HashMap<String, (String, Instant)>>,
+    /// 跨连接存活会话（0x02 tracker + 0x03 resume）的声明总量记账
+    /// （轮 UI-2 P2-2——对齐 udp.rs DECLARED_CAP 口径：无配对码 LAN 服务器上
+    /// 恶意声明大 total 的 set_len 磁盘放大封顶）。
+    pub declared_total: std::sync::atomic::AtomicU64,
 }
+
+/// 声明总量封顶（64 GiB——与 udp.rs DECLARED_CAP 同口径）。
+const CS_DECLARED_CAP: u64 = 64 * 1024 * 1024 * 1024;
+/// tracker 空闲回收窗（活动连接分块间隔远小于此——纯死条目阈值）。
+const CS_TRACKER_TTL: Duration = Duration::from_secs(15 * 60);
+/// 断点会话空闲回收窗（用户驱动的重连间隔友好余量；活跃传输逐块刷新）。
+const CS_RESUME_TTL: Duration = Duration::from_secs(30 * 60);
+/// 0x04 摘要缓存条目封顶（对齐 hashcache DEGRADED_MAP_CAP 纪律——轮 UI-2 P3-1）。
+const CS_SYNC_HASH_CAP: usize = 200_000;
 
 /// C# ChunkTracker 等价物：预分配文件 + 区间合并覆盖。
 pub struct CsChunkTracker {
@@ -947,11 +1029,21 @@ pub struct CsChunkTracker {
     file: std::fs::File,
     ranges: Vec<(u64, u64)>, // 闭区间，已合并升序
     pub received: u64,
+    /// 最后活跃（轮 UI-2 P2-1：连接中断的 tracker 此前永驻 + 持有文件句柄；
+    /// TTL 惰性清扫用）。
+    touched: Instant,
 }
 
 impl CsChunkTracker {
     fn create(save_path: PathBuf, total: u64) -> io::Result<Self> {
         use std::io::Write;
+        // 磁盘预检（轮 UI-2 P2-2——对齐 v2 帧全部接收路径：恶意声明大 total
+        // 的 set_len 磁盘放大在此拦下；目录取保存路径父目录）。
+        if let Some(dir) = save_path.parent() {
+            if !crate::transfer::receiver::space_ok(dir, total) {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "磁盘可用空间不足"));
+            }
+        }
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -966,12 +1058,14 @@ impl CsChunkTracker {
             file: f,
             ranges: Vec::new(),
             received: 0,
+            touched: Instant::now(),
         })
     }
 
     /// 写入一个偏移段；返回是否已完整覆盖 [0, total)。
     fn write_chunk(&mut self, off: u64, data: &[u8]) -> io::Result<bool> {
         use std::io::{Seek, SeekFrom, Write};
+        self.touched = Instant::now();
         self.file.seek(SeekFrom::Start(off))?;
         self.file.write_all(data)?;
         self.received += data.len() as u64;
@@ -1015,6 +1109,98 @@ pub struct CsResumeState {
     /// 首个 peer IP（轮 6 P1——外来 peer 猜中/重放 sid 不得续写他人会话；
     /// C# ResumeLocks + state.Peer 同防线）。
     pub peer_ip: String,
+    /// 最后活跃（轮 UI-2 P2-1：中断会话 TTL 清扫用——活跃传输逐块刷新）。
+    pub touched: Instant,
+}
+
+/* ============ 跨连接会话纪律：声明总量记账 + TTL 惰性清扫（轮 UI-2 P2-1/P2-2） ============ */
+
+/// 声明总量记账（fetch_add / fetch_sub 对称；溢出方向封顶拒绝）。
+fn cs_declare(state: &CsServerState, amount: u64) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    // CAS 循环防并发超额（fetch_add 会瞬时越界）。
+    let mut cur = state.declared_total.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = cur.checked_add(amount) else {
+            return Err(Error::Rejected("声明总量超限".into()));
+        };
+        if next > CS_DECLARED_CAP {
+            return Err(Error::Rejected(format!(
+                "声明总量超过 {} GiB 上限",
+                CS_DECLARED_CAP / (1 << 30)
+            )));
+        }
+        match state.declared_total.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn cs_release_declared(state: &CsServerState, amount: u64) {
+    use std::sync::atomic::Ordering;
+    state
+        .declared_total
+        .fetch_sub(amount, Ordering::Relaxed); // 记账对称：不会下溢（只有 declare 过才 release）
+}
+
+/// 惰性清扫：在 0x02/0x03 处理器入口调用。
+/// - tracker 空闲 > CS_TRACKER_TTL：摘表（drop 句柄）+ 释放声明量 + 删半成品
+///   （轮 UI-4 F3：组装器已改 `.trft-part` 半成品名——清扫可安全回收，时间
+///   维度不再绕过磁盘封顶；重建路径本就截断重建，无残值损失）。
+/// - resume 空闲 > CS_RESUME_TTL：摘会话 + 摘门 + 释放声明量（残件文件保留，
+///   会话失忆后客户端重连按新传走 cs_unique_save_path，不覆盖旧残件）。
+/// - group_peers 同窗清扫 + 硬上限（轮 UI-4 F9：伪造 guid 洪水防表膨胀）。
+fn cs_sweep_stale(state: &CsServerState) {
+    let now = Instant::now();
+    {
+        let mut t = state.trackers.lock().expect("tracker 锁");
+        let stale: Vec<String> = t
+            .iter()
+            .filter(|(_, tr)| now.duration_since(tr.touched) > CS_TRACKER_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            if let Some(tr) = t.remove(&k) {
+                cs_release_declared(state, tr.total);
+                let _ = std::fs::remove_file(&tr.save_path);
+            }
+        }
+    }
+    {
+        let mut rs = state.resume.lock().expect("resume 锁");
+        let stale: Vec<String> = rs
+            .iter()
+            .filter(|(_, st)| now.duration_since(st.touched) > CS_RESUME_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            if let Some(st) = rs.remove(&k) {
+                cs_release_declared(state, st.total);
+                state.resume_gates.lock().expect("resume 门锁").remove(&k);
+            }
+        }
+    }
+    state
+        .group_peers
+        .lock()
+        .expect("组归属锁")
+        .retain(|_, (_, ts)| now.duration_since(*ts) < CS_RESUME_TTL);
+    // 硬上限（confirm_seen 同纪律）：TTL 窗口内洪水仍可能有界膨胀。
+    {
+        let mut owners = state.group_peers.lock().expect("组归属锁");
+        if owners.len() > 4096 {
+            let mut v: Vec<_> = owners.drain().collect();
+            v.sort_by_key(|(_, (_, ts))| *ts);
+            v.truncate(2048);
+            owners.extend(v);
+        }
+    }
 }
 
 
@@ -1052,7 +1238,13 @@ fn sync_hash_of(
         return *h;
     }
     let h = crate::hash::sha256_file(p).unwrap_or_default();
-    state.sync_hashes.lock().expect("同步缓存锁").insert(key, h);
+    let mut cache = state.sync_hashes.lock().expect("同步缓存锁");
+    // 条目封顶（轮 UI-2 P3-1——对齐 hashcache DEGRADED_MAP_CAP：百万文件级
+    // 目录反复同步此前无界累积；满即清空重建，miss 只多一次读盘）。
+    if cache.len() >= CS_SYNC_HASH_CAP {
+        cache.clear();
+    }
+    cache.insert(key, h);
     h
 }
 
@@ -1305,7 +1497,7 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
             {
                 let owners = state.group_peers.lock().expect("组归属锁");
                 match owners.get(&key) {
-                    Some(owner) if *owner != peer.ip().to_string() => {
+                    Some((owner, _)) if *owner != peer.ip().to_string() => {
                         drop(owners);
                         outcome.rejected = true;
                         return Err(Error::Rejected("分块组会话属于其他设备".into()));
@@ -1355,7 +1547,18 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(r) = reporter {
         r.set_total(size);
     }
-    let temp = save_path.with_extension(format!("part-{}", random_hex(8)));
+    // 半成品命名：`<原名>.<hex>.trft-part`（轮 UI-2 P2-1——旧命名 `.part-<hex>`
+    // 不匹配任何孤儿清扫器，中断残件永久残留用户目录；现被三个
+    // cleanup_part_orphans 同口径覆盖，7 天回收）。
+    let mut temp_os = save_path.as_os_str().to_os_string();
+    temp_os.push(format!(".{}.trft-part", random_hex(8)));
+    let temp = PathBuf::from(temp_os);
+    // 磁盘预检（轮 UI-2 P2-2——对齐 v2 帧接收路径：宣大 size 的截断放大拦下）。
+    if let Some(dir) = save_path.parent() {
+        if !crate::transfer::receiver::space_ok(dir, size) {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::StorageFull, "磁盘可用空间不足")));
+        }
+    }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1397,7 +1600,7 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
         let _ = std::fs::remove_file(&temp);
         return Err(Error::Rejected(format!("{display}: SHA-256 校验失败")));
     }
-    std::fs::rename(&temp, save_path)?;
+    cs_publish(&temp, save_path).map_err(Error::Io)?;
     Ok(computed)
 }
 
@@ -1560,13 +1763,15 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             // 组归属绑定（防外来 peer 写入他人组装——C# ChunkSessionPeers 同防线）。
             let ip = peer.ip().to_string();
             let mut owners = state.group_peers.lock().expect("组归属锁");
-            match owners.get(g) {
-                Some(owner) if *owner != ip => {
+            match owners.get_mut(g) {
+                Some((owner, ts)) if *owner != ip => {
                     return Err(Error::Rejected("分块组会话属于其他设备".into()));
                 }
-                Some(_) => {}
+                Some((_, ts)) => {
+                    *ts = Instant::now(); // 活跃刷新（TTL 清扫依据）
+                }
                 None => {
-                    owners.insert(g.clone(), ip);
+                    owners.insert(g.clone(), (ip, Instant::now()));
                 }
             }
             format!("S|{g}")
@@ -1575,6 +1780,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     // 组装器（大小不符的遗留 tracker 重建——C# 同策略）。
+    cs_sweep_stale(state); // 轮 UI-2 P2-1：入口惰性清扫（死 tracker/会话不再永驻）
     {
         let mut t = state.trackers.lock().expect("tracker 锁");
         let stale = match t.get(&tracker_key) {
@@ -1583,11 +1789,23 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             None => None,
         };
         if let Some(st) = stale {
+            cs_release_declared(state, st.total); // 旧声明量随重建释放
             let _ = std::fs::remove_file(&st.save_path);
         }
         if !t.contains_key(&tracker_key) {
-            let save_path = cs_unique_save_path(save_dir, &name);
-            let tr = CsChunkTracker::create(save_path, total as u64).map_err(Error::Io)?;
+            // 轮 UI-4 F2/F3：declare 先于 create（被拒时不落盘）；组装器落盘改用
+            // `.trft-part` 半成品名（旧最终名 + TTL 不敢删 = 时间维度绕过磁盘封顶；
+            // 半成品名让 TTL 清扫可安全回收，完成时经 cs_publish 原子发布）。
+            cs_declare(state, total as u64)?;
+            let mut part_os = cs_unique_save_path(save_dir, &name).into_os_string();
+            part_os.push(format!(".{}.trft-part", random_hex(8)));
+            let tr = match CsChunkTracker::create(PathBuf::from(part_os), total as u64) {
+                Ok(tr) => tr,
+                Err(e) => {
+                    cs_release_declared(state, total as u64);
+                    return Err(Error::Io(e));
+                }
+            };
             t.insert(tracker_key.clone(), tr);
         }
     }
@@ -1627,6 +1845,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
     if !ct_eq(&got, &computed) {
         let t = state.trackers.lock().expect("tracker 锁").remove(&tracker_key);
         if let Some(tr) = t {
+            cs_release_declared(state, tr.total);
             let _ = std::fs::remove_file(&tr.save_path);
         }
         return Ok(false);
@@ -1638,9 +1857,20 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             .expect("tracker 锁")
             .remove(&tracker_key);
         if let Some(tr) = t {
+            cs_release_declared(state, tr.total);
             if let Some(g) = &group_key {
                 state.group_peers.lock().expect("组归属锁").remove(g);
             }
+            // 半成品 → 最终名原子发布（轮 UI-4 F3：hard_link fail-if-exists，
+            // 冲突名重取；发布失败清半成品回滚——最终名上不留截断内容）。
+            let final_path = match cs_publish(&tr.save_path, &cs_unique_save_path(save_dir, &name))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tr.save_path);
+                    return Err(Error::Io(e));
+                }
+            };
             record_recv(
                 opts,
                 peer,
@@ -1648,7 +1878,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
                 1,
                 Instant::now(),
                 "分块传输",
-                &tr.save_path,
+                &final_path,
             );
             if let Some(r) = &reporter {
                 r.finish();
@@ -1710,13 +1940,17 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
     let key = guid_hex(&sid);
     // 单飞锁（轮 6 P1——同名 sid 两连接并发 append 会交错写坏文件；C# ResumeLocks
     // TryWait(0) 同防线）+ peer 绑定校验。锁随会话生命周期存续，完成时清理。
+    // 轮 UI-2 P1-1：guard 必须绑定变量持有到函数尾——旧写法 `if
+    // resume_gate.try_lock().is_err()` 里 Ok(guard) 是条件临时值，判定完即
+    // drop，锁形同虚设（两连接同 sid 仍可并发 append 交错写坏文件）。
+    cs_sweep_stale(state); // 轮 UI-2 P2-1：入口惰性清扫
     let resume_gate = {
         let mut gates = state.resume_gates.lock().expect("resume 门锁");
         gates.entry(key.clone()).or_default().clone()
     };
-    if resume_gate.try_lock().is_err() {
-        return Err(Error::Rejected("该续传会话正被另一连接使用".into()));
-    }
+    let _resume_guard = resume_gate
+        .try_lock()
+        .map_err(|_| Error::Rejected("该续传会话正被另一连接使用".into()))?;
     let ip = peer.ip().to_string();
     // 会话解析：status 0 新传 / 1 续传 / 2 已完整（服务端权威 offset——客户端虚报不采信，
     // C# HandleResumableCore 同语义）。
@@ -1732,12 +1966,18 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                 if st.peer_ip != ip {
                     return Err(Error::Rejected("续传会话属于其他设备".into()));
                 }
+                st.touched = Instant::now(); // 活跃刷新（TTL 清扫依据）
                 Session::Resume(st.save_path.clone(), st.received)
             }
             Some(st) if st.total == total as u64 => Session::Done(st.save_path.clone()),
             _ => {
                 let save_path = cs_unique_save_path(save_dir, &name);
-                rs.insert(
+                // 声明总量记账（轮 UI-2 P2-2）：跨连接存活的断点会话纳入封顶。
+                cs_declare(state, total as u64)?;
+                // 轮 UI-4 F1：同 sid 不同 total 覆盖旧会话——旧声明量必须先释放，
+                // 否则 declared_total 单调泄漏，远程几轮即可打满 64GiB 封顶
+                // 令 UDT 槽位 0x02/0x03 全拒（持久 DoS）。
+                let old = rs.insert(
                     key.clone(),
                     CsResumeState {
                         save_path,
@@ -1745,8 +1985,13 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                         received: 0,
                         name: name.clone(),
                         peer_ip: ip.clone(),
+                        touched: Instant::now(),
                     },
                 );
+                if let Some(old) = old {
+                    cs_release_declared(state, old.total);
+                    state.resume_gates.lock().expect("resume 门锁").remove(&key);
+                }
                 let p = rs.get(&key).expect("刚插入").save_path.clone();
                 Session::New(p)
             }
@@ -1757,12 +2002,15 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
             record_recv(opts, peer, total as u64, 1, Instant::now(), "续传传输", &path);
             let st = state.resume.lock().expect("resume 锁").remove(&key);
             state.resume_gates.lock().expect("resume 门锁").remove(&key);
+            if let Some(st) = &st {
+                cs_release_declared(state, st.total);
+            }
             drop(st);
             if let Some(r) = &reporter {
                 r.finish();
             }
             send_resume_response(wire, total, 2).await?;
-            return Ok(true);
+            Ok(true)
         }
         Session::New(path) => {
             send_resume_response(wire, 0, 0).await?;
@@ -1812,6 +2060,12 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<bool> {
     use sha2::Digest;
     use std::io::{Seek as _, Write as _};
+    // 磁盘预检（轮 UI-2 P2-2：追加段也占空间——与 v2 帧接收路径同口径）。
+    if let Some(dir) = path.parent() {
+        if !crate::transfer::receiver::space_ok(dir, total - start) {
+            return Err(Error::Io(io::Error::new(io::ErrorKind::StorageFull, "磁盘可用空间不足")));
+        }
+    }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1820,11 +2074,23 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
     let mut hasher = sha2::Sha256::new();
     let mut remaining = total - start;
     let mut buf = vec![0u8; CS_RECV_BUF];
+    // 首块静默窗（轮 UI-2 P2-3：0x10 应答后挂活不发体的 peer 不得占闸——
+    // receive_payload 同款；后续块无窗兼容合法慢速限速）。
+    let mut first_block = true;
     while remaining > 0 {
         // 部分读：中断前的到达字节必须立即记账（C# ReadSomeAsync 同构——
         // read_exact 会让不足一块的进度滞留 socket，续点回退）。
         let want = buf.len().min(remaining as usize);
-        let n = wire.read_some(&mut buf[..want]).await?;
+        let n = if first_block {
+            match tokio::time::timeout(PRELUDE_IDLE, wire.read_some(&mut buf[..want])).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(Error::Io(e)),
+                Err(_) => return Err(proto("续传体首块静默超时（30s）")),
+            }
+        } else {
+            wire.read_some(&mut buf[..want]).await?
+        };
+        first_block = false;
         if n == 0 {
             return Err(Error::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "对端中断")));
         }
@@ -1838,6 +2104,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
             let mut rs = state.resume.lock().expect("resume 锁");
             if let Some(st) = rs.get_mut(key) {
                 st.received += n as u64;
+                st.touched = Instant::now(); // 活跃刷新（TTL 清扫依据）
             }
         }
         if let Some(r) = reporter {
@@ -1852,6 +2119,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
         let st = state.resume.lock().expect("resume 锁").remove(key);
         state.resume_gates.lock().expect("resume 门锁").remove(key);
         if let Some(st) = st {
+            cs_release_declared(state, st.total);
             let _ = std::fs::remove_file(&st.save_path);
         }
         return Ok(false);
@@ -1863,6 +2131,7 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
             let st = state.resume.lock().expect("resume 锁").remove(key);
             state.resume_gates.lock().expect("resume 门锁").remove(key);
             if let Some(st) = st {
+                cs_release_declared(state, st.total);
                 let _ = std::fs::remove_file(&st.save_path);
             }
             send_resume_response(wire, total as i64, 3).await?;
@@ -1871,6 +2140,9 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let st = state.resume.lock().expect("resume 锁").remove(key);
     state.resume_gates.lock().expect("resume 门锁").remove(key);
+    if let Some(st) = &st {
+        cs_release_declared(state, st.total);
+    }
     if let Some(st) = st {
         record_recv(opts, peer, total, 1, Instant::now(), "续传传输", &st.save_path);
     }
@@ -2059,17 +2331,29 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             std::fs::create_dir_all(parent)?;
         }
         if start == 0 {
-            let temp = save_path.with_extension(format!("part-{}", random_hex(8)));
+            // 外层暂存名同口径 `.trft-part` 后缀（轮 UI-2 P2-1：成功后 2069 行
+            // rename 失败的残件也在清扫器覆盖内）。
+            let mut temp_os = save_path.clone().into_os_string();
+            temp_os.push(format!(".{}.trft-part", random_hex(8)));
+            let temp = PathBuf::from(temp_os);
             let r = receive_payload(wire, &temp, e.size, &e.rel, limiter, &reporter).await;
             match r {
                 Ok(_) => {
-                    std::fs::rename(&temp, &save_path)?;
+                    // 轮 UI-4 P3-2：发布走 cs_publish（裸 rename 在 Unix 上静默
+                    // 替换既有目标——0x00 已堵的完整性冒充向量，0x04 路径对齐）。
+                    // 0x04 会话内重发 = 服务端已核对「不 identical」的同名文件
+                    // ——替换是会话语义；cs_publish 的防覆盖守卫针对新到文件，
+                    // 此处先摘旧文件再发布（旧内容已确认过期）。
+                    let _ = std::fs::remove_file(&save_path);
+                    cs_publish(&temp, &save_path).map_err(Error::Io)?;
                 }
                 Err(_) => {
                     // 残件保留（轮 9 P2-5，对齐 C# WireProtocol "Keep the partial
                     // file"——改名入续点扫描视野，下一轮 0x04 以 len<size 续传；
                     // 收到的损坏字节由续传分支的全文件复核兜底，不会假成功）。
-                    let _ = std::fs::rename(&temp, &save_path);
+                    // 发布失败仅丢「续件」，不丢数据完整性（下一轮全量重传）。
+                    let _ = std::fs::remove_file(&save_path);
+                    let _ = cs_publish(&temp, &save_path);
                     return Ok((false, 0, files));
                 }
             }
@@ -2077,13 +2361,27 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             // 增量续传：追加 + 增量哈希 + 全文件复核（C# HandleFolderResumableAsync 同构）。
             use sha2::Digest;
             use std::io::Write as _;
+            // 磁盘预检 + 首块静默窗（轮 UI-2 P2-2/P2-3——与主路径同口径）。
+            if let Some(dir) = save_path.parent() {
+                if !crate::transfer::receiver::space_ok(dir, e.size - start) {
+                    return Err(Error::Io(io::Error::new(io::ErrorKind::StorageFull, "磁盘可用空间不足")));
+                }
+            }
             let mut f = std::fs::OpenOptions::new().append(true).open(&save_path)?;
             let mut hasher = sha2::Sha256::new();
             let mut remaining = e.size - start;
             let mut buf = vec![0u8; CS_RECV_BUF];
+            let mut first_block = true;
             while remaining > 0 {
                 let n = buf.len().min(remaining as usize);
-                wire.read_exact(&mut buf[..n]).await?;
+                if first_block {
+                    tokio::time::timeout(PRELUDE_IDLE, wire.read_exact(&mut buf[..n]))
+                        .await
+                        .map_err(|_| proto("续传体首块静默超时（30s）"))??;
+                    first_block = false;
+                } else {
+                    wire.read_exact(&mut buf[..n]).await?;
+                }
                 if let Some(l) = limiter {
                     l.acquire(n as u64).await;
                 }
@@ -2777,11 +3075,9 @@ pub async fn send_folder_cs(
             files,
             started,
             "目录",
-            &path
-                .file_name()
+            path.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("目录")
-                .to_string(),
+                .unwrap_or("目录"),
         );
         Ok(())
     }

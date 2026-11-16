@@ -82,11 +82,14 @@ impl StatsLog {
         path: &str,
     ) {
         let time = crate::devices::now_secs();
+        // 轮 UI-3 P3-8：`|` 与换行一并清洗——含 \n 的路径（Linux/macOS 合法
+        // 文件名）会把一行拆两行，前半解析成截断的幽灵记录。
+        let sanitize = |s: &str| s.replace('|', " ").replace(['\n', '\r'], " ");
         let line = format!(
             "{time}|{}|{peer}|{bytes}|{files}|{secs}|{}|{}\n",
             dir.tag(),
-            detail.replace('|', " "),
-            path.replace('|', " "),
+            sanitize(detail),
+            sanitize(path),
         );
         let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -206,7 +209,7 @@ fn parse_time_col(s: &str) -> Option<u64> {
     if let Ok(v) = s.parse::<u64>() {
         return Some(v);
     }
-    let mut it = s.split(|c| c == '-' || c == ' ' || c == ':');
+    let mut it = s.split(['-', ' ', ':']);
     let (y, mo, d, h, mi, se) = (
         it.next()?.parse::<i32>().ok()?,
         it.next()?.parse::<u8>().ok()?,

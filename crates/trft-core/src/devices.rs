@@ -5,7 +5,7 @@
 //! 而传输帧不携带设备名——名字仅来自 discovery 0xD1/0xD2 应答与发送成功记忆。
 //! 持久化 `devices.json`，进程内 `DeviceStore` 快照供接收器热读。
 
-use crate::error::{config_err, Result};
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -227,22 +227,10 @@ impl DeviceStore {
     }
 }
 
-/// CLI/外部写入入口（保持与旧 GUI 直写等价的行为）。
-pub fn record_to_disk(path: &PathBuf, devices: Vec<DeviceInfo>) -> Result<()> {
-    let mut list = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<DeviceInfo>>(&t).ok())
-        .unwrap_or_default();
-    for d in devices {
-        upsert(&mut list, d);
-    }
-    write_to_disk(path, &list)
-}
-
-pub fn write_to_disk(path: &PathBuf, list: &[DeviceInfo]) -> Result<()> {
-    let text = serde_json::to_string_pretty(list).map_err(|e| config_err(e.to_string()))?;
-    crate::config::atomic_write(path, text.as_bytes())
-}
+// 轮 UI-3 P3-3：record_to_disk/write_to_disk（v1 裸数组格式、全仓零调用）
+// 已删除——一旦被复用会写出 v1 格式，下次 load 走 v1 迁移分支把真 UDT4 的
+// "udt" 改写为 "rudp"，绕过 §7.30「v2 格式的 udt 永不改写」语义。
+// 外部写入统一走 DeviceStore::upsert + DeviceStore::save（v2 格式）。
 
 #[cfg(test)]
 mod tests {

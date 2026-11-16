@@ -76,6 +76,10 @@ pub struct AppState {
     pub tasks: Mutex<HashMap<u64, TaskHandle>>,
     /// 任务 ID → 进度事件 ID（UI 卡片挂暂停/继续按钮用；任务收尾即移除）。
     pub task_progress: Mutex<HashMap<u64, u64>>,
+    /// 用户主动终止（暂停/取消）的任务 ID（UI-1 P2-3）：队列子任务的
+    /// done 通道因 abort 断开时，凭此区分「用户终止」与「传输失败」——
+    /// 前者不重试（否则取消的文件被复活重发）。一次性消费（查即删）。
+    pub user_cancelled: Mutex<std::collections::HashSet<u64>>,
     pub next_task: AtomicU64,
     /// 校验中途停止标志（规格 §3.5；Arc 供任务闭包克隆）。
     pub verify_stop: Arc<AtomicBool>,
@@ -116,6 +120,7 @@ impl AppState {
             http: Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
             task_progress: Mutex::new(HashMap::new()),
+            user_cancelled: Mutex::new(std::collections::HashSet::new()),
             next_task: AtomicU64::new(1),
             verify_stop: Arc::new(AtomicBool::new(false)),
             discovery_answer: Mutex::new(None),

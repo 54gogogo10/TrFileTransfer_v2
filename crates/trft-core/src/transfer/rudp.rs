@@ -796,8 +796,8 @@ impl AsyncWrite for RudpStream {
         // ——每批一次锁一次让出；仅窗口满时走单许可慢路径（等 ACK 归还唤醒）。
         let want = buf.len().div_ceil(mss).min(RUDP_WINDOW) as u32;
         let sem = self.conn.window.clone();
-        let permits = match sem.clone().try_acquire_many_owned(want) {
-            Ok(p) => p,
+        let (permits, cap_pkts) = match sem.clone().try_acquire_many_owned(want) {
+            Ok(p) => (p, want as usize),
             Err(_) => {
                 if self.acquire.is_none() {
                     let sem = sem.clone();
@@ -810,7 +810,7 @@ impl AsyncWrite for RudpStream {
                 }
                 let mut fut = self.acquire.take().expect("已插入");
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready(p) => p,
+                    Poll::Ready(p) => (p, 1usize),
                     Poll::Pending => {
                         self.acquire = Some(fut);
                         return Poll::Pending;
@@ -818,6 +818,10 @@ impl AsyncWrite for RudpStream {
                 }
             }
         };
+        // 轮 UI-2 P1-2：慢路径只拿 1 个许可 → 本 poll 只发 1 个包。旧实现
+        // 拿 1 个许可却把整个 buf 发完（want-1 个许可凭空虚账）：窗口上限持续
+        // 上漂、超窗包挤爆对端 RUDP_PENDING_CAP 退化为 RTO 风暴——§7.43 背压
+        // 体系被架空。write_all 会带余量重入本函数，下一轮走批量快速路径补齐。
         permits.forget(); // 配额由 ACK 归还（add_permits）；close 兜底全量归还
         let mut pkts: Vec<WirePkt> = Vec::new();
         let mut sent = 0usize;
@@ -825,7 +829,8 @@ impl AsyncWrite for RudpStream {
             let mut s = self.conn.send.lock().expect("发送锁");
             let now = Instant::now();
             let mut off = 0usize;
-            while off < buf.len() {
+            let mut n_pkts = 0usize;
+            while off < buf.len() && n_pkts < cap_pkts {
                 let end = (off + s.mss).min(buf.len());
                 let seq = s.next_seq;
                 s.next_seq = seq.wrapping_add(1);
@@ -848,11 +853,12 @@ impl AsyncWrite for RudpStream {
                 }
                 sent = end;
                 off = end;
+                n_pkts += 1;
             }
         }
         if sent == 0 {
             // 编码全败（防御路径）：归还刚扣的许可，报错。
-            self.conn.window.add_permits(want as usize);
+            self.conn.window.add_permits(cap_pkts);
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "RUDP 编码失败",

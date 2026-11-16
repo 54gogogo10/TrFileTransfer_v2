@@ -20,9 +20,10 @@ const L10N = {
     pause: "暂停",
     devices: "设备", discover: "发现设备", devices_clear: "清空记忆", use: "使用", to_group: "加入群发",
     ip_filter: "IP 过滤", if_off: "关闭", if_allow: "白名单（allow）", if_deny: "黑名单（deny）",
-    discovering: "发现中…", online: "在线", known: "已知",
+    discovering: "发现中…", online: "在线",
     group_targets: "群发目标（每行 ip:port）", group_send: "并行群发", group_summary: "群发完成",
     group_bad_target: "非法目标（跳过）", paused: "已暂停", resume: "继续", cancel_task: "取消",
+    resume_unavailable: "该任务不支持在此继续（队列项请重新执行队列）",
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     batch_add: "批量入队", help_title: "使用说明", help_close: "关闭",
@@ -49,13 +50,13 @@ const L10N = {
     udp_passes_lbl: "UDP 重发轮数", fec: "FEC 前向纠错", udp_parity_lbl: "校验片",
     settings_update: "更新", update_url: "清单 URL", check_update: "检查更新", auto_update_check: "自动检查更新（启动时静默，发现新版本提示）", save: "保存设置",
     logs: "日志", clear: "清空",
-    st_running: "传输中", st_done: "完成", st_failed: "失败", st_unknown: "未知",
+    st_running: "传输中", st_done: "完成", st_failed: "失败",
     up_to_date: "已是最新版本", new_version: "发现新版本", update_fail: "检查失败",
-    saved: "设置已保存", save_fail: "保存失败", copied: "已复制", copy_fail: "复制失败",
-    started: "已启动", stopped: "已停止", http_on: "共享已开启", http_off: "共享未运行",
+    saved: "设置已保存", save_fail: "保存失败", copied: "已复制", copy_fail: "复制失败", http_off: "共享未运行",
     verify_done: "校验完成", send_fail: "发送失败", lang_locked: "传输进行中，语言切换已锁定",
     queue_sent: "队列已全部执行", queue_full: "队列已达 500 项上限",
     udp_file_only: "单向 UDP 仅支持单文件（无握手通道）",
+    udt_code_warn: "UDT 互通协议的配对认证以未加盐哈希上线（C# 2.14 互锁约束）：嗅探可离线爆破配对码。该场景建议 12 位配对码，或改用 TCP/QUIC/RUDP 槽位",
     tab_stats: "历史",
     stats_summary: "统计概览", refresh: "刷新", export_csv: "导出 CSV", stats_clear: "全部清除",
     st_today: "今日次数", st_today_bytes: "今日流量", st_week_bytes: "7 天流量", st_total: "累计次数", st_total_bytes: "累计流量",
@@ -65,7 +66,6 @@ const L10N = {
     monitor: "监控模式", monitor_start: "启动监控", monitor_stop: "停止监控", monitor_dir: "监控目录",
     monitor_hint: "目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。",
     mon_queued: "入队", mon_not_ready: "未就绪（等待）", mon_dropped: "已消失（丢弃）", mon_sending: "发送中", mon_sent: "已发送", mon_failed: "失败",
-    monitor_running: "监控运行中",
     confirm_receive: "接收前确认", cf_off: "关闭（不确认）", cf_unknown: "仅未知设备（已知放行）", cf_all: "一律确认（30 秒无应答视为拒绝）",
     per_device: "按设备分目录", auto_archive: "按日期归档",
     recv_dir_hint: "分目录/归档作用于新接收会话；叠加顺序 = 保存目录/设备/日期。",
@@ -100,9 +100,10 @@ const L10N = {
     pause: "Pause",
     devices: "Devices", discover: "Discover", devices_clear: "Clear memory", use: "Use", to_group: "To group",
     ip_filter: "IP filter", if_off: "Off", if_allow: "Allow list", if_deny: "Deny list",
-    discovering: "Discovering…", online: "online", known: "known",
+    discovering: "Discovering…", online: "online",
     group_targets: "Group targets (ip:port per line)", group_send: "Send to all", group_summary: "Group send finished",
     group_bad_target: "Invalid target (skipped)", paused: "Paused", resume: "Resume", cancel_task: "Cancel",
+    resume_unavailable: "This task cannot be resumed here (queue items: re-run the queue)",
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     batch_add: "Batch enqueue", help_title: "Help", help_close: "Close",
@@ -129,13 +130,13 @@ const L10N = {
     udp_passes_lbl: "UDP passes", fec: "FEC", udp_parity_lbl: "Parity",
     settings_update: "Update", update_url: "Manifest URL", check_update: "Check update", auto_update_check: "Check for updates automatically (silent at startup)", save: "Save settings",
     logs: "Logs", clear: "Clear",
-    st_running: "Running", st_done: "Done", st_failed: "Failed", st_unknown: "Unknown",
+    st_running: "Running", st_done: "Done", st_failed: "Failed",
     up_to_date: "Up to date", new_version: "New version", update_fail: "Check failed",
-    saved: "Settings saved", save_fail: "Save failed", copied: "Copied", copy_fail: "Copy failed",
-    started: "started", stopped: "stopped", http_on: "Sharing started", http_off: "Sharing not running",
+    saved: "Settings saved", save_fail: "Save failed", copied: "Copied", copy_fail: "Copy failed", http_off: "Sharing not running",
     verify_done: "Verify finished", send_fail: "Send failed", lang_locked: "Language locked during transfers",
     queue_sent: "Queue finished", queue_full: "Queue reached the 500-item limit",
     udp_file_only: "One-way UDP supports single files only (no handshake channel)",
+    udt_code_warn: "The UDT interop protocol sends an unsalted pairing-code hash on the wire (C# 2.14 interop constraint): sniffing enables offline brute force. Use a 12-digit code here, or switch to TCP/QUIC/RUDP.",
     tab_stats: "History",
     stats_summary: "Overview", refresh: "Refresh", export_csv: "Export CSV", stats_clear: "Clear all",
     st_today: "Today", st_today_bytes: "Today bytes", st_week_bytes: "7-day bytes", st_total: "Total count", st_total_bytes: "Total bytes",
@@ -145,7 +146,6 @@ const L10N = {
     monitor: "Monitor", monitor_start: "Start monitor", monitor_stop: "Stop monitor", monitor_dir: "Watch dir",
     monitor_hint: "Ready files are sent automatically (exclusive open + stable window); moved to \"Sent files\" on success.",
     mon_queued: "queued", mon_not_ready: "not ready (waiting)", mon_dropped: "vanished (dropped)", mon_sending: "sending", mon_sent: "sent", mon_failed: "failed",
-    monitor_running: "Monitor running",
     confirm_receive: "Confirm before receive", cf_off: "Off (no confirm)", cf_unknown: "Unknown devices only", cf_all: "Always (30s silence = deny)",
     per_device: "Per-device folder", auto_archive: "Date archive",
     recv_dir_hint: "Applies to new receive sessions; order = save dir / device / date.",
@@ -211,6 +211,8 @@ const tasks = new Map();        // progressId -> { el, bar, meta, state }
 const taskByProgress = new Map(); // progressId -> 任务 ID（task-start 事件绑定）
 const reqByTask = new Map();      // 任务 ID -> { req, kind }（继续 = 原参数重发）
 const pausedTasks = new Set();    // 已暂停任务 ID
+const taskTerminalSeen = new Map(); // 任务 ID -> { ok }（UI-1 P2-4：终态事件先于
+// invoke 返回时兜底群发/补挂判定；条目生命周期 = 会话内任务数，量级可忽略）
 const groupPending = new Map();   // 群发批次：taskId -> true；全部终态后汇总
 let groupTotal = 0;
 let groupOk = 0;
@@ -220,12 +222,14 @@ let sendKind = "file";
 const queueItems = [];          // 拖放/手动加入的队列
 let httpInfo = null;            // { port, token, dir }
 let knownDevices = [];          // 已知设备缓存（进度卡设备名徽标，A5）
+let udtCodeWarned = false;      // UDT+配对码风险告警（安全轮 P1-1，每会话一次）
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
 function fmtBytes(n) {
-  if (!n) return "0 B";
+  // UI-1 P3-9：NaN 与非正数显式归零（!n 会把 NaN 一并当 0 掩盖上游缺陷）。
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   let v = n;
@@ -247,11 +251,15 @@ function applyLang() {
 /* ============ 主题 ============ */
 const media = window.matchMedia("(prefers-color-scheme: dark)");
 function applyTheme() {
-  const cfgTheme = appState ? appState.config.theme : localStorage.getItem("trft-theme") || "system";
+  let cfgTheme = appState ? appState.config.theme : localStorage.getItem("trft-theme") || "system";
+  // UI-1 P2-6：非法/缺失值白名单归一——null 主题曾让 $("#theme-null") 命中
+  // 空节点直接 TypeError，且 applyTheme 在 init 主链路上会打断全部后续接线。
+  if (!["light", "system", "dark"].includes(cfgTheme)) cfgTheme = "system";
   const dark = cfgTheme === "dark" || (cfgTheme === "system" && media.matches);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
   $$("#theme-seg .seg-btn").forEach((b) => b.classList.remove("active"));
-  $("#theme-" + cfgTheme).classList.add("active");
+  const btn = $("#theme-" + cfgTheme);
+  if (btn) btn.classList.add("active");
 }
 media.addEventListener("change", () => applyTheme());
 
@@ -281,11 +289,15 @@ function toast(msg, cls, actionText, onAction, extraActions) {
     el.appendChild(wrap);
   }
   layer.appendChild(el);
+  // UI-1 P3-19：toast 数量上限（坏目标批量/日志风暴时防无界堆叠）。
+  while (layer.children.length > 5) layer.firstChild.remove();
   setTimeout(() => el.remove(), 8000);
 }
 
 function beep() {
-  if (!appState || !appState.config.notify_enabled || !appState.config.notify_sound) return;
+  // notify_sound 口径对齐 fillSettings（!== false 默认开）——旧配置无此字段
+  // 时 UI-1 P3-12：此前按 undefined 静音，勾选显示开、实际无声。
+  if (!appState || !appState.config.notify_enabled || appState.config.notify_sound === false) return;
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator();
@@ -474,11 +486,20 @@ function sendRequest(kindOverride) {
     nofec: $("#send-nofec").checked,
     pin: null,
   };
+  // 安全轮 P1-1 缓解：UDT 槽位 + 配对码 = 未加盐码哈希上线（C# 互锁协议固有
+  // 约束，线格式不可改）——按会话一次告警，指引用户加长配对码或换槽位。
+  if (req.proto === "udt" && req.code && !udtCodeWarned) {
+    udtCodeWarned = true;
+    toast(t("udt_code_warn"), "warn");
+    log("warn", t("udt_code_warn"));
+  }
   const errs = [];
   // 提交门与红框同口径（仅数字）：红框标非法的字段不再被 parseInt 静默放行。
+  // UI-1 P3-10：必填项空值也不再放行——空 IP/端口曾把 NaN 一路送到 invoke
+  // 反序列化，用户只看到晦涩错误（红框空值中性是输入期策略，提交期必填）。
   const raw = (sel) => $(sel).value.trim();
-  if (!ipOk(raw("#send-ip"))) errs.push(t("target"));
-  if (!numOk(1, 65535)(raw("#send-port"))) errs.push(t("port"));
+  if (raw("#send-ip") === "" || !ipOk(raw("#send-ip"))) errs.push(t("target"));
+  if (raw("#send-port") === "" || !numOk(1, 65535)(raw("#send-port"))) errs.push(t("port"));
   if (raw("#send-srcport") !== "" && !numOk(1, 65535)(raw("#send-srcport"))) errs.push(t("port"));
   const code = req.code;
   if (code && !(/^[0-9]{4,12}$/.test(code))) errs.push(t("pairing"));
@@ -610,6 +631,12 @@ $("#btn-queue-batch").addEventListener("click", async () => {
 $("#btn-queue-clear").addEventListener("click", () => { queueItems.length = 0; renderQueue(); persistQueue(); });
 $("#btn-queue-run").addEventListener("click", async () => {
   if (!queueItems.length) return;
+  // UI-1 P3-3/P3-4：await 期间禁用——连点会起两批队列 + 让首个 confirmDialog
+  // 的 Promise 永不 resolve（onclick 被第二次调用覆盖）。
+  const runBtn = $("#btn-queue-run");
+  if (runBtn.disabled) return;
+  runBtn.disabled = true;
+  const done = () => { runBtn.disabled = false; };
   // 轮 6 P2-4：逐项按入队快照构造（旧条目无快照时回落当前面板值）。
   // 轮 7 F2：kind 映射与直发路径一致（proto=udp → "udpfile"）——此前队列
   // 里的 UDP 项被静默改走 TCP/0x03；UDP 专属参数（passes/fecParity/nofec）
@@ -647,7 +674,7 @@ $("#btn-queue-run").addEventListener("click", async () => {
     if (ad === "shutdown") msg = t("confirm_shutdown");
     else if (ad === "sleep") msg = t("confirm_sleep");
     else msg = t("confirm_command") + $("#after-command").value + t("confirm_tail");
-    if (!(await confirmDialog(msg, { danger: ad === "shutdown" || ad === "sleep" }))) return;
+    if (!(await confirmDialog(msg, { danger: ad === "shutdown" || ad === "sleep" }))) { done(); return; }
   }
   try {
     await invoke("send_queue", {
@@ -661,6 +688,7 @@ $("#btn-queue-run").addEventListener("click", async () => {
     persistQueue();
     toast(t("queue_sent"), "ok");
   } catch (e) { toast(String(e), "err"); }
+  done();
 });
 /* 群发（规格 §3.2）：并行对每目标起独立客户端，逐目标进度卡 + 汇总 {ok}/{total} */
 function parseTarget(s2) {
@@ -679,11 +707,15 @@ function parseTarget(s2) {
 }
 
 $("#btn-group-send").addEventListener("click", async () => {
+  const btn = $("#btn-group-send");
+  if (btn.disabled) return; // UI-1 P3-3：发起期间禁用（防两批计数器交错）
   const lines = $("#group-targets").value.split(String.fromCharCode(10)).map((x) => x.trim()).filter(Boolean);
   const targets = [...new Set(lines)];
   if (!targets.length) return;
   const base = sendRequest();
   if (base.errs.length) { toast(base.errs.join(", "), "err"); return; }
+  btn.disabled = true;
+  groupLaunching = true;
   let launched = 0;
   groupTotal = 0; groupOk = 0; groupFail = 0;
   groupPending.clear(); // 轮 7 P2：残留 id 会让本批及之后所有汇总失效
@@ -698,9 +730,16 @@ $("#btn-group-send").addEventListener("click", async () => {
       groupPending.set(id, true);
       groupTotal += 1;
       launched += 1;
+      // UI-1 P2-4：瞬时任务终态可能先于 invoke 返回——注册后凭 taskTerminalSeen
+      // 补收敛，否则该槽位永悬挂、汇总永不出现。
+      const term = taskTerminalSeen.get(id);
+      if (term) groupSettle(id, term.ok, term.paused);
     } catch (e) { toast(String(e), "err"); }
   }
+  groupLaunching = false;
   if (!launched) groupTotal = 0;
+  groupMaybeSummary(); // launching 门控期间被压下的汇总在此补判（UI-4 P3-3）
+  btn.disabled = false;
 });
 
 $("#after-done").addEventListener("change", () => {
@@ -844,7 +883,9 @@ function ensureCard(ev) {
     el.appendChild(head);
     el.appendChild(bar);
     $("#progress-list").prepend(el);
-    card = { el, name, state, meta, bar, kind: ev.kind, base: ev.name, lastT: performance.now(), lastDone: 0, speed: 0 };
+    // counted：activeTransfers 的 +1/-1 配对标志（UI-1 P1-1——建卡只加一次，
+    // 暂停终态/取消/完成等多条扣减路径凭它去重，防语言锁被提前解除）。
+    card = { el, name, state, meta, bar, kind: ev.kind, base: ev.name, lastT: performance.now(), lastDone: 0, speed: 0, counted: true };
     tasks.set(ev.id, card);
     activeTransfers += 1;
     updateLangLock();
@@ -853,11 +894,21 @@ function ensureCard(ev) {
   return card;
 }
 
+/* 计数扣减唯一入口：只对未扣过的卡扣一次（P1-1 修复） */
+function releaseCard(card) {
+  if (!card.counted) return;
+  card.counted = false;
+  activeTransfers = Math.max(0, activeTransfers - 1);
+  updateLangLock();
+}
+
 /* 暂停/继续/取消（规格 §3.2：取消型暂停——暂停即断，继续按 0x03/0x04 服务端会话续传） */
 function attachCardButtons(progressId, card) {
   if (card.kind !== "send") return;
   const taskId = taskByProgress.get(progressId);
-  if (!taskId || reqByTask.has(taskId) === false) return;
+  // UI-1 P2-5：不再以 reqByTask.has 为前置（task-start 事件可能先于 invoke 返回，
+  // 否则按钮永不出现）；已终态的任务不再挂按钮。resume 点击时再实时取 entry。
+  if (!taskId || taskTerminalSeen.has(taskId)) return;
   const head = card.el.querySelector(".phead");
   let btns = head.querySelector(".pbtns");
   if (btns) return;
@@ -878,26 +929,48 @@ function attachCardButtons(progressId, card) {
       card.state.textContent = t("paused");
       card.state.className = "pstate failed";
       pauseBtn.textContent = t("resume");
-      await invoke("send_cancel", { id: taskId, paused: true });
+      // UI-1 P2-3：invoke 失败回滚「已暂停」假象（传输实际仍在跑）。
+      try {
+        await invoke("send_cancel", { id: taskId, paused: true });
+      } catch (e) {
+        pausedTasks.delete(taskId);
+        card.state.textContent = t("st_running");
+        card.state.className = "pstate running";
+        pauseBtn.textContent = t("pause");
+        toast(String(e), "err");
+      }
     } else {
       const entry = reqByTask.get(taskId);
-      pausedTasks.delete(taskId);
+      // UI-4 P3-4：队列子任务卡片（Rust 侧发起，无 reqByTask 条目）——
+      // 「继续」此前静默无效；明确提示改用队列重跑。
+      if (!entry) { toast(t("resume_unavailable"), "warn"); return; }
+      // UI-1 P2-1：先起任务成功再拆旧卡——起不动时暂停卡保留，续传入口不丢。
+      try {
+        pausedTasks.delete(taskId);
+        await startTask(entry);
+      } catch (e) {
+        pausedTasks.add(taskId);
+        toast(String(e), "err");
+        return;
+      }
       btns.remove();
       card.el.remove();
       tasks.delete(progressId);
-      await startTask(entry);
     }
   });
   const cancelBtn = mk(t("cancel_task"), async () => {
-    await invoke("send_cancel", { id: taskId });
+    // UI-1 P2-2：取消失败也要走本地清理（否则残留 pausedTasks 会误吞后续终态）。
+    try {
+      await invoke("send_cancel", { id: taskId });
+    } catch (e) { toast(String(e), "err"); }
     cancelledProgress.add(progressId);
     setTimeout(() => cancelledProgress.delete(progressId), 10000);
     reqByTask.delete(taskId);
     pausedTasks.delete(taskId);
+    taskByProgress.delete(progressId);
     card.el.remove();
     tasks.delete(progressId);
-    activeTransfers = Math.max(0, activeTransfers - 1);
-    updateLangLock();
+    releaseCard(card);
   });
   btns.appendChild(pauseBtn);
   btns.appendChild(cancelBtn);
@@ -922,6 +995,14 @@ async function startTask(entry) {
     id = await invoke("send_start", { req });
   }
   reqByTask.set(id, entry);
+  // UI-1 P2-5：invoke 返回时 task-start 事件可能已到（按钮已挂好）；若卡片
+  // 已存在且按钮未挂（乱序窗口错过 attachCardButtons），此处补挂一次。
+  for (const [pid, tid] of taskByProgress) {
+    if (tid === id) {
+      const card = tasks.get(pid);
+      if (card) attachCardButtons(pid, card);
+    }
+  }
   return id;
 }
 
@@ -959,8 +1040,7 @@ function onProgress(ev) {
     // 该「失败」不得覆盖「已暂停」/清卡（否则继续按钮 6 秒后不可达）。
     const pausedOwner = taskByProgress.get(ev.id);
     if (ev.state === "failed" && pausedOwner && pausedTasks.has(pausedOwner)) {
-      activeTransfers = Math.max(0, activeTransfers - 1);
-      updateLangLock();
+      releaseCard(card); // UI-1 P1-1：计数扣减经 counted 标志去重
       return;
     }
     card.state.textContent = ev.state === "done" ? t("st_done") : t("st_failed");
@@ -969,8 +1049,7 @@ function onProgress(ev) {
     card.el.classList.toggle("failed", ev.state !== "done");
     if (ev.state === "done") beep();
     if (ev.kind === "recv" && ev.state === "done") addRecent(ev.name, ev.total);
-    activeTransfers = Math.max(0, activeTransfers - 1);
-    updateLangLock();
+    releaseCard(card); // UI-1 P1-1：计数扣减经 counted 标志去重
     setTimeout(() => { card.el.remove(); tasks.delete(ev.id); }, 6000);
   }
 }
@@ -1037,8 +1116,12 @@ function renderAddrDropdowns() {
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.value = val;
-      cb.checked = prev.size ? prev.has(val) : val === "0.0.0.0";
+      // 用户已交互过（dirty）就以旧选中集为准——允许「全不勾」跨重渲染存续；
+      // 否则首渲染默认通配 v4（原逻辑：prev 为空即重置 0.0.0.0，取消全部后
+      // 语言切换会静默回勾，违背用户意图）。
+      cb.checked = dd.dataset.dirty ? prev.has(val) : (prev.size ? prev.has(val) : val === "0.0.0.0");
       cb.addEventListener("change", () => {
+        dd.dataset.dirty = "1";
         label.textContent = ddLabelFor([...panel.querySelectorAll("input:checked")].map((x) => x.value));
       });
       lb.appendChild(cb);
@@ -1074,6 +1157,10 @@ $$(".recv-card").forEach((card) => {
   card.querySelector(".recv-start").addEventListener("click", async () => {
     const addrs = checkedAddrs(proto);
     if (!addrs.length) { toast(t("no_addr_selected"), "err"); return; }
+    // UI-1 P3-3：await 期间防连点（双 invoke 双监听）。
+    const btn = card.querySelector(".recv-start");
+    if (btn.disabled) return;
+    btn.disabled = true;
     try {
       const res = await invoke("recv_start", {
         proto,
@@ -1084,7 +1171,10 @@ $$(".recv-card").forEach((card) => {
       appState.receivers.push({ proto, port: res.port, bound: res.bound });
       (res.failed || []).forEach((f) => toast(t("partial_bind") + ": " + f.addr + " — " + f.error, "err"));
       renderReceivers();
-    } catch (e) { toast(String(e), "err"); }
+    } catch (e) {
+      toast(String(e), "err");
+      renderReceivers(); // 失败复位按钮
+    }
   });
   card.querySelector(".recv-stop").addEventListener("click", async () => {
     try {
@@ -1275,8 +1365,11 @@ function fillSettings() {
 
 async function saveSettings() {
   // 提交门：红框字段不再放行（与发送面板同口径）。
-  if ($("#cfg-pairing-len").classList.contains("invalid")) {
-    toast(t("invalid_range").replace("{min}", 4).replace("{max}", 12), "err");
+  // UI-1 P2-7：此前只拦配对码位数——update_url/cache_days/parity 等红框
+  // 字段被 parseInt||默认 静默改写或直接入库，红框与实际落库值不一致。
+  const bad = $$("#pane-settings input.invalid, #pane-settings textarea.invalid, #http-port.invalid");
+  if (bad.length) {
+    toast((bad[0].title || t("save_fail")), "err");
     return;
   }
   const c = JSON.parse(JSON.stringify(appState.config));
@@ -1371,7 +1464,6 @@ $("#btn-check-update").addEventListener("click", async () => {
 
 /* ============ 拖放（规格 §3.2：多文件逐项入队；单文件填充路径框） ============ */
 function setupDragDrop() {
-  let depth = 0;
   T.webview.getCurrentWebview().onDragDropEvent((ev) => {
     const p = ev.payload;
     if (p.type === "enter" || p.type === "over") {
@@ -1503,6 +1595,8 @@ function monitorLine(kind, name) {
   const li = document.createElement("li");
   const k = document.createElement("span");
   k.className = "pmeta";
+  // UI-1 P3-15a：挂 data-i18n——语言切换时 applyLang 统一刷新（否则残留旧语言）。
+  if (map[kind]) k.dataset.i18n = map[kind];
   k.textContent = t(map[kind] || kind);
   const n = document.createElement("span");
   n.className = "grow";
@@ -1544,7 +1638,10 @@ $("#btn-monitor-start").addEventListener("click", async () => {
 $("#btn-monitor-stop").addEventListener("click", async () => {
   try {
     await invoke("monitor_stop");
-  } catch (e) { toast(String(e), "err"); }
+  } catch (e) {
+    toast(String(e), "err");
+    return; // UI-1 P3-6：停止失败时 UI 不复位（与后端真实状态保持一致）
+  }
   $("#dot-monitor").classList.remove("on");
   $("#btn-monitor-start").disabled = false;
   $("#btn-monitor-stop").disabled = true;
@@ -1632,6 +1729,9 @@ function pumpConfirm() {
     cd.textContent = String(left) + "s";
     if (left <= 0) {
       clearInterval(confirmTimer);
+      // UI-1 P3-13：接线闲置字典 confirm_expired——超时拒绝不该无感静默。
+      toast(t("confirm_expired"), "warn");
+      log("warn", t("confirm_expired"));
       closeConfirm(id, false);
     }
   }, 1000);
@@ -1646,6 +1746,24 @@ async function closeConfirm(id, allow) {
 }
 
 /* ============ 事件接线 ============ */
+/* 群发槽位收敛（UI-1 P2-4 抽取）：终态事件与 invoke 返回乱序时由
+   taskTerminalSeen 兜底补收敛；neutralized = 暂停（不计成败）。
+   UI-4 P3-3：汇总判定加 launching 门控——launching 期间（多目标 invoke
+   尚未全部返回）瞬时终态不得中途触发「1/1」式汇总并清零计数。 */
+let groupLaunching = false;
+function groupMaybeSummary() {
+  if (groupLaunching || groupPending.size !== 0 || groupTotal === 0) return;
+  const msg = t("group_summary") + " " + groupOk + " / " + groupTotal + (groupFail ? " (" + t("send_fail") + " " + groupFail + ")" : "");
+  toast(msg, groupFail ? "err" : "ok");
+  log(groupFail ? "warn" : "ok", msg);
+  groupTotal = 0; groupOk = 0; groupFail = 0;
+}
+function groupSettle(id, ok, neutralized) {
+  if (!groupPending.delete(id)) return;
+  if (!neutralized) { if (ok) groupOk += 1; else groupFail += 1; }
+  groupMaybeSummary();
+}
+
 async function wireEvents() {
   await listen("trft://progress", (ev) => onProgress(ev.payload));
   // 轮 7 F4/F7：后端异步状态变化（窗口隐藏停共享/接收器自摘/监控自摘）——
@@ -1675,29 +1793,15 @@ async function wireEvents() {
     // 轮 7 F1：暂停的终态事件（paused 标记）不清 reqByTask/pausedTasks/
     // taskByProgress——「继续」按钮与 onProgress 暂停守卫都依赖它们。
     const isPaused = !!p.paused || pausedTasks.has(p.id);
+    // UI-1 P2-4：先记录终态（invoke 返回晚于事件时，注册侧凭此收敛群发槽位）。
+    taskTerminalSeen.set(p.id, { ok: !!p.ok, paused: isPaused });
     if (isPaused) {
-      if (groupPending.delete(p.id)) {
-        // 群发槽位收敛（不计失败）——否则汇总永不出现。
-        if (groupPending.size === 0 && groupTotal > 0) {
-          const msg = t("group_summary") + " " + groupOk + " / " + groupTotal + (groupFail ? " (" + t("send_fail") + " " + groupFail + ")" : "");
-          toast(msg, groupFail ? "err" : "ok");
-          log(groupFail ? "warn" : "ok", msg);
-          groupTotal = 0; groupOk = 0; groupFail = 0;
-        }
-      }
+      groupSettle(p.id, false, true); // 暂停 = 槽位收敛，不计成败
       return;
     }
     reqByTask.delete(p.id);
     pausedTasks.delete(p.id);
-    if (groupPending.delete(p.id)) {
-      if (p.ok) groupOk += 1; else groupFail += 1;
-      if (groupPending.size === 0 && groupTotal > 0) {
-        const msg = t("group_summary") + " " + groupOk + " / " + groupTotal + (groupFail ? " (" + t("send_fail") + " " + groupFail + ")" : "");
-        toast(msg, groupFail ? "err" : "ok");
-        log(groupFail ? "warn" : "ok", msg);
-        groupTotal = 0; groupOk = 0; groupFail = 0;
-      }
-    }
+    groupSettle(p.id, !!p.ok);
     if (p.ok) { log("ok", "#" + p.id + " " + (p.summary || "OK")); if (p.summary) beep(); }
     else if (p.reason === "cancelled") {
       // 轮 7 F5：主动取消不是失败——warn 日志即可，不弹失败 toast。
@@ -1786,6 +1890,23 @@ function setLang(v) {
   applyLang();
   renderQueue();
   renderAddrDropdowns();
+  // UI-1 P3-15b：暂停卡驻留期语言切换——状态词与按钮文案定点刷新
+  //（暂停卡不在 data-i18n 覆盖范围，否则中英混排直到继续/取消）。
+  tasks.forEach((card, pid) => {
+    const tid = taskByProgress.get(pid);
+    if (!tid || !pausedTasks.has(tid)) return;
+    card.state.textContent = t("paused");
+    const pauseBtn = card.el.querySelector(".pbtns button");
+    if (pauseBtn) pauseBtn.textContent = t("resume");
+  });
+  // UI-1 P3-15c：在队确认弹窗即时重渲染（否则打开状态下语言不刷新）。
+  if (confirmShowing) {
+    $("#confirm-msg").textContent = t("confirm_msg").replace("{d}", confirmShowing.device).replace("{p}", confirmShowing.peer);
+    const total = confirmQueue.length + 1;
+    $("#confirm-title").textContent = t("confirm_title") + (total > 1 ? " (" + total + ")" : "");
+    $("#btn-confirm-allow").textContent = t("confirm_allow");
+    $("#btn-confirm-deny").textContent = t("confirm_deny");
+  }
   // 动态渲染的列表不在 data-i18n 覆盖范围内：语言切换后必须重渲染，
   // 否则中英混排（实机测试：按设备行残留「5 文件」/ 统计历史仍是旧文案）。
   refreshStats();
@@ -1827,6 +1948,9 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
   lang = localStorage.getItem("trft-lang") || "zh";
   appState = await invoke("get_app_state");
   lang = appState.config.language || lang;
+  // UI-4 F8：语言白名单归一（theme 同款）——非法值会让 t() 抛 TypeError
+  // 打断整个 init 接线。
+  if (!["zh", "en"].includes(lang)) lang = "zh";
   applyLang();
   applyTheme();
   fillSettings();

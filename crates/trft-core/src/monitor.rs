@@ -106,18 +106,24 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         )));
     }
     // 事件加速器：任何 FS 事件 → 提前触发一次扫描（失败 = 纯轮询，零损失）。
+    // 轮 UI-3 P2-1：半死通道防线——构造失败/事件线程 panic 时 sender 全部
+    // drop，recv() 恒立即 Ready(Err)，select 退化为零间隔热自旋（CPU 拉满 +
+    // 磁盘风暴）。tick_rx Option 化：Err 即永久禁用该分支（回退纯轮询节律）。
     use notify::Watcher;
     let (tick_tx, mut tick_rx) = mpsc::unbounded_channel::<()>();
-    let _watcher = notify::recommended_watcher(move |_| {
+    let (_watcher, mut tick_alive) = match notify::recommended_watcher(move |_| {
         let _ = tick_tx.send(());
-    })
-    .map(|mut w| {
-        w.watch(&cfg.watch_dir, notify::RecursiveMode::NonRecursive)
-            .ok();
-        w
-    })
-    .map_err(|e| eprintln!("[监控] 事件侦听不可用（纯轮询模式）: {e}"))
-    .ok();
+    }) {
+        Ok(mut w) => {
+            w.watch(&cfg.watch_dir, notify::RecursiveMode::NonRecursive)
+                .ok();
+            (Some(w), true)
+        }
+        Err(e) => {
+            eprintln!("[监控] 事件侦听不可用（纯轮询模式）: {e}");
+            (None, false)
+        }
+    };
 
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
     let mut queued: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -143,7 +149,12 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         // 等待：事件 tick / 轮询间隔 / 停止（三者任一）。
         tokio::select! {
             _ = tokio::time::sleep(cfg.poll_interval) => {}
-            _ = tick_rx.recv() => {}
+            r = tick_rx.recv(), if tick_alive => {
+                if r.is_none() {
+                    // 发送端全体消失（事件线程 panic 等）——禁用分支防热自旋。
+                    tick_alive = false;
+                }
+            }
             // changed() 就绪 = 有新变更或通道已关闭——协议上两者都是停止
             // （发送端只发 true）。直接退出；不得再查 has_changed()
             //（changed() 已把变更标记为已读 → 恒 false → 永不退出）。
@@ -172,6 +183,14 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
                     name: file_name(p),
                     to: dest.display().to_string(),
                 });
+                false
+            }
+            // 轮 UI-3 P3-2：源文件已被用户移走/删除（NotFound）——条目摘除，
+            // 不再每轮做注定失败的 create_dir_all + rename + 失败事件
+            //（与队列路径「已消失即丢弃」语义对称）。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                queued.remove(p);
+                cfg.emit(MonitorEvent::Dropped { name: file_name(p) });
                 false
             }
             Err(e) => {
@@ -209,9 +228,11 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
             .await
             .unwrap_or(false);
         if !ready {
-            // 后移一位：队首让给下一个文件，本文件下一轮重试（规格 §3.2）。
-            if queue.len() > 1 {
-                queue.swap(0, 1);
+            // 移到队尾：队首让给下一个文件，本文件稍后重试（规格 §3.2）。
+            // 轮 UI-3 P2-2：旧实现 swap(0,1) 只交换前两个——两个未就绪文件
+            // 乒乓震荡，其后已就绪的文件永远到不了队首（就绪文件被饿死）。
+            if let Some(f) = queue.pop_front() {
+                queue.push_back(f);
             }
             throttled_log(&mut throttle, &name, || {
                 cfg.emit(MonitorEvent::NotReady { name: name.clone() });

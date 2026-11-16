@@ -123,7 +123,13 @@ impl Reporter {
         if due {
             *last = Some(Instant::now());
             drop(last);
-            let _ = self.tx.send(Self::snapshot(&self.sh, "running"));
+            // 轮 UI-3 P3-1：发送前重查终态——入口检查与发送之间的窗口里
+            // finish/fail（分块共享 Reporter 的另一连接、会话逐出补终态）
+            // 可能已发出终态；迟到的 running 快照会让 UI 卡片「复活」且无
+            // 纠正事件，违反「终态必达且此后 add 一律忽略」的模块纪律。
+            if self.sh.state.load(Ordering::Relaxed) == STATE_RUNNING {
+                let _ = self.tx.send(Self::snapshot(&self.sh, "running"));
+            }
         }
     }
 
