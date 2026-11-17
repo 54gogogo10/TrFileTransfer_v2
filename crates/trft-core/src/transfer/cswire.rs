@@ -1340,8 +1340,8 @@ pub struct CsOutcome {
 }
 
 /// UDT 连接的 C# 方言入口（serve_udt_on 每连接调用；镜像 receiver::handle_conn 形状）。
-pub(crate) async fn handle_conn_cs(
-    stream: UdtStream,
+pub(crate) async fn handle_conn_cs<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: S,
     peer: SocketAddr,
     opts: &RecvOptions,
     served: Arc<AtomicU64>,
@@ -1355,8 +1355,8 @@ pub(crate) async fn handle_conn_cs(
     r
 }
 
-async fn conn_cs_inner(
-    stream: UdtStream,
+async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: S,
     peer: SocketAddr,
     opts: &RecvOptions,
     state: &Arc<CsServerState>,
@@ -2645,14 +2645,33 @@ pub async fn cs_connect_stack_full(
     caps_req: u8,
 ) -> Result<(CsWire<UdtStream>, u8)> {
     let stream = connect_udt(addr, opts.src_port).await?;
-    let mut wire = CsWire::new(stream);
+    cs_handshake(CsWire::new(stream), opts, caps_req).await
+}
+
+/// TCP 槽位的 C# 方言建连（互通改造：TCP 应用层与 UDT 同为 cswire）。
+pub async fn cs_connect_tcp(
+    addr: SocketAddr,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<CsWire<tokio::net::TcpStream>> {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(Error::Io)?;
+    Ok(cs_handshake(CsWire::new(stream), opts, 0).await?.0)
+}
+
+/// 已建连流上的 C# 认证栈（UDT/TCP 共用）。
+pub async fn cs_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    mut wire: CsWire<S>,
+    opts: &crate::transfer::sender::SendOptions,
+    caps_req: u8,
+) -> Result<(CsWire<S>, u8)> {
     let code = opts.pairing_code.clone().unwrap_or_default();
     if !code.is_empty() {
         if opts.encrypt {
             match cs_client_ecdh(&mut wire, &code).await? {
                 CsEcdhOutcome::Encrypted => {}
                 CsEcdhOutcome::Plaintext => {
-                    eprintln!("[UDT] 对端未启用配对，明文继续");
+                    eprintln!("[C# 方言] 对端未启用配对，明文继续");
                 }
             }
         } else {
