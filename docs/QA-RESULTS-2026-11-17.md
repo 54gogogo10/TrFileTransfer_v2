@@ -154,6 +154,21 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 | 0x02 尾哈希失配 | ✅ | 新增 e2e：0x00 拒收 + 组装器丢弃 + 整组补发发布（**302 项全绿**） |
 | IPv6 | ⚠️ 仅库级 | CLI/GUI 接收端固定绑 `0.0.0.0`（无 `--bind`）；`::1` 路径仅 e2e 覆盖，C# 侧本就只绑 IPv4 |
 
+
+## VM 真机互通（10.143.208.49，TCP 改造后首次）
+
+**环境**：宿主 10.143.208.78（WLAN）↔ VM 10.143.208.49（Windows，用户 `gogo`）；经 SMB `C$` 部署二进制、`schtasks /S /U /P` 远端拉起接收器；被测二进制为 `be21b91` 的 release 构建（TCP 全走 cswire）。此前各轮的 VM 对打跑的是 **v2 TCP 帧**，本轮是 TCP 并入 C# 方言后的首次真实链路验证。
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 宿主 trft → VM trft（TCP 0x03） | ✅ | 64 MiB / **0.87s**（≈77 MB/s），VM 落盘 SHA-256 一致 |
+| 宿主 **C# 2.14** → VM trft（0x09 加密 + 配对码 + deflate） | ✅ | 8 MiB / 0.8s，C# 日志 `Encrypted session established (AES-256)`，VM 落盘哈希一致 |
+| 宿主 trft `--chunks 4` → VM trft（0x02） | ✅ | 8 MiB / 0.2s，VM 日志先记探针 `0x02 头非法` 再收分块，落盘哈希一致 |
+| 宿主 trft `sync` → VM trft（0x04） | ✅ | 会话目录 `syncsrc.0da1f5a0/`，两文件哈希一致；**二次同步 0.06s**、无重复副本（逐文件跳过生效） |
+| VM → 宿主（反向） | ⚠️ 环境阻断 | 宿主未提权，入站 19611 无防火墙规则 → VM 侧 10s 连接超时；需管理员加规则：`netsh advfirewall firewall add rule name=trft-test dir=in action=allow program=<trft.exe> protocol=tcp localport=19611` |
+
+**清理**：VM 上本轮创建的计划任务（trft-recv1/3/4/5、trft-send1）与新增的 exe/bat/日志/接收目录已删除；SMB 映射保留（`net use \\10.143.208.49\C$`，此前既有记忆映射）。VM 上更早会话遗留的 `trft-test` 负载（a2.bin 5GiB 等）未动。
+
 ## 未完成（需人工/其它环境）
 
 | ID | 原因 |
@@ -180,4 +195,5 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 - VM：`trft-recv`/`trft-kill`/`trft-hash` 等任务已删，接收进程已终止。
 - 宿主 C 盘（2026-11-17 补清）：`C:\Users\chen\trft-remote\`（85 个文件 / **6.54 GB** 测试负载、脚本、截图）已删；`%TEMP%\trft-*` 11 项已删；`%APPDATA%\TrFileTransfer` 下测试残留——`stats.log` 测试行 49 条、hash 缓存测试条目（1.39 MB→89 KB、698 KB→4 KB）、`resume`/`server-resume` 测试会话 246 个、默认接收目录 `tcp\` 2006 个测试文件（18.9 MB）——全部清除；`devices.json` 清空、`client_port` 恢复 8080、配对码保持清空。应用日志（`logs\`）与真实历史保留。
 - 宿主网络：`net use \\10.143.208.49\C$` 仍为 Disconnected 记忆映射（未删，按需清理）。
+
 
