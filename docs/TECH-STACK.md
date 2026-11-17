@@ -369,6 +369,71 @@
    - **验证**：每轮全量回归，终态 **272 测试全绿 0 告警**（e2e_udt 曾拦下 cs_publish 破坏 0x04 会话内重发替换语义的回归——0x04 重发路径保留「先摘旧文件再发布」的会话语义）；clippy deny 级（never_loop）清零、本批触及文件的风格告警清零；
    - **登记接受**：GUI 文件日志时间戳/按天滚动用 UTC（本地时区换算需引依赖或 Win32 API 特性开关，与 C# 原版本地时间口径的偏离已知——排查时按 +8 折算）；RUDP 接收热路径三段拷贝（demux to_vec → on_data to_vec → try_send clone；按值传递重构涉及全链签名，当前 126-255MB/s 下为分配税非瓶颈，扩性能批再做）；scrub 校验跟随指向文件的符号链接（与 0x01/0x03 skip 判定 sha256_file 口径一致性绑定，单方面改会引入假不一致）；PBKDF2 50k 轮维持（Rust 0x05/0x09 路径提升至 600k 会破坏新旧版本互通且握手无 KDF 参数协商位；6 位码爆破已由 §5.2 声明 + UDT 泄漏路径单独登记）。
 
+45. **真机 GUI 冒烟（CDP/WebView2）+ L10n 判别检查 + 工作区清理**（2026-11-16，批 44 收口后执行）：
+   - **冒烟方法学**：`cargo build -p trft-gui` → 以 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port` 启动真机 exe → CDP 直连 WebView2（Runtime.evaluate / Page.captureScreenshot）。覆盖 stub harness/静态截图/e2e 均不覆盖的一条路径——**前端 JS 初始化是否完整跑完**（三者分别不执行产品 IPC、只验视觉、不跑前端）；
+   - **抓获（P1）**：dist/app.js zh 字典在批 44 死键清理轮被写坏为 `cf_un`（键名截断+值丢失的非法简写属性）→ 运行时 ReferenceError 顶层中断 → 事件监听器全未挂载、UI 整体无响应。`node --check` 语法合法、截图正常，唯真机交互可现形；修复 = 复原 `cf_unknown: "仅未知设备（已知放行）"` + 删 en 侧漏删死键 `known`；
+   - **判别检查**：`.zcode/check_l10n.js`（node 直跑）三重校验——字典损坏简写键 / `data-i18n`+`t()` 引用缺键 / zh-en 键集不对称；本 bug 在其下必红。定位为发布/前端大改后手动跑的门禁（非 cargo test，前端无测试基建，暂记工具债）；
+   - **复测全绿**：页面异常 0、控制台错误 0、6/6 标签切换、IPC 三命令真实回数（get_app_state/list_addresses/stats_summary）、设置页 19 项回填、qr-address 下拉 JS 填充=4（初始化完整证据）、错误 toast 0；亮/暗真机截图归档 `.zcode/ui-preview/shots/real-smoke2-*`；VLM 亮色误判深色一事再次印证程序化验证优先；
+   - **工作区清理**：回收 ~62.5GB（target/debug/incremental 60G 陈旧增量缓存 + `.zcode/scratch-*` 2.6G + 迭代截图/ws 包/旧构建日志）；保留 check_l10n.js、ui-preview harness（stub/sync/同步副本）、最终验收截图 15 张（6 页 × 亮暗 + 真机 3 张）、build/（WebView2 固定运行时，打包依赖）与 release/（发布产物）、debug deps/build（保增量构建速度，`cargo build` 复验 0.64s）；
+   - **损失登记（清理误删）**：`.zcode/scratch-interop/` 为 §7.32 登记的互操作测试床而非纯残留——删前仅核对体积与日志样本、未枚举其内驱动脚本，违反「删前看目标」纪律，已删（gitignored，不可恢复）。实际损失 = 床内驱动脚本与运行产物/日志；C# 2.14 exe 用户机有原件，fixture/矩阵/基准口径在 §7.31/#44 均有登记可按步重建。e2e 自动化套件（crates/trft-core/tests，272 项）不受影响；互操作复测需要时按 §7.31 场景矩阵重写 harness。教训：清理 gitignored 目录前先 `find -type f \( -name '*.sh' -o -name '*.ps1' -o -name '*.py' \)` 枚举脚本。恢复排查终态：git 未跟踪/回收站不经由/CLI 日志纯遥测/checkpoint 与残留会话 stdout 均无原件（仅存 bench_loop.py 的 traceback）；winfr 原件恢复路径（需提权）经决策不执行——损失定案，转入重建。
+   - **床重建（同日完成并实跑全绿）**：按 #31/#32/#44 场景登记 + 双方 CLI 实测用法（`trft --help`、C# 2.14.0.0 `--help`）重建 `.zcode/scratch-interop/` 六件套（common/build_fixtures/bench_loop/matrix_c2v/matrix_v2c/README）；终态验证 **bench 5/5（tcp/quic/rudp/udt/udp）、c2v 9/9（含 0x04 三轮）、v2c 8 PASS+1 SKIP**；重建过程沉淀的行为适配：C# 重定向日志 GBK 落盘（断言字节级双编码）、Text received 收尾才可见、重复落盘 `_1` 命名、`--count` 与 udp 互斥、0x04 会话目录随端口变需开局清目录——详见床 README；
+   - **新发现 A（v2 缺陷，登记后续批）**：v2 UDT 发送端间歇 `early eof` 误报——接收端完整落盘哈希一致、发送端 rc=1（C# `recv --count 1` 收满即退与 v2 终 ACK 读竞态疑似；重试副作用 = C# 端 `_1` 副本）。床判据「完整送达即 PASS+误报标注」保留缺陷可见性（终态运行中 02/05 两场景复现标注）；
+   - **新发现 B（C# 侧固有，登记修正）**：C# 2.14.0.0 CLI recv 的 0x04 服务端在判决后瞬时宣称 complete 且零落盘——**原版 C#↔C# 配对同样失败**（TCP/UDT 双传输、干净 fixture 复现；证据 `.zcode/scratch-interop/out_v2c/probe_*`），非 v2 回归；#44 的「v2→C# 0x04 同步实机验证」登记待复核（当时接收端形态可能不同）。0x04 回路改以 **C#→v2 方向**覆盖（场景 09：全量树一致 → 二轮 C# 客户端回显 already fully received（v2 服务端 status=2 零传输）→ 三轮改文件差量送达且旁证不动，实测通过）；
+   - **边界固化**：C# 方言仅承载于 UDT 槽位（§7.30）——TCP 上 C#↔v2 协议错配，双向均以负例场景固化（TCP 明文/配对尝试必须失败）。
+
+46. **独立审查修复批（轮 UI-5，2026-11-16）**：外部独立审查（6 个并行审查上下文 + 逐条复核）发现 1×P0 + 6×P1，全部修复并配「去修复必红」判别测试；基线 272 → **280 项全绿**（rustc 0 告警，连跑 3 次无 flake）。
+   - **P0 0x04 数据丢失**：同步更新失败的 Err 分支先删既有文件、再发布一个从未创建的 temp（用户上一版文件凭空消失）。改为 cs_publish_replace（同目录 rename 原子覆盖）、失败路径不触碰目标、receive_payload 加 PartGuard 清内层半成品；
+   - **P1 0x03 假成功**：体收满但尾哈希前断连时会话被当成「已完整」（st=2 零校验）。引入 CsResumeState.verified + 磁盘长度硬校验；未验证会话删残件、回 st=0/offset 0 整组重来；已验证会话保留以支持 C#「已完整」重问且不重复记账；
+   - **P1 0x02 假成功**：组装器被并发参数不符/TTL 清扫摘除后，块被静默跳过而本连接哈希只覆盖自己收到的字节、仍回 ACK 0x01。取不到 tracker 即 Err（整组重发）；
+   - **P1 0x09 预认证放大 + 锁定绕过**：PBKDF2 50k 移到读取 32B 证明之后；配对阶段 Io/Proto 错误折算 AuthRejected 计入 10 次锁定门（此前「发 1 字节即断」可无限烧 CPU）；
+   - **P1 UDT 轻量 ACK 越界**：补 cum <= next_seq+1 校验（越界断连）+ off 上界兜底（此前 20B 包可让驱动空转 ≈10 亿次 pop_front 并把 last_ack 推到未来）；
+   - **P1 Web 令牌断链**：?t= 校验通过即签发会话（扫码后页内链接/表单不再被打回 /login）；
+   - **P1 共享启动 panic**：is_upload_part_name 增加 is_char_boundary(8) 守卫（非 ASCII 文件名不再 panic）；
+   - **文档同步**：WIRE-PROTOCOL §2.1（旧服务端回退默认 fail-closed）、§3（serverOffset = 磁盘事实）、§10.2（0x03 验证前置条件、0x04 原子替换）三处与实现相反的陈述已改正；
+   - **判别纪律**：上述除 0x02（仅 TTL/完成后可达，防御性收口）外 6 项均做「去修复必红」实测；
+   - **自查补修两处**：已验证会话保留后不得因同 sid 换 total 删除已交付文件；完成即释放声明量（幂等），否则 TTL 窗口内占用 64 GiB 封顶额度误拒大批量同步（各配回归测试）；
+   - **登记后续批**：审查报告 P2 清单（跨 peer 会话逐出、30s 判决窗口、发布前 fsync、配置 .bak 自愈、缓存 TTL 单位、stats 时区、scrub 停止口径、monitor 退避、Web 416 语义、更新器相对重定向端口等）。
+
+47. **P2 收口批（轮 UI-5 续，2026-11-16）**：先收审查报告 P2 清单中的 8 项，基线 280 → **286 项全绿**（rustc 0 告警；clippy 无新增）。
+   - 配置 `.bak` 自愈两处（空 `.bak` 不再被 serde(default) 吃成默认配置；保存时只有旧主文件合法才轮换备份）；
+   - 摘要缓存 TTL 单位对齐（纳秒 mtime ÷ 1e9 比秒 TTL——此前条目永不过期，hash_cache_days 成死配置）；
+   - 统计「今日」边界保留本地偏移（UTC+8 下不再从本地 08:00 起算）；
+   - 文件名净化去掉 `..` 子串误拒（a..b.txt 可发可收；精确段 `..`/分隔符仍拒）；
+   - 0x01/0x04 最终判决窗口 30s → 300s（接收端回执前整文件重哈希不再误报拒绝）；
+   - RUDP 非环回 mss 钳到 1400（读侧按块缓冲的单连接上限 ≈123MB → ≈2.8MB）；
+   - UDT 对端流窗钳到 25600（恶意通告 i32::MAX 不再无限驻留待发数据）；
+   - 复查修正 hashcache 测试的秒级 mtime 输入；
+   - **判别纪律**：除 0x01/0x04 超时口径（对称性修复，无独立 e2e）外 6 项均做「去修复必红」实测。
+
+48. **交互/网络面收口（轮 UI-5 续 2，2026-11-16）**：再收 5 项，基线 286 → **291 项全绿**（rustc 0 告警；clippy 无新增）。
+   - scrub 停止：`stopped` 标记 + 不补发 (total,total) + GUI「已中止」文案（旧行为 = 进度走满 + 0 不一致的假成功）；
+   - Web Range：空文件无 Range → 200 + CL=0（显式 Range 才 416）；多区间/未知单位 → 200 全量（RFC 允许忽略，不再 416）；
+   - 发布前 fsync：v2 0x03 / 0x02 组装 / C# 方言 0x03 三条路径补齐（掉电后不得短文件报成功）；
+   - monitor 失败退避：每文件指数退避（1s→…→10min）+ 失败次数入事件文案（旧实现每轮重连死对端）；
+   - 更新器相对重定向保留端口（resolve_redirect 用 host_header_of，含端口与 IPv6 方括号）；
+   - **判别纪律**：除 fsync（耐久性，无判别 e2e）外 4 项均做「去修复必红」实测。
+
+49. **落盘包含性 + 共享信息保持（轮 UI-5 续 3，2026-11-16）**：再收 2 项，基线 291 → **292 项全绿**（rustc 0 告警；clippy 无新增）。
+   - 0x04 落盘包含性：新增 ensure_contained（canonicalize 最近存在祖先必须落在 save_dir 内），根目录与每个文件父目录建前/建后各验一次——save_dir 内预置 junction 不再能把对端可控相对路径写出树外（判别：cs_sync_rejects_junction_escape，Windows mklink /J）；
+   - 共享信息保持：HttpHandle 增 token/dir + 新 http_info 命令；前端 `sync-state` 仅在共享确实停止时清空链接，页面重载后从后端句柄恢复（旧实现任一子系统状态事件都会把运行中的共享显示成未运行）；
+   - **判别纪律**：包含性做「去修复必红」实测；共享信息为 UI 状态修复（无 JS 测试基建，登记真机冒烟）。
+
+50. **0x02 会话跨 peer 隔离（轮 UI-5 续 4，2026-11-16）**：基线 292 → **293 项全绿**（clippy 无新增）。
+   - 分块会话逐出按来源分桶：单来源上限 8 组（只逐出本来源最旧、组装中不删），全局表满拒绝新组——旧策略全局最旧逐出可被单主机 65 个组打掉他人半成品（跨 peer DoS）；判别：session_eviction_is_per_peer_and_never_cross_peer。
+
+51. **cswire 跨连接表条数上限（轮 UI-5 续 5，2026-11-16）**：基线 293 → **294 项全绿**（clippy 无新增）。
+   - `CS_MAX_TRACKERS=64` / `CS_MAX_RESUME_SESSIONS=256`，超出按 touched 最旧逐出；resume 只摘会话不删文件（可能是已验证交付）；被逐连接得到显式错误而非假成功；判别：session_tables_are_capped。
+
+54. **真机 F1：0x02 发布后释放文件句柄（轮 UI-5 续 8，2026-11-17）**：真机 A14 暴露——组装完成后会话仍握最终文件句柄，Windows 上文件被锁到 TTL 10 分钟。`GroupSession.file` 改 `Mutex<Option<File>>`，`finish` 成功后在 file→state 同序锁下置 `None`；判别：finish_releases_published_file_handle；真机复核读取成功。基线 296 → **297 项全绿**。
+
+55. **真机 F2：发布改名落盘（轮 UI-5 续 9，2026-11-17）**：B3 断电暴露——数据 fsync 了但 `hard_link`/`rename` 的目录项未落盘，重启后文件仍是 `.trft-part` 而发送端已收「完成」。新增 `publish` 模块：Windows `MoveFileExW(WRITE_THROUGH)` 的 `move_noreplace`/`move_replace`，接入 `publish_part`/UDP/C# 方言/0x04 四处；判别 `publish::tests`；真机二次断电复核最终名与哈希一致。基线 297 → **299 项全绿**。
+
+52. **GUI 共享启停竞态（轮 UI-5 续 6，2026-11-16）**：基线 294 → **295 项全绿**（clippy 无新增）。
+   - HttpHandle 增 `gen: Arc<()>`；`http_start` 先占位再 bind（检查与插入同一临界区），bind 失败按 gen 收回；收尾凭 `Arc::ptr_eq` 判定（被 stop 取走则报「共享在启动过程中被停止」，不复活）；判别：http_start_placeholder_blocks_double_start_and_detects_stop。
+
+53. **Web 下载并发名额绑 body（轮 UI-5 续 7，2026-11-16）**：基线 295 → **296 项全绿**（clippy 无新增）。
+   - 中间件把 permit 放进请求扩展（`PermitSlot`），下载处理器取出外包 `PermitReader`（持有 `OwnedSemaphorePermit` 的 `AsyncRead`）构造流式 body——名额随 body 销毁才归还；旧实现 permit 随中间件返回即释放，慢速下载可无限并发绕过 32 上限；判别：permit_reader_holds_permit_until_dropped。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

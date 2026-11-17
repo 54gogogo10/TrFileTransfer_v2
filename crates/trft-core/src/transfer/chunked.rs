@@ -7,7 +7,9 @@
 //!   防组装与迟到写竞态——发布是 hard_link，迟到写会穿透链接改坏成品）。
 //! - 覆盖达成 → 组装（现算整文件 SHA-256 → 登记摘要缓存 → 原子发布）；
 //!   组装失败必须移除会话，让 0x0C 回 0x00 强制客户端整组重来（杜绝假成功）。
-//! - 会话表 64 组、10 分钟无块逐出并删除半成品；孤儿 `.trft-part` 另受 7 天清扫兜底。
+//! - 会话表全局 64 组、**单来源 8 组**：超配额只逐出本来源最旧（组装中的组不删），
+//!   全局满则拒绝新组（fail-closed）——绝不跨 peer 逐出；10 分钟无块逐出并删除
+//!   半成品；孤儿 `.trft-part` 另受 7 天清扫兜底。
 
 use crate::error::{config_err, proto, Error, Result};
 use crate::hash::sha256_file;
@@ -36,6 +38,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// 空闲会话逐出（与单向 UDP 会话 TTL 同源纪律）。
 const SESSION_TTL: Duration = Duration::from_secs(600);
+/// 单来源并发组上限（轮 UI-5 续 4）：超出时只逐出**本来源**的最旧组；全局表满
+/// 则拒绝新组（fail-closed）。旧策略按全局最旧逐出，任意主机开 65 个组即可删掉
+/// 他人正在传的半成品（跨 peer DoS）。
+const MAX_SESSIONS_PER_PEER: usize = 8;
 
 pub(crate) struct GroupState {
     ranges: Vec<(u64, u64)>, // 已写盘区间（合并、升序）
@@ -50,9 +56,14 @@ pub(crate) struct GroupState {
 pub(crate) struct GroupSession {
     name: String,
     total: u64,
+    /// 创建该组的来源 IP（轮 UI-5 续 4：逐出按来源分桶，绝不跨 peer 删他人
+    /// 正在传的半成品——此前全局最旧逐出可被任意主机用 65 个组打掉）。
+    peer: String,
     part: PathBuf,
     /// 位置写互斥：并行连接串行落盘（正确性优先；吞吐由多连接网络 I/O 重叠获得）。
-    file: tokio::sync::Mutex<tokio::fs::File>,
+    /// 组装发布后置 `None` 释放句柄（轮 UI-5 续 8 / 真机 F1）：`rename` 不换句柄，
+    /// 会话若继续持有会把最终文件锁到 TTL（Windows 上用户 10 分钟内打不开）。
+    file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     state: tokio::sync::Mutex<GroupState>,
     last_seen_ms: AtomicU64,
     /// 组装结论唤醒（finish 成功/失败时唤醒 0x0C 等待者）。
@@ -66,6 +77,15 @@ pub struct ChunkTracker {
     sessions: tokio::sync::Mutex<HashMap<[u8; 16], std::sync::Arc<GroupSession>>>,
     /// 进度事件出口（GUI 注入；Default None = 不上报）。
     pub progress: Option<crate::progress::ProgressHub>,
+}
+
+/// 逐出一个会话：删半成品（打开句柄可能删不掉——孤儿清扫兜底）+ 给进度卡补终态
+/// （轮 3 F1：发送端中途放弃的组被逐出后，接收侧进度卡不得永久 running）。
+fn drop_group(s: &GroupSession) {
+    let _ = std::fs::remove_file(&s.part);
+    if let Some(r) = &s.report {
+        r.fail_if_running();
+    }
 }
 
 fn now_ms() -> u64 {
@@ -153,10 +173,7 @@ impl ChunkTracker {
             let fresh = now.saturating_sub(s.last_seen_ms.load(Ordering::Relaxed))
                 < SESSION_TTL.as_millis() as u64;
             if !fresh {
-                let _ = std::fs::remove_file(&s.part);
-                if let Some(r) = &s.report {
-                    r.fail_if_running();
-                }
+                drop_group(s);
             }
             fresh
         });
@@ -167,20 +184,38 @@ impl ChunkTracker {
             s.last_seen_ms.store(now, Ordering::Relaxed);
             return Ok(s.clone());
         }
-        if map.len() >= MAX_CHUNK_SESSIONS {
-            // 最旧逐出（last_seen 主序，与 UDP 引擎同策略）。
-            let oldest = map
-                .iter()
-                .min_by_key(|(_, s)| s.last_seen_ms.load(Ordering::Relaxed))
-                .map(|(k, _)| *k);
-            if let Some(k) = oldest {
-                if let Some(s) = map.remove(&k) {
-                    let _ = std::fs::remove_file(&s.part);
-                    if let Some(r) = &s.report {
-                        r.fail_if_running();
-                    }
+        // 单来源配额：本来源已满则逐出本来源最旧、且**不在组装中**的组。
+        // 绝不跨 peer 逐出（跨 peer 删他人半成品是远程 DoS 面）。
+        let mine: Vec<([u8; 16], u64)> = map
+            .iter()
+            .filter(|(_, s)| s.peer == peer_ip)
+            .map(|(k, s)| (*k, s.last_seen_ms.load(Ordering::Relaxed)))
+            .collect();
+        if mine.len() >= MAX_SESSIONS_PER_PEER {
+            let mut order = mine;
+            order.sort_by_key(|(_, ts)| *ts);
+            let mut victim = None;
+            for (k, _) in order {
+                // 组装中的组不得删（发布与迟到写竞态）；try_lock 失败视同组装中。
+                let assembling = map
+                    .get(&k)
+                    .map(|s| s.state.try_lock().map(|g| g.assembling).unwrap_or(true))
+                    .unwrap_or(true);
+                if !assembling {
+                    victim = Some(k);
+                    break;
                 }
             }
+            let Some(k) = victim else {
+                return Err(proto("该来源的分块会话数已达上限（请稍后重试）"));
+            };
+            if let Some(s) = map.remove(&k) {
+                drop_group(&s);
+            }
+        }
+        if map.len() >= MAX_CHUNK_SESSIONS {
+            // 全局满：拒绝新组（对端重试），**不得**再按全局最旧逐出。
+            return Err(proto("分块会话表已满（请稍后重试）"));
         }
         let part = group_part_path(save_dir, name, &gid);
         // 磁盘预检（轮 1：0x02 此前缺席——规格 §3.1 口径对齐其余接收路径）。
@@ -211,8 +246,9 @@ impl ChunkTracker {
         let s = std::sync::Arc::new(GroupSession {
             name: name.to_string(),
             total,
+            peer: peer_ip.to_string(),
             part,
-            file: tokio::sync::Mutex::new(file),
+            file: tokio::sync::Mutex::new(Some(file)),
             state: tokio::sync::Mutex::new(GroupState {
                 ranges: Vec::new(),
                 covered: 0,
@@ -259,6 +295,11 @@ impl ChunkTracker {
                 sess.last_seen_ms.store(now_ms(), Ordering::Relaxed);
                 return Ok(false); // 幂等：已覆盖区间跳过写盘
             }
+            // 句柄已在组装完成后释放（assembling 分支在上面，迟到块仍走幂等）；
+            // 走到这里说明会话被异常回收、状态却没标记——整组重发。
+            let Some(f) = f.as_mut() else {
+                return Err(proto("分块组装器已被回收（请整组重发）"));
+            };
             f.seek(SeekFrom::Start(offset)).await?;
             f.write_all(payload).await?;
             let added = merge_range(&mut st.ranges, offset, end)?;
@@ -310,7 +351,12 @@ impl ChunkTracker {
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map.get(&gid) {
-                s.state.lock().await.assembled = true;
+                // 先 file 后 state（与 receive 同序，避免 ABBA 死锁）。
+                let mut f = s.file.lock().await;
+                let mut st = s.state.lock().await;
+                st.assembled = true;
+                // 释放发布后的句柄（真机 F1）：否则最终文件被锁到 TTL。
+                *f = None;
             }
         }
         notify.notify_waiters();
@@ -322,9 +368,17 @@ impl ChunkTracker {
 
     async fn assemble(&self, part: &Path, name: &str, opts: &RecvOptions) -> Result<PathBuf> {
         let p = part.to_path_buf();
-        let hash = tokio::task::spawn_blocking(move || sha256_file(&p))
-            .await
-            .map_err(|e| proto(e.to_string()))??;
+        let hash = tokio::task::spawn_blocking(move || -> Result<[u8; 32]> {
+            // 发布前落盘（轮 UI-5 续 P2）：0x02 组装此前不 fsync——哈希从页缓存
+            // 算出，掉电后最终名可能是短文件而服务端已回 0x01 并记成功。
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)?
+                .sync_all()?;
+            sha256_file(&p)
+        })
+        .await
+        .map_err(|e| proto(e.to_string()))??;
         // 发布目录 = 会话半成品所在目录（PerDeviceFolder/AutoArchive 下即
         // 解析后的设备/日期目录）——目录在会话建立时固定，与续传语义一致。
         let dir = part
@@ -784,6 +838,86 @@ async fn send_complement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 轮 UI-5 续 8 / 真机 F1 判别：0x02 组装发布后必须释放会话持有的文件句柄，
+    /// 否则最终文件被锁到 TTL（Windows 上用户 10 分钟内打不开/改不了名）。
+    #[tokio::test]
+    async fn finish_releases_published_file_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = ChunkTracker::default();
+        let gid = [0x3au8; 16];
+        let data = b"0123456789abcdef";
+        assert!(
+            t.receive(gid, "f.bin", data.len() as u64, 0, data, dir.path(), "1.2.3.4")
+                .await
+                .unwrap()
+        );
+        let dest = t.finish(gid, &RecvOptions::default()).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        let sess = t
+            .sessions
+            .lock()
+            .await
+            .get(&gid)
+            .cloned()
+            .expect("会话保留为已完成态");
+        assert!(
+            sess.file.lock().await.is_none(),
+            "发布后必须释放文件句柄（真机 F1）"
+        );
+    }
+
+    /// 轮 UI-5 续 4 判别：分块会话逐出必须按来源分桶——旧策略（全局最旧）下
+    /// 任意主机开 65 个组即可删掉他人正在传的半成品（跨 peer DoS）。
+    #[tokio::test]
+    async fn session_eviction_is_per_peer_and_never_cross_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = ChunkTracker::default();
+        let victim = [0x11u8; 16];
+        t.ensure(victim, "victim.bin", 16, dir.path(), "10.9.9.9")
+            .await
+            .unwrap();
+
+        // 攻击者占满自己的配额后再来一个——只逐出它自己的最旧组。
+        for i in 0..MAX_SESSIONS_PER_PEER as u8 {
+            let mut g = [0u8; 16];
+            g[0] = i;
+            g[15] = 0xA1;
+            t.ensure(g, "atk.bin", 16, dir.path(), "10.6.6.6")
+                .await
+                .unwrap();
+        }
+        let mut extra = [0u8; 16];
+        extra[15] = 0xAF;
+        t.ensure(extra, "atk.bin", 16, dir.path(), "10.6.6.6")
+            .await
+            .unwrap();
+        assert!(
+            t.sessions.lock().await.contains_key(&victim),
+            "其他 peer 的会话不得被逐出"
+        );
+
+        // 多来源填满全局表：新来源必须被拒绝，而不是逐出他人。
+        for p in 0..10u8 {
+            for i in 0..MAX_SESSIONS_PER_PEER as u8 {
+                let mut g = [0u8; 16];
+                g[0] = i;
+                g[1] = p;
+                g[15] = 0xB2;
+                let _ = t
+                    .ensure(g, "fill.bin", 16, dir.path(), &format!("10.1.1.{p}"))
+                    .await;
+            }
+        }
+        let mut fresh = [0u8; 16];
+        fresh[15] = 0xFF;
+        let r = t.ensure(fresh, "new.bin", 16, dir.path(), "10.3.3.3").await;
+        assert!(r.is_err(), "全局满时必须拒绝新来源，不得逐出他人");
+        assert!(
+            t.sessions.lock().await.contains_key(&victim),
+            "填表过程同样不得动其他 peer 的会话"
+        );
+    }
 
     #[test]
     fn split_and_complement() {

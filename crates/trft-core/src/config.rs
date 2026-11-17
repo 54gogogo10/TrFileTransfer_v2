@@ -168,12 +168,8 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let main: Result<Self> = match std::fs::read_to_string(path) {
-            // 解析为空（规格 §3.8）：保存中途截断的典型形态，视为损坏。
-            Ok(text) if text.trim().is_empty() => Err(config_err("主文件为空（疑似保存中途截断）")),
-            Ok(text) => toml::from_str::<Config>(&text)
-                .map_err(|e| config_err(format!("config 解析失败: {e}")))
-                .and_then(|c| c.validate()),
+        let main = match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse_text(&text),
             Err(e) => Err(config_err(format!("主文件不可读: {e}"))),
         };
         match main {
@@ -182,10 +178,9 @@ impl Config {
                 let bak = path.with_extension("bak");
                 if bak.exists() {
                     let bak_text = std::fs::read_to_string(&bak)?;
-                    let c: Config = toml::from_str(&bak_text).map_err(|e2| {
-                        config_err(format!("主文件损坏（{main_err}）且 .bak 无法解析: {e2}"))
-                    })?;
-                    c.validate()
+                    Self::parse_text(&bak_text).map_err(|e2| {
+                        config_err(format!("主文件损坏（{main_err}）且 .bak 不可用: {e2}"))
+                    })
                 } else {
                     Err(main_err)
                 }
@@ -193,9 +188,28 @@ impl Config {
         }
     }
 
+    /// 主文件与 `.bak` 共用的解析/校验口径（轮 UI-5 P2）：**空或纯空白文本一律
+    /// 视为损坏**——`#[serde(default)]` 会把空文档吃成默认配置，静默关掉配对码、
+    /// IP 过滤与接收确认。旧实现只对主文件做了空判定，`.bak` 空文件会被当成
+    /// 「合法默认配置」返回 Ok。
+    fn parse_text(text: &str) -> Result<Self> {
+        if text.trim().is_empty() {
+            return Err(config_err("配置内容为空（疑似保存中途截断）"));
+        }
+        toml::from_str::<Config>(text)
+            .map_err(|e| config_err(format!("config 解析失败: {e}")))
+            .and_then(|c| c.validate())
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = toml::to_string_pretty(self).map_err(|e| config_err(e.to_string()))?;
-        atomic_write(path, text.as_bytes())
+        // 只在旧主文件「可解析且合法」时才轮换 .bak：把截断/空/非法主文件写成
+        // 备份会摧毁唯一的好备份（轮 UI-5 P2——主文件被截断后改任一设置即
+        // 让 .bak 失效，下次启动静默回落默认配置）。
+        let rotate = std::fs::read_to_string(path)
+            .ok()
+            .is_some_and(|t| Self::parse_text(&t).is_ok());
+        atomic_write_opts(path, text.as_bytes(), rotate)
     }
 
     /// fail-closed：非法值宁可报错也不带病运行。
@@ -225,7 +239,13 @@ pub fn new_token_secret() -> String {
 /// 注意：`.bak` 只在此处生成一次；`write_atomic` 内部**不再**做第二份 copy
 /// （本轮 F9：旧实现里 `.bak` 被写两遍，且注释宣称"非裸 copy"而实现是 copy）。
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    if path.exists() {
+    atomic_write_opts(path, data, true)
+}
+
+/// `backup = false`：不轮换 `.bak`（调用方已判定旧文件不可信任，或该文件没有
+/// 读回路径）。重试/原子换入逻辑与 [`atomic_write`] 完全一致。
+pub(crate) fn atomic_write_opts(path: &Path, data: &[u8], backup: bool) -> Result<()> {
+    if backup && path.exists() {
         let old = std::fs::read(path)?;
         write_atomic(&path.with_extension("bak"), &old)?;
     }
@@ -359,5 +379,41 @@ mod tests {
         std::fs::write(&p, "   \n\t\n").unwrap();
         let c3 = Config::load(&p).unwrap();
         assert_eq!(c3.server_port_tcp, 9100, "纯空白主文件同样按损坏处理");
+    }
+
+    /// 轮 UI-5 P2 判别：`.bak` 为空/纯空白同样按损坏处理——`serde(default)` 会把
+    /// 空文档吃成默认配置（配对码/IP 过滤/确认全关），旧实现只判主文件。
+    #[test]
+    fn empty_bak_is_not_silently_defaulted() {
+        let (_d, p) = tmp_config();
+        std::fs::write(&p, "").unwrap();
+        std::fs::write(p.with_extension("bak"), "   \n").unwrap();
+        assert!(
+            Config::load(&p).is_err(),
+            "空 .bak 不得被解析成默认配置返回 Ok"
+        );
+    }
+
+    /// 轮 UI-5 P2 判别：主文件损坏时保存**不得**把坏内容写成 .bak——否则唯一
+    /// 好备份被摧毁，下次主文件再坏即静默回落默认配置。
+    #[test]
+    fn save_keeps_good_bak_when_main_is_broken() {
+        let (_d, p) = tmp_config();
+        let c = Config {
+            server_port_tcp: 9100,
+            ..Config::default()
+        };
+        c.save(&p).unwrap();
+        // 造出「好备份 + 截断主文件」的现场。
+        std::fs::copy(&p, p.with_extension("bak")).unwrap();
+        std::fs::write(&p, "").unwrap();
+        let c2 = Config {
+            server_port_tcp: 9200,
+            ..Config::default()
+        };
+        c2.save(&p).unwrap();
+        let bak = Config::load(&p.with_extension("bak")).unwrap();
+        assert_eq!(bak.server_port_tcp, 9100, "好备份不得被截断主文件覆盖");
+        assert_eq!(Config::load(&p).unwrap().server_port_tcp, 9200);
     }
 }

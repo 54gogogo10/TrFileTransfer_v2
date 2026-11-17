@@ -426,22 +426,19 @@ where
     let flags_c = crate::protocol::io::read_u8(&mut enc).await?;
     let mut authed = false;
     // 配对码存在时：PBKDF2 50k 移出 async 线程，k_code 双侧可独立重算。
-    let k_code = match code {
-        Some(c) => {
+    // 轮 UI-5 P1：**先读满 32B 证明、再算 KDF**。旧顺序下客户端只要发 1 字节
+    // flags=1 就断连，服务端仍白烧一次 50k 轮 PBKDF2，且该路径是 Io 错误、
+    // 不计入配对锁定门——单个 LAN 主机即可持续打满 CPU 并饿死并发闸。
+    let mut k_code: Option<[u8; 32]> = None;
+    match (code, flags_c & 1 == 1) {
+        (Some(c), true) => {
+            let proof = crate::protocol::io::read_n(&mut enc, 32).await?;
             let c = c.to_string();
             let material2 = material.clone();
-            Some(
-                tokio::task::spawn_blocking(move || k_code_of(&c, &material2))
-                    .await
-                    .map_err(|e| io_err(e))?,
-            )
-        }
-        None => None,
-    };
-    match (code, flags_c & 1 == 1) {
-        (Some(_), true) => {
-            let proof = crate::protocol::io::read_n(&mut enc, 32).await?;
-            let expect = confirm_proof(&conf_c, &material, k_code.as_ref().unwrap());
+            let k = tokio::task::spawn_blocking(move || k_code_of(&c, &material2))
+                .await
+                .map_err(io_err)?;
+            let expect = confirm_proof(&conf_c, &material, &k);
             if !ct_eq(&proof, &expect) {
                 enc.write_all(&[STATUS_REJECT]).await?;
                 return Err(Error::AuthRejected(
@@ -449,6 +446,7 @@ where
                 ));
             }
             authed = true;
+            k_code = Some(k);
         }
         (Some(_), false) => {
             enc.write_all(&[STATUS_REJECT]).await?;

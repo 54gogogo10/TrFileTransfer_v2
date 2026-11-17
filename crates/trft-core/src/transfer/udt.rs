@@ -481,8 +481,19 @@ impl UdtConn {
                 // lite ACK 以 16×k 的频率把窗口棘轮到 0，发送端在两个完整 ACK
                 // （≤100/s）之间被饿死（真机 v2→C# 10MB/s 根因，§7.32）。
                 let cum = words[0] as i32;
+                // 超前校验（与完整 ACK 分支同口径，轮 UI-5 P1）：缺此检查时
+                // seq_off 可返回 ≈0x3FFFFF00——一个 20B 轻量 ACK 就足以让驱动
+                // 空转 10 亿次 pop_front，并把 last_ack 推到 next_seq 之前 1e9
+                // （重传过滤与 ACK 判序永久错乱，连接发送方向卡死）。未认证
+                // 对端两包握手即可触发，故越界一律断连。
+                if pw::seq_cmp(cum, pw::seq_inc(s.next_seq)) > 0 {
+                    drop(s);
+                    self.close(Some("轻量 ACK 越界（对端状态异常）".into()));
+                    return;
+                }
                 if pw::seq_cmp(cum, s.last_ack) >= 0 {
-                    let off = pw::seq_off(s.last_ack, cum);
+                    // 上界兜底：合法范围内 off ≤ 在途包数，异常路径也不得空转。
+                    let off = pw::seq_off(s.last_ack, cum).min(s.pkts.len() as i32 + 1);
                     if off > 0 {
                         for _ in 0..off {
                             s.pkts.pop_front();
@@ -502,7 +513,10 @@ impl UdtConn {
                 }
                 if pw::seq_cmp(cum, s.last_ack) >= 0 {
                     if words.len() >= 4 {
-                        s.flow_window = words[3] as i32;
+                        // 对端通告的流窗必须钳到本实现上限（libudt
+                        // m_iFlightFlagSize=25600）：否则恶意对端报 i32::MAX 可让
+                        // 发送侧把整个待发文件驻留内存（轮 UI-5 P2）。
+                        s.flow_window = (words[3] as i32).clamp(2, pw::UDT_FLIGHT_FLAG);
                     }
                     // 对端 RTT / 投递速率 EWMA（ACK word1/word4——libudt core.cpp
                     // 2057-2074 同款；CA 速率公式的主输入）。
@@ -2006,6 +2020,67 @@ mod tests {
         let r = stream.read(&mut buf).await;
         assert!(r.is_err(), "超前 ACK 必须报 ConnectionReset");
         assert!(conn.error().is_some());
+    }
+
+    /// 轮 UI-5 P1 判别：**轻量 ACK（单字 cum）同样必须做超前校验**。
+    /// 修复前该分支缺校验，seq_off 可返回 ≈0x3FFFFF00 —— 一个 20B 包让驱动
+    /// 空转约 10 亿次 pop_front，并把 last_ack 推到 next_seq 之前 1e9（重传
+    /// 过滤与 ACK 判序永久错乱）；且连接不会断（不报错）。未认证对端两包
+    /// 握手即可触发。
+    #[tokio::test]
+    async fn lite_ack_oversized_breaks_connection_without_spin() {
+        let peer: SocketAddr = "127.0.0.1:12".parse().unwrap();
+        let isn = 42;
+        let (conn, mut stream, in_tx, _out, _drv) =
+            build_conn(1, 2, peer, isn, isn, 64, None, None);
+        // 单字 ACK：cum 落在 last_ack 的前半空间（seq_cmp 判定为前进），但远超
+        // next_seq+1。旧实现会把它当成 ~1.07e9 个已确认包。
+        let huge = (isn as u32).wrapping_add(0x3FFF_FF00);
+        in_tx
+            .send(pw::Pkt::Ctrl {
+                ctype: pw::C_ACK,
+                ext: 0,
+                add: 0,
+                ts: 0,
+                dst: 1,
+                words: vec![huge],
+            })
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let r = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("轻量 ACK 越界处理不得挂起/空转");
+        assert!(r.is_err(), "越界轻量 ACK 必须断连（不得静默接受）");
+        assert!(conn.error().is_some(), "断连原因必须可见");
+    }
+
+    /// 轮 UI-5 P2 判别：对端通告的流窗必须钳到本实现上限（25600）——
+    /// 否则恶意对端报 i32::MAX 会让发送侧把整个待发文件驻留内存。
+    #[tokio::test]
+    async fn ack_flow_window_is_clamped() {
+        let peer: SocketAddr = "127.0.0.1:14".parse().unwrap();
+        let isn = 7;
+        let (conn, _stream, in_tx, _out, _drv) =
+            build_conn(1, 2, peer, isn, isn, 64, None, None);
+        in_tx
+            .send(pw::Pkt::Ctrl {
+                ctype: pw::C_ACK,
+                ext: 0,
+                add: 0,
+                ts: 0,
+                dst: 1,
+                words: vec![isn as u32, 0, 0, i32::MAX as u32],
+            })
+            .unwrap();
+        let mut got = 0;
+        for _ in 0..100 {
+            got = conn.send.lock().unwrap().flow_window;
+            if got == pw::UDT_FLIGHT_FLAG {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(got, pw::UDT_FLIGHT_FLAG, "对端流窗必须钳到 25600");
     }
 
     /// 窗口约束：流窗 3 时写 8 包必须被窗口限流（未被 ACK 放行前不得完成）。

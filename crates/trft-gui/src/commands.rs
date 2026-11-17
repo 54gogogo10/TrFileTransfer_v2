@@ -1323,18 +1323,38 @@ pub fn recv_stop(app: tauri::AppHandle, proto: Proto) -> Result<(), String> {
 
 // ============ HTTP 共享 + 二维码（规格 §3.4） ============
 
+/// 启动占位（轮 UI-5 续 6 P2）：检查与插入同一临界区（调用方持锁）。
+fn http_claim(slot: &mut Option<HttpHandle>, h: HttpHandle) -> bool {
+    if slot.is_some() {
+        return false;
+    }
+    slot.replace(h);
+    true
+}
+
+/// 启动收尾：占位仍是本次启动（gen 相同）才写入 token/dir；已被 stop 取走则失败。
+fn http_finalize(
+    slot: &mut Option<HttpHandle>,
+    gen: &std::sync::Arc<()>,
+    token: Option<String>,
+    dir: String,
+) -> bool {
+    match slot.as_mut() {
+        Some(h) if std::sync::Arc::ptr_eq(&h.gen, gen) => {
+            h.token = token;
+            h.dir = dir;
+            true
+        }
+        _ => false,
+    }
+}
+
 #[tauri::command]
 pub async fn http_start(
     app: tauri::AppHandle,
     port: Option<u16>,
     dir: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    {
-        let st = app.state::<AppState>();
-        if st.http.lock().expect("http 锁").is_some() {
-            return Err("共享已在运行".into());
-        }
-    }
     let cfg = app.state::<AppState>().config();
     let port = port.unwrap_or(cfg.http_port).clamp(1, 65535);
     // 规格 §3.4：共享所选保存目录（GUI 无标签页，用下拉三选一）。
@@ -1342,6 +1362,29 @@ pub async fn http_start(
         Some(d) if !d.is_empty() => PathBuf::from(d),
         _ => cfg.save_dir_tcp.clone(),
     };
+    // 启动占位（轮 UI-5 续 6 P2）：检查与插入同一临界区、先占位再 bind——
+    // 旧实现 check→bind→insert 有窗口，两个并发 http_start 可都通过检查，
+    // 后者覆盖前者（旧服务泄漏且 stop 只能停一个）。占位即「启动中」，
+    // 并发 stop 会取走占位并发出 shutdown，收尾凭 gen 判定放弃。
+    let dir_str = dir.to_string_lossy().into_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let gen = std::sync::Arc::new(());
+    {
+        let st = app.state::<AppState>();
+        let claimed = http_claim(
+            &mut st.http.lock().expect("http 锁"),
+            HttpHandle {
+                port,
+                shutdown: tx,
+                token: None,
+                dir: dir_str.clone(),
+                gen: gen.clone(),
+            },
+        );
+        if !claimed {
+            return Err("共享已在运行".into());
+        }
+    }
     let _ = std::fs::create_dir_all(&dir);
     // 上传半成品孤儿清扫（轮 5 P2-2：Drop 守卫不覆盖进程被杀——7 天口径与
     // core 半成品清扫一致，`http_start` 是共享目录的天然启动钩子）。
@@ -1377,10 +1420,20 @@ pub async fn http_start(
         secret,
     ));
     let router = trft_server::build_router(state);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .map_err(|e| format!("端口 {port} 绑定失败: {e}"))?;
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            // 占位收回（仅当仍是本次启动——stop 已取走则不再动表）。
+            let st = app.state::<AppState>();
+            let mut g = st.http.lock().expect("http 锁");
+            if g.as_ref()
+                .is_some_and(|h| std::sync::Arc::ptr_eq(&h.gen, &gen))
+            {
+                g.take();
+            }
+            return Err(format!("端口 {port} 绑定失败: {e}"));
+        }
+    };
     let app2 = app.clone();
     let _handle = tauri::async_runtime::spawn(async move {
         let _ = axum_like_serve(listener, router, rx).await;
@@ -1391,10 +1444,11 @@ pub async fn http_start(
     });
     {
         let st = app.state::<AppState>();
-        st.http
-            .lock()
-            .expect("http 锁")
-            .replace(HttpHandle { port, shutdown: tx });
+        let mut g = st.http.lock().expect("http 锁");
+        if !http_finalize(&mut g, &gen, token.clone(), dir_str.clone()) {
+            // 启动期间被 stop 取走：serve 已收到 shutdown，不得复活，直接报错。
+            return Err("共享在启动过程中被停止".into());
+        }
     }
     update_awake(&app);
     let _ = app.emit(
@@ -1402,6 +1456,18 @@ pub async fn http_start(
         serde_json::json!({ "level": "ok", "message": format!("HTTP 共享启动 :{port}") }),
     );
     Ok(serde_json::json!({ "port": port, "token": token, "dir": dir.to_string_lossy() }))
+}
+
+/// 运行中的共享信息（轮 UI-5 续 3 P2）：`sync-state` 是「任意子系统状态变了」的
+/// 通用信号，前端不得据此清空链接——共享仍在运行时从此命令重建 URL/二维码；
+/// 页面重载后同样靠它恢复（token 只在后端句柄里）。
+#[tauri::command]
+pub fn http_info(app: tauri::AppHandle) -> Option<serde_json::Value> {
+    let st = app.state::<AppState>();
+    let h = st.http.lock().expect("http 锁");
+    h.as_ref().map(|h| {
+        serde_json::json!({ "port": h.port, "token": h.token, "dir": h.dir })
+    })
 }
 
 /// 带头读超时的共享 serve + graceful shutdown（轮 2 P1：与 trft-server main 同口径，
@@ -2393,4 +2459,66 @@ pub fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, level: &str, messa
 pub fn save_now(app: &tauri::AppHandle) {
     let st = app.state::<AppState>();
     let _ = st.save_config();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 轮 UI-5 续 6 P2 判别：共享启动占位必须让并发 start 失败；stop 取走占位后，
+    /// 迟到的收尾必须放弃（不得复活已停的服务）。旧实现 check→bind→insert 有窗口，
+    /// 两个并发 http_start 可都通过检查（后者覆盖前者，旧服务泄漏）。
+    #[test]
+    fn http_start_placeholder_blocks_double_start_and_detects_stop() {
+        let gen = std::sync::Arc::new(());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        let mut slot: Option<HttpHandle> = None;
+        assert!(http_claim(
+            &mut slot,
+            HttpHandle {
+                port: 1,
+                shutdown: tx,
+                token: None,
+                dir: "d".into(),
+                gen: gen.clone(),
+            }
+        ));
+        // 并发第二次启动：占位在位 → 必须被拒。
+        let (tx2, _rx2) = tokio::sync::oneshot::channel::<()>();
+        assert!(!http_claim(
+            &mut slot,
+            HttpHandle {
+                port: 2,
+                shutdown: tx2,
+                token: None,
+                dir: "d".into(),
+                gen: std::sync::Arc::new(()),
+            }
+        ));
+        // 正常收尾：写入 token/dir。
+        assert!(http_finalize(&mut slot, &gen, Some("t".into()), "d".into()));
+        assert_eq!(slot.as_ref().unwrap().token.as_deref(), Some("t"));
+        // stop 取走后，迟到的收尾必须失败（且不得重新插入）。
+        assert!(slot.take().is_some());
+        assert!(!http_finalize(&mut slot, &gen, Some("t".into()), "d".into()));
+        assert!(slot.is_none());
+        // 更狠的窗口：stop 之后新 start 已占位——旧代的收尾不得覆盖新代。
+        let (tx3, _rx3) = tokio::sync::oneshot::channel::<()>();
+        let gen_b = std::sync::Arc::new(());
+        assert!(http_claim(
+            &mut slot,
+            HttpHandle {
+                port: 3,
+                shutdown: tx3,
+                token: None,
+                dir: "d".into(),
+                gen: gen_b.clone(),
+            }
+        ));
+        assert!(
+            !http_finalize(&mut slot, &gen, Some("old".into()), "d".into()),
+            "旧代收尾不得覆盖新代"
+        );
+        assert_eq!(slot.as_ref().unwrap().port, 3);
+    }
 }

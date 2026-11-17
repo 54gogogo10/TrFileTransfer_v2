@@ -53,7 +53,7 @@ const L10N = {
     st_running: "传输中", st_done: "完成", st_failed: "失败",
     up_to_date: "已是最新版本", new_version: "发现新版本", update_fail: "检查失败",
     saved: "设置已保存", save_fail: "保存失败", copied: "已复制", copy_fail: "复制失败", http_off: "共享未运行",
-    verify_done: "校验完成", send_fail: "发送失败", lang_locked: "传输进行中，语言切换已锁定",
+    verify_done: "校验完成", verify_stopped: "校验已中止（仅扫描了部分文件）", send_fail: "发送失败", lang_locked: "传输进行中，语言切换已锁定",
     queue_sent: "队列已全部执行", queue_full: "队列已达 500 项上限",
     udp_file_only: "单向 UDP 仅支持单文件（无握手通道）",
     udt_code_warn: "UDT 互通协议的配对认证以未加盐哈希上线（C# 2.14 互锁约束）：嗅探可离线爆破配对码。该场景建议 12 位配对码，或改用 TCP/QUIC/RUDP 槽位",
@@ -133,7 +133,7 @@ const L10N = {
     st_running: "Running", st_done: "Done", st_failed: "Failed",
     up_to_date: "Up to date", new_version: "New version", update_fail: "Check failed",
     saved: "Settings saved", save_fail: "Save failed", copied: "Copied", copy_fail: "Copy failed", http_off: "Sharing not running",
-    verify_done: "Verify finished", send_fail: "Send failed", lang_locked: "Language locked during transfers",
+    verify_done: "Verify finished", verify_stopped: "Verify stopped (partial scan)", send_fail: "Send failed", lang_locked: "Language locked during transfers",
     queue_sent: "Queue finished", queue_full: "Queue reached the 500-item limit",
     udp_file_only: "One-way UDP supports single files only (no handshake channel)",
     udt_code_warn: "The UDT interop protocol sends an unsalted pairing-code hash on the wire (C# 2.14 interop constraint): sniffing enables offline brute force. Use a 12-digit code here, or switch to TCP/QUIC/RUDP.",
@@ -1771,8 +1771,20 @@ async function wireEvents() {
   await listen("trft://sync-state", async () => {
     try {
       appState = await invoke("get_app_state");
-      httpInfo = null;
-      $("#share-dir-line").textContent = "";
+      // 轮 UI-5 续 3 P2：sync-state 是「任意子系统状态变了」的通用信号——
+      // 共享仍在运行时不得清空链接/二维码（token 只在后端句柄里，前端丢了
+      // 就再也拿不回来；旧实现任何接收器/监控退出都会把运行中的共享显示成
+      // 「未运行」）。
+      if (appState.httpRunning) {
+        const info = await invoke("http_info").catch(() => null);
+        if (info) {
+          httpInfo = info;
+          $("#share-dir-line").textContent = info.dir;
+        }
+      } else {
+        httpInfo = null;
+        $("#share-dir-line").textContent = "";
+      }
       refreshQr();
       renderReceivers();
       invoke("monitor_status").then((on) => {
@@ -1877,7 +1889,13 @@ async function wireEvents() {
       li.textContent = m;
       mm.appendChild(li);
     });
-    toast(t("verify_done"), r.mismatches.length ? "err" : "ok");
+    // 轮 UI-5 续 P2：中途停止不得显示「校验完成」（只扫了部分文件时
+    // mismatches 为空与「完整扫描且全一致」无法区分）。
+    if (r.stopped) {
+      toast(t("verify_stopped"), "warn");
+    } else {
+      toast(t("verify_done"), r.mismatches.length ? "err" : "ok");
+    }
   });
 }
 
@@ -1947,6 +1965,11 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
 (async function init() {
   lang = localStorage.getItem("trft-lang") || "zh";
   appState = await invoke("get_app_state");
+  // 页面重载/重启后共享可能仍在运行：从后端句柄恢复链接（token 不在状态快照里）。
+  if (appState.httpRunning) {
+    httpInfo = await invoke("http_info").catch(() => null);
+    if (httpInfo) $("#share-dir-line").textContent = httpInfo.dir;
+  }
   lang = appState.config.language || lang;
   // UI-4 F8：语言白名单归一（theme 同款）——非法值会让 t() 抛 TypeError
   // 打断整个 init 接线。

@@ -111,6 +111,7 @@ build.bat                           :: 一键发布：release\ 三件套 + sha25
 | [docs/PRODUCT-SPEC.md](docs/PRODUCT-SPEC.md) | 产品规格（行为与要求的权威描述） |
 | [docs/TECH-STACK.md](docs/TECH-STACK.md) | 技术选型与里程碑记录 |
 | [docs/WIRE-PROTOCOL.md](docs/WIRE-PROTOCOL.md) | 线协议字节级布局（互通实现参考） |
+| [docs/QA-CHECKLIST.md](docs/QA-CHECKLIST.md) | 真机验证清单（C# 2.14 互通 / NTFS 掉电 fsync / GUI 冒烟） |
 
 ## 路线图
 

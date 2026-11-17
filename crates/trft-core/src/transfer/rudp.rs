@@ -1044,6 +1044,17 @@ fn random_u32() -> u32 {
 /* ============ 客户端 ============ */
 
 /// 建立到 `addr` 的 RUDP 连接（HS 握手 + 定时重发；30s 超时）。
+/// 握手采纳的 mss：环回放行到提案值（高带宽），其余钳到 1400。
+/// 读侧待读缓冲按块计（2048 块），远端 60000B 提案会把单连接内存上限
+/// 放大到 ≈123MB（轮 UI-5 P2）。独立成纯函数以便单测。
+fn clamp_peer_mss(mss: usize, peer_is_loopback: bool) -> usize {
+    if peer_is_loopback {
+        mss
+    } else {
+        mss.min(1400)
+    }
+}
+
 /// 首发协商版 HS（nonce + mss 提案：环回 60000 / 其余 1400），重发窗口
 /// 自动降级为旧版 16B HS——旧服务端只认 16B，新服务端两种都认。
 /// `src_port`：可选本地端口绑定（与 TCP/QUIC `--srcport` 同口径）。
@@ -1263,6 +1274,10 @@ async fn demux_one(
         let Some(mss) = pw::hs_mss(payload) else {
             return Ok(false);
         };
+        // 非环回对端钳到 1400（与客户端提案同口径）。读侧待读缓冲按**块**计
+        //（RUDP_DATA_CAP=2048），放行远端 60000B 提案会把单连接上限放大到
+        // ≈123MB（轮 UI-5 P2）；LAN 常规 MTU 也吃不下 60000B 的分片。
+        let mss = clamp_peer_mss(mss, src.ip().is_loopback());
         // IP 过滤先于握手（对齐 quic.rs：被拒源不进任何状态机）。
         if !ip_allowed(src.ip(), opts.ip_filter_mode, &opts.ip_filter_list) {
             if let Some(rst) = rst_pkt(h.conn, "被 IP 过滤规则拒绝") {
@@ -1493,6 +1508,15 @@ pub async fn serve_rudp_on(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 轮 UI-5 P2 判别：非环回对端的 60000B 提案必须钳到 1400——读侧缓冲按
+    /// 块计（2048 块），不钳制则单连接内存上限 ≈123MB。
+    #[test]
+    fn peer_mss_clamped_for_non_loopback() {
+        assert_eq!(clamp_peer_mss(60_000, true), 60_000, "环回放行高带宽提案");
+        assert_eq!(clamp_peer_mss(60_000, false), 1400, "非环回钳到 1400");
+        assert_eq!(clamp_peer_mss(1200, false), 1200, "低于 1400 保持原值");
+    }
 
     /// 绕过 socket 的对偶装配：两条连接的出入包直接经转发任务对接。
     /// `lossy = true` 时按确定性伪随机序列丢弃约 25% 的包（重传路径注入）。

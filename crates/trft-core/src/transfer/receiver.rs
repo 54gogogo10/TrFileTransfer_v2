@@ -618,6 +618,21 @@ pub(crate) async fn conn_settle(
     }
 }
 
+/// 配对/加密阶段的传输错误折算为认证失败（轮 UI-5 P1）：该阶段被中断（EOF/
+/// 超时/半包）同样是一次**未完成的凭据尝试**——若不计数，攻击者只需「发 1 字节
+/// 就断」即可无限烧 50k 轮 PBKDF2 并完全绕过 10 次配对锁定门。业务帧之后的
+/// 错误不受影响（磁盘满/权限等业务拒绝仍不计入锁定，规格 §4.1）。
+pub(crate) fn pairing_phase_err(e: Error, has_code: bool) -> Error {
+    if !has_code {
+        return e;
+    }
+    match e {
+        Error::Io(e) => Error::AuthRejected(format!("配对握手未完成（IO）: {e}")),
+        Error::Protocol(m) => Error::AuthRejected(format!("配对握手未完成: {m}")),
+        other => other,
+    }
+}
+
 /// TCP 入口：首字节 0x09 = 加密升级（规格 §4.1 认证在前、装饰器在后）。
 pub(crate) async fn handle_conn<S>(
     mut s: S,
@@ -647,7 +662,8 @@ where
                 )
                 .await
             }
-            Err(e) => Err(e),
+            // 轮 UI-5 P1：加密握手被中断同样是一次配对尝试，必须计入锁定门。
+            Err(e) => Err(pairing_phase_err(e, opts.pairing_code.is_some())),
         }
     } else {
         conn_loop_inner(
@@ -775,7 +791,10 @@ where
             Some(code) => {
                 let t = match pending.take() {
                     Some(t) => t,
-                    None => read_u8(&mut s).await?, // QUIC：首字节仍在流里
+                    // 配对阶段读超时/EOF 也是一次未完成的凭据尝试（计入锁定）。
+                    None => read_u8(&mut s)
+                        .await
+                        .map_err(|e| pairing_phase_err(e, true))?, // QUIC：首字节仍在流里
                 };
                 // 拒绝收尾：写拒绝字节 + 排水后关闭（确定性拒绝的前提）。
                 async fn reject_pairing<S>(s: &mut S, msg: String) -> Result<()>
@@ -803,7 +822,9 @@ where
                     let mut salt = [0u8; 16];
                     OsRng.fill_bytes(&mut salt);
                     write_all(s, &salt).await?;
-                    let proof = read_n(s, 32).await?;
+                    let proof = read_n(s, 32)
+                        .await
+                        .map_err(|e| pairing_phase_err(e, true))?;
                     let code_owned = code.to_string();
                     let salt_v = salt.to_vec();
                     // PBKDF2(50k) 是纯 CPU 密集：移出 async 工作线程（防 DoS 放大）。
@@ -837,7 +858,9 @@ where
                         let mut salt = [0u8; 16];
                         OsRng.fill_bytes(&mut salt);
                         write_all(&mut s, &salt).await?;
-                        let proof = read_n(&mut s, 32).await?;
+                        let proof = read_n(&mut s, 32)
+                            .await
+                            .map_err(|e| pairing_phase_err(e, true))?;
                         let code_owned = code.to_string();
                         let salt_v = salt.to_vec();
                         let k = tokio::task::spawn_blocking(move || {
@@ -1200,11 +1223,10 @@ pub(crate) async fn resolve_conflict(dir: &Path, name: &str) -> PathBuf {
 pub(crate) async fn publish_part(part: &Path, dir: &Path, name: &str) -> Result<PathBuf> {
     for _ in 0..10000u32 {
         let candidate = resolve_conflict(dir, name).await;
-        match std::fs::hard_link(part, &candidate) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(part);
-                return Ok(candidate);
-            }
+        // 真机 F2：硬链接同样不保证目录项落盘——改用 write-through 改名
+        // （目标存在即失败，与 hard_link 同语义；成功即源已消失）。
+        match crate::publish::move_noreplace(part, &candidate) {
+            Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
                 // 卷不支持硬链接（FAT32/exFAT/部分网络共享）：退化为「create_new

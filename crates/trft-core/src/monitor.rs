@@ -131,6 +131,9 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
     // 不得重发（无限重传放大），仅重试归档。
     let mut pending_archive: Vec<PathBuf> = Vec::new();
     let mut throttle: HashMap<String, Instant> = HashMap::new();
+    // 发送失败退避（轮 UI-5 续 P2）：文件 → (连续失败次数, 下次允许尝试时刻)。
+    // 旧实现失败即回队尾，每轮（默认 1s）对已死对端重连一次，永久不收敛。
+    let mut retry: HashMap<PathBuf, (u32, Instant)> = HashMap::new();
     let mut mut_stop = cfg.stop.clone();
 
     // 启动全量扫描（规格 §3.2）。
@@ -214,8 +217,15 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         if !front.is_file() {
             queue.pop_front();
             queued.remove(&front);
+            retry.remove(&front);
             cfg.emit(MonitorEvent::Dropped { name });
             continue;
+        }
+        // 退避门：上次失败的文件在退避期内跳过（回到 select 等下一拍）。
+        if let Some((_, next)) = retry.get(&front) {
+            if *next > Instant::now() {
+                continue;
+            }
         }
 
         // 拷贝完成判定（双重门；阻塞窗在 blocking 池）。
@@ -275,6 +285,7 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         match res {
             Ok(()) => {
                 queue.pop_front();
+                retry.remove(&front);
                 match move_to_sent(&cfg.watch_dir, &front) {
                     Ok(dest) => {
                         queued.remove(&front);
@@ -299,16 +310,20 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
                 }
             }
             Err(e) => {
-                // 失败不阻断队列：移到队尾（他人先行），按文件节流上报。
+                // 失败不阻断队列：移到队尾（他人先行），按文件节流上报；
+                // 指数退避（1s→2s→…→上限 10 分钟），不再每轮重连死对端。
                 queue.pop_front();
                 queue.push_back(front.clone());
+                let attempts = retry.get(&front).map(|(a, _)| *a + 1).unwrap_or(1);
+                let delay = retry_delay(attempts);
+                retry.insert(front.clone(), (attempts, Instant::now() + delay));
                 throttled_log(&mut throttle, &name, || {
                     cfg.emit(MonitorEvent::Failed {
                         name: name.clone(),
-                        error: e.to_string(),
+                        error: format!("{e}（第 {attempts} 次失败，{}s 后重试）", delay.as_secs()),
                     });
                 });
-                eprintln!("[监控] 发送失败 {name}: {e}");
+                eprintln!("[监控] 发送失败 {name}: {e}（第 {attempts} 次，{}s 后重试）", delay.as_secs());
             }
         }
     }
@@ -408,6 +423,14 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// 发送失败后的重试退避（轮 UI-5 续 P2）：第 n 次失败后等 2^(n-1) 秒，
+/// 上限 10 分钟。旧实现失败即回队尾、每轮（默认 1s）重连，对已死对端永久
+/// 产生连接风暴与失败事件。纯函数以便单测。
+fn retry_delay(attempts: u32) -> Duration {
+    let exp = attempts.saturating_sub(1).min(10); // 1,2,4,…,1024
+    Duration::from_secs((1u64 << exp).min(600))
+}
+
 /// 按文件节流：首报立即、后续 LOG_THROTTLE 内静默（规格 §3.2）。
 fn throttled_log(map: &mut HashMap<String, Instant>, name: &str, f: impl FnOnce()) {
     let now = Instant::now();
@@ -430,6 +453,16 @@ pub fn describe_error(e: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 轮 UI-5 续 P2 判别：失败退避必须指数增长并封顶 10 分钟。
+    #[test]
+    fn retry_delay_backs_off_exponentially_and_caps() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(3), Duration::from_secs(4));
+        assert_eq!(retry_delay(10), Duration::from_secs(512));
+        assert_eq!(retry_delay(20), Duration::from_secs(600), "上限 10 分钟");
+    }
 
     #[test]
     fn copy_complete_rejects_growing_file() {

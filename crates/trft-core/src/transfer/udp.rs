@@ -1007,11 +1007,9 @@ fn known_count(s: &Session, group: u64, total_shards: usize) -> usize {
 fn publish_part_sync(part: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
     for _ in 0..10000u32 {
         let cand = resolve_conflict_sync(dir, name);
-        match std::fs::hard_link(part, &cand) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(part);
-                return Some(cand);
-            }
+        // 真机 F2：同 publish_part——write-through 改名替代硬链接。
+        match crate::publish::move_noreplace(part, &cand) {
+            Ok(()) => return Some(cand),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
                 // 硬链接不可用卷的退化路径（fail-if-exists 语义不变）；

@@ -167,9 +167,47 @@ pub fn token_for(secret: &[u8; 32], code: &str) -> String {
 
 // ============ 中间件 ============
 
+/// 并发闸 permit 的请求级载体（轮 UI-5 续 7）：中间件把 permit 放进请求扩展，
+/// 下载处理器取出并绑到响应 body——下载在**读完 body 之前**一直占着并发名额。
+/// 旧实现 permit 随中间件返回即释放：慢速下载（每块隔几秒）可无限并发，32 连接
+/// 上限形同虚设。
+#[derive(Clone)]
+pub struct PermitSlot(Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
+
+impl PermitSlot {
+    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.lock().expect("permit 锁").take()
+    }
+}
+
+/// 持有 permit 的 AsyncRead 包装：permit 随 reader（→ 响应 body）一起释放。
+struct PermitReader<R> {
+    inner: R,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl<R> PermitReader<R> {
+    fn new(inner: R, permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        Self {
+            inner,
+            _permit: permit,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PermitReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 async fn concurrency_mw(
     State(st): State<Arc<WebState>>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     // /health、/login 豁免并发闸（轮 2 P1：32 个慢连接不得锁死健康检查与登录入口；
@@ -185,7 +223,14 @@ async fn concurrency_mw(
     )
     .await
     {
-        Ok(Ok(_permit)) => next.run(req).await,
+        Ok(Ok(permit)) => {
+            // permit 交给请求扩展：下载处理器绑到 body（读毕才释放）；其余路由
+            // 请求结束时随扩展一起释放（与旧行为一致）。
+            req.extensions_mut().insert(PermitSlot(Arc::new(
+                std::sync::Mutex::new(Some(permit)),
+            )));
+            next.run(req).await
+        }
         _ => (StatusCode::SERVICE_UNAVAILABLE, "服务繁忙，请稍后重试").into_response(),
     }
 }
@@ -227,12 +272,6 @@ async fn auth_mw(
     if !st.auth_enabled() || path == "/health" || path == "/login" {
         return next.run(req).await;
     }
-    // ?t= 令牌（书签/脚本直连）。
-    if let Some(t) = q.get("t") {
-        if st.check_token(t) {
-            return next.run(req).await;
-        }
-    }
     // 会话 Cookie（守卫不得跨 await——std Mutex 非 Send）。
     let sid_ok = cookie_of(req.headers(), SID_COOKIE)
         .map(|sid| {
@@ -248,6 +287,18 @@ async fn auth_mw(
         .unwrap_or(false);
     if sid_ok {
         return next.run(req).await;
+    }
+    // ?t= 令牌（书签/脚本直连）。轮 UI-5 P1：令牌只覆盖「这一次请求」——
+    // 必须顺手签发会话，否则页内链接/表单的下一次请求既无 Cookie 也无令牌，
+    // 扫码打开根目录后点任意子目录/下载/上传都会被打回 /login
+    // （规格 §3.4「手机扫码即可浏览/上传/下载」）。
+    if let Some(t) = q.get("t") {
+        if st.check_token(t) {
+            let (sid, csrf) = issue_session(&st);
+            let mut resp = next.run(req).await;
+            attach_session_cookies(&mut resp, &sid, &csrf);
+            return resp;
+        }
     }
     Redirect::to("/login").into_response()
 }
@@ -272,6 +323,32 @@ fn rand_hex32() -> String {
     let mut b = [0u8; 16];
     OsRng.fill_bytes(&mut b);
     trft_core::hash::hex(&b)
+}
+
+/// 签发会话 + CSRF（登录与 `?t=` 令牌直连共用）。容量满时 fail-closed：
+/// sid 不入表 → 下一次请求仍被拒，会话表不放大。
+fn issue_session(st: &WebState) -> (String, String) {
+    let sid = rand_hex32();
+    let csrf = rand_hex32();
+    let mut sessions = st.sessions.lock().unwrap();
+    // 容量防线：先清过期，仍满则拒绝新会话（fail-closed，锁不放大）。
+    sessions.retain(|_, t| t.elapsed() < SESSION_TTL);
+    if sessions.len() < SESSION_CAP {
+        sessions.insert(sid.clone(), Instant::now());
+    }
+    (sid, csrf)
+}
+
+/// HttpOnly + SameSite=Strict（规格 §3.4）；CSRF 供 /del 表单双校验。
+fn attach_session_cookies(res: &mut Response, sid: &str, csrf: &str) {
+    let h = res.headers_mut();
+    for (name, value) in [(SID_COOKIE, sid), (CSRF_COOKIE, csrf)] {
+        if let Ok(v) =
+            HeaderValue::from_str(&format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/"))
+        {
+            h.append(header::SET_COOKIE, v);
+        }
+    }
 }
 
 // ============ 登录 ============
@@ -328,32 +405,9 @@ async fn login_submit(
     }
     st.gate.lock().unwrap().success(&ip);
     // 成功：会话 + CSRF（HttpOnly + SameSite=Strict，规格 §3.4）。
-    let sid = rand_hex32();
-    let csrf = rand_hex32();
-    {
-        let mut sessions = st.sessions.lock().unwrap();
-        // 容量防线：先清过期，仍满则拒绝新会话（fail-closed，锁不放大）。
-        sessions.retain(|_, t| t.elapsed() < SESSION_TTL);
-        if sessions.len() < SESSION_CAP {
-            sessions.insert(sid.clone(), Instant::now());
-        }
-    }
+    let (sid, csrf) = issue_session(&st);
     let mut res = Redirect::to("/").into_response();
-    let h = res.headers_mut();
-    h.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "{SID_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/"
-        ))
-        .unwrap_or(HeaderValue::from_static("")),
-    );
-    h.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "{CSRF_COOKIE}={csrf}; HttpOnly; SameSite=Strict; Path=/"
-        ))
-        .unwrap_or(HeaderValue::from_static("")),
-    );
+    attach_session_cookies(&mut res, &sid, &csrf);
     res
 }
 
@@ -589,10 +643,13 @@ struct RangeSpec {
 /// 解析单区间 Range（多区间按 RFC 容忍降级为 200 全量——由调用方处理）。
 fn parse_range(h: &str, size: u64) -> Result<Option<RangeSpec>, ()> {
     let Some(spec) = h.strip_prefix("bytes=") else {
-        return Err(());
+        // 未知单位：RFC 9110 允许忽略 Range 回 200 全量（不得 416）。
+        return Ok(None);
     };
     if spec.contains(',') {
-        return Err(()); // 多区间：调用方回 200 全量
+        // 多区间：未实现 multipart/byteranges，按 RFC 忽略 Range 回 200
+        // 全量（轮 UI-5 续 P2——此前回 416，支持多区间的下载器/播放器直接失败）。
+        return Ok(None);
     }
     let (a, b) = spec.split_once('-').ok_or(())?;
     if a.is_empty() {
@@ -628,7 +685,10 @@ async fn download(
     State(st): State<Arc<WebState>>,
     AxPath(path): AxPath<String>,
     headers: HeaderMap,
+    axum::Extension(slot): axum::Extension<PermitSlot>,
 ) -> Response {
+    // 并发名额绑到 body（轮 UI-5 续 7）：取出后随 reader 一起释放。
+    let permit = slot.take();
     let full = match resolve_under(&st.dir, &path) {
         Ok(f) => f,
         Err(e) => return e.into_response(),
@@ -641,7 +701,18 @@ async fn download(
     }
     let size = meta.len();
     if size == 0 {
-        // 空文件无可服务区间（轮 2 P3：避免 size-1 回绕/debug panic）。
+        // 空文件（轮 2 P3 避免 size-1 回绕 + 轮 UI-5 续 P2 语义修正）：
+        // 无 Range 的 GET 必须是 200 + Content-Length: 0（RFC 9110）——
+        // 旧实现一律 416，空文件在共享页里点下载直接报错；只有显式 Range
+        // 才因「区间不可满足」回 416。
+        if headers.get(header::RANGE).is_none() {
+            let mut res = StatusCode::OK.into_response();
+            res.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_static("0"),
+            );
+            return res;
+        }
         let mut res = (StatusCode::RANGE_NOT_SATISFIABLE, "bytes */0").into_response();
         res.headers_mut()
             .insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes */0"));
@@ -691,7 +762,8 @@ async fn download(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "定位失败").into_response();
             }
             // 流式响应（轮 2 P2：内存 O(块)——此前整段驻留内存可被放大到 OOM）。
-            let stream = tokio_util::io::ReaderStream::new(file.take(len));
+            let stream =
+                tokio_util::io::ReaderStream::new(PermitReader::new(file.take(len), permit));
             h.insert(
                 header::CONTENT_RANGE,
                 HeaderValue::from_str(&format!("bytes {}-{}/{}", spec.start, spec.end, size))
@@ -713,7 +785,9 @@ async fn download(
                     let mut res = (
                         StatusCode::OK,
                         [(header::CONTENT_LENGTH, HeaderValue::from(size))],
-                        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+                        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
+                            PermitReader::new(file, permit),
+                        )),
                     )
                         .into_response();
                     res.headers_mut().extend(h);
@@ -1084,7 +1158,13 @@ fn is_upload_part_name(name: &str) -> bool {
     };
     let after = &name[dot + 3..];
     // 自产形：".up" + 8 位 hex + ext（空或 ".xxx" 单段）+ ".part" 结尾。
-    if after.len() < 8 || !after[..8].chars().all(|c| c.is_ascii_hexdigit()) {
+    // 轮 UI-5 P1：磁盘文件名可含多字节字符——下标 8 不保证是字符边界，
+    // 直接 after[..8] 会 panic（"byte index 8 is not a char boundary"），
+    // 而本函数在服务启动/开共享时对目录内每个文件调用。
+    if after.len() < 8 || !after.is_char_boundary(8) {
+        return false;
+    }
+    if !after[..8].chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
     let Some(stripped) = after[8..].strip_suffix(".part") else {
@@ -1181,6 +1261,18 @@ pub async fn serve_with_header_timeout(
 mod tests {
     use super::*;
 
+    /// 轮 UI-5 续 7 判别：并发闸 permit 必须随响应 body（reader）存活——旧实现
+    /// permit 在中间件返回时即释放，慢速下载可无限并发绕过 32 连接上限。
+    #[tokio::test]
+    async fn permit_reader_holds_permit_until_dropped() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let p = sem.clone().acquire_owned().await.unwrap();
+        let r = PermitReader::new(tokio::io::empty(), Some(p));
+        assert_eq!(sem.available_permits(), 0, "body 存活期间必须占着名额");
+        drop(r);
+        assert_eq!(sem.available_permits(), 1, "body 销毁后名额必须归还");
+    }
+
     /// 轮 8 P3-2 判别：上传半成品判定与自产名严格同形——宽松匹配
     /// （contains(".up")）会误删形如 my.uploader.part 的用户文件。
     #[test]
@@ -1201,6 +1293,19 @@ mod tests {
             !is_upload_part_name("a.up1a2b3c4d.t.x.part"),
             "扩展名含点非自产形"
         );
+    }
+
+    /// 轮 UI-5 P1 判别：磁盘文件名可含多字节字符，".up" 后第 8 字节可能落在
+    /// 字符中间——旧实现 `after[..8]` 直接 panic（"byte index 8 is not a char
+    /// boundary"），而本函数在服务启动/开共享时对目录内每个文件调用。
+    #[test]
+    fn upload_part_name_rejects_multibyte_without_panic() {
+        assert!(!is_upload_part_name("a.up1234567é.txt.part"));
+        assert!(!is_upload_part_name("x.up备份文件.part"));
+        assert!(!is_upload_part_name("报表.up文件名很长很长.part"));
+        // 多字节 stem/ext 不影响自产形的判定。
+        assert!(is_upload_part_name("报表.up1a2b3c4d.数据.part"));
+        assert!(is_upload_part_name("noext.up00000000.part"));
     }
 
     /// 本轮 F6 判别：Cookie 头里出现无 `=` 的段（代理/扩展常见）时，后面的

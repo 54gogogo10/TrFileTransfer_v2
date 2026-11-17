@@ -226,6 +226,43 @@ fn cs_publish(temp: &Path, save_path: &Path) -> io::Result<PathBuf> {
     ))
 }
 
+/// 同步替换发布（0x04 用）：新文件已整文件校验通过 → **原子覆盖**既有目标。
+/// 与 cs_publish 的 fail-if-exists 语义不同：0x04 的会话语义就是「用新版本
+/// 替换旧版本」（服务端已逐项核对过不 identical）。
+/// 纪律（轮 UI-5 P0）：先让新内容就位再让旧档消失——rename 在 Windows
+/// （MoveFileEx REPLACE_EXISTING）与 Unix 上都是原子替换；失败时旧档原样保留，
+/// **绝不「先删旧档再发布」**（那会在任一步失败时让用户上一版文件凭空消失）。
+fn cs_publish_replace(temp: &Path, dest: &Path) -> io::Result<()> {
+    // 真机 F2：write-through 覆盖，保证断电后最终名不丢。
+    crate::publish::move_replace(temp, dest)
+}
+
+/// 0x04 落盘包含性（轮 UI-5 续 3 P2）：0x04 会**复用**既有会话目录（<folder>.<guid8>），
+/// 而 save_dir 内预置的 junction/符号链接会把对端可控的相对路径写到保存目录之外
+/// （Windows 上 junction 不需要管理员权限；0x00/0x01/0x02/0x03 用随机半成品名或原子
+/// 建目录，天然不吃这条路径）。用 canonicalize 解析目标最近的存在祖先，必须落在
+/// canonical(save_dir) 前缀内。
+fn ensure_contained(save_dir: &Path, target: &Path) -> Result<()> {
+    let Ok(base) = std::fs::canonicalize(save_dir) else {
+        return Ok(()); // save_dir 尚不存在：由调用方创建（用户选择的根）
+    };
+    // target 可能尚不存在：向上取最近的存在祖先再 canonicalize（会解析链接）。
+    let mut probe = target.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) if p.starts_with(save_dir) => probe = p.to_path_buf(),
+            _ => return Ok(()),
+        }
+    }
+    let real = std::fs::canonicalize(&probe).map_err(Error::Io)?;
+    if !real.starts_with(&base) {
+        return Err(Error::Rejected(
+            "落盘路径解析到保存目录之外（疑似符号链接/junction）".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn random_hex(n: usize) -> String {
     use rand_core::RngCore;
     let mut b = vec![0u8; n];
@@ -1017,6 +1054,10 @@ pub struct CsServerState {
 const CS_DECLARED_CAP: u64 = 64 * 1024 * 1024 * 1024;
 /// tracker 空闲回收窗（活动连接分块间隔远小于此——纯死条目阈值）。
 const CS_TRACKER_TTL: Duration = Duration::from_secs(15 * 60);
+/// 跨连接表条数上限（轮 UI-5 续 5）：declared_total 只封字节不封条数——每帧一个
+/// tracker/会话即可无限建条目（每条持半成品句柄/会话名），仅靠 TTL 回收。
+const CS_MAX_TRACKERS: usize = 64;
+const CS_MAX_RESUME_SESSIONS: usize = 256;
 /// 断点会话空闲回收窗（用户驱动的重连间隔友好余量；活跃传输逐块刷新）。
 const CS_RESUME_TTL: Duration = Duration::from_secs(30 * 60);
 /// 0x04 摘要缓存条目封顶（对齐 hashcache DEGRADED_MAP_CAP 纪律——轮 UI-2 P3-1）。
@@ -1111,6 +1152,13 @@ pub struct CsResumeState {
     pub peer_ip: String,
     /// 最后活跃（轮 UI-2 P2-1：中断会话 TTL 清扫用——活跃传输逐块刷新）。
     pub touched: Instant,
+    /// 完整性已验证（尾哈希 + 可选全文件哈希通过）。**只有 verified 才允许回
+    /// status 2「已完整」**：体收满但尾哈希前断连时 received == total 而未验证，
+    /// 下一连接必须整组重传（轮 UI-5 P1：此前 Done 分支零校验 = 未验证即成功）。
+    pub verified: bool,
+    /// 是否仍持有声明量（declare 记账）。完成即释放——否则已验证会话在 TTL
+    /// 窗口内持续占用 64 GiB 封顶额度，大批量同步会被误拒（轮 UI-5 自查）。
+    pub declared_held: bool,
 }
 
 /* ============ 跨连接会话纪律：声明总量记账 + TTL 惰性清扫（轮 UI-2 P2-1/P2-2） ============ */
@@ -1139,6 +1187,14 @@ fn cs_declare(state: &CsServerState, amount: u64) -> Result<()> {
             Ok(_) => return Ok(()),
             Err(actual) => cur = actual,
         }
+    }
+}
+
+/// 会话侧声明量收尾（幂等）：只有仍持有时才减账——完成已释放的会话不重复扣。
+fn release_resume_declared(state: &CsServerState, st: &mut CsResumeState) {
+    if st.declared_held {
+        cs_release_declared(state, st.total);
+        st.declared_held = false;
     }
 }
 
@@ -1171,6 +1227,18 @@ fn cs_sweep_stale(state: &CsServerState) {
                 let _ = std::fs::remove_file(&tr.save_path);
             }
         }
+        // 条数上限：超出按 touched 最旧逐出（与 TTL 同序）。被逐连接随后会得到
+        // 显式错误（组装器缺失 → 整组重发），不会假成功。
+        while t.len() >= CS_MAX_TRACKERS {
+            let Some(k) = t.iter().min_by_key(|(_, tr)| tr.touched).map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(tr) = t.remove(&k) {
+                cs_release_declared(state, tr.total);
+                let _ = std::fs::remove_file(&tr.save_path);
+            }
+        }
     }
     {
         let mut rs = state.resume.lock().expect("resume 锁");
@@ -1180,8 +1248,20 @@ fn cs_sweep_stale(state: &CsServerState) {
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale {
-            if let Some(st) = rs.remove(&k) {
-                cs_release_declared(state, st.total);
+            if let Some(mut st) = rs.remove(&k) {
+                release_resume_declared(state, &mut st);
+                state.resume_gates.lock().expect("resume 门锁").remove(&k);
+            }
+        }
+        // 同一上限：只摘会话/释放声明量，**不删文件**（可能是已验证交付的文件）——
+        // 与 TTL 路径一致，残件由孤儿清扫兜底。
+        while rs.len() >= CS_MAX_RESUME_SESSIONS {
+            let Some(k) = rs.iter().min_by_key(|(_, st)| st.touched).map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(mut st) = rs.remove(&k) {
+                release_resume_declared(state, &mut st);
                 state.resume_gates.lock().expect("resume 门锁").remove(&k);
             }
         }
@@ -1553,6 +1633,9 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
     let mut temp_os = save_path.as_os_str().to_os_string();
     temp_os.push(format!(".{}.trft-part", random_hex(8)));
     let temp = PathBuf::from(temp_os);
+    // 失败守卫（轮 UI-5 P0）：任何 Err 路径（断连/哈希失配/拷贝回退失败）都清掉
+    // 内层半成品——成功时它已被 cs_publish 改名移走，守卫为空操作。
+    let _part_guard = crate::transfer::receiver::PartGuard(temp.clone());
     // 磁盘预检（轮 UI-2 P2-2——对齐 v2 帧接收路径：宣大 size 的截断放大拦下）。
     if let Some(dir) = save_path.parent() {
         if !crate::transfer::receiver::space_ok(dir, size) {
@@ -1597,7 +1680,7 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
     wire.read_exact(&mut got).await?;
     let computed: [u8; 32] = hasher.finalize().into();
     if !ct_eq(&got, &computed) {
-        let _ = std::fs::remove_file(&temp);
+        // 半成品由 _part_guard 兜底清理（与所有 Err 路径同口径）。
         return Err(Error::Rejected(format!("{display}: SHA-256 校验失败")));
     }
     cs_publish(&temp, save_path).map_err(Error::Io)?;
@@ -1826,10 +1909,21 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
         hasher.update(&buf[..n]);
         {
             let mut t = state.trackers.lock().expect("tracker 锁");
-            if let Some(tr) = t.get_mut(&tracker_key) {
-                complete = tr.write_chunk(write_off, &buf[..n])?;
-                if tr.ranges_count() > CS_MAX_CHUNK_RANGES {
-                    return Err(Error::Rejected("分块覆盖区间数超限".into()));
+            match t.get_mut(&tracker_key) {
+                Some(tr) => {
+                    complete = tr.write_chunk(write_off, &buf[..n])?;
+                    if tr.ranges_count() > CS_MAX_CHUNK_RANGES {
+                        return Err(Error::Rejected("分块覆盖区间数超限".into()));
+                    }
+                }
+                None => {
+                    // 组装器已被并发连接（同 key 不同 total）或 TTL 清扫摘除：
+                    // **绝不能静默丢块后回 ACK 成功**（轮 UI-5 P1——此前该块
+                    // 被跳过，本连接哈希只覆盖自己收到的字节仍然通过，对端收到
+                    // 0x01 但文件永不发布）。整组重发是唯一安全方向。
+                    return Err(Error::Rejected(
+                        "分块组装器已被回收（请整组重发）".into(),
+                    ));
                 }
             }
         }
@@ -1961,51 +2055,93 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let session = {
         let mut rs = state.resume.lock().expect("resume 锁");
-        match rs.get_mut(&key) {
-            Some(st) if st.total == total as u64 && st.received < st.total => {
-                if st.peer_ip != ip {
-                    return Err(Error::Rejected("续传会话属于其他设备".into()));
-                }
-                st.touched = Instant::now(); // 活跃刷新（TTL 清扫依据）
-                Session::Resume(st.save_path.clone(), st.received)
+        // 先取值判定、再决定动作（避免在 get_mut 的借用下改表）。
+        let existing = rs.get(&key).map(|st| {
+            (
+                st.total,
+                st.received,
+                st.verified,
+                st.peer_ip.clone(),
+                st.save_path.clone(),
+            )
+        });
+        match existing {
+            Some((_, _, _, eip, _)) if eip != ip => {
+                return Err(Error::Rejected("续传会话属于其他设备".into()));
             }
-            Some(st) if st.total == total as u64 => Session::Done(st.save_path.clone()),
+            Some((etotal, received, _, _, path))
+                if etotal == total as u64 && received < total as u64 =>
+            {
+                // 磁盘事实优先（轮 UI-5 P1）：内存记账与实文件长度分叉时（外部
+                // 截断/替换、上次部分写失败）作废重来——绝不带着错位续写。
+                let disk = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let mut from = received;
+                if disk != received {
+                    let _ = std::fs::File::create(&path); // 截断到 0
+                    from = 0;
+                }
+                if let Some(st) = rs.get_mut(&key) {
+                    st.received = from;
+                    st.verified = false;
+                    st.touched = Instant::now(); // 活跃刷新（TTL 清扫依据）
+                }
+                Session::Resume(path, from)
+            }
+            Some((etotal, _, true, _, path)) if etotal == total as u64 => {
+                // 已验证完成：再核一次磁盘长度（外部篡改/丢失即拒绝，不报成功）。
+                let ok = std::fs::metadata(&path)
+                    .map(|m| m.len() == total as u64)
+                    .unwrap_or(false);
+                if !ok {
+                    // 只摘会话，**不删文件**：磁盘上的内容可能是用户后来替换的
+                    // 正常文件（长度不同），删除即数据丢失。
+                    if let Some(mut old) = rs.remove(&key) {
+                        release_resume_declared(state, &mut old);
+                    }
+                    state.resume_gates.lock().expect("resume 门锁").remove(&key);
+                    return Err(Error::Rejected("续传残件长度不符，需整组重发".into()));
+                }
+                Session::Done(path)
+            }
             _ => {
+                // 旧会话（参数不同 / 体收满但未验证）一律作废：**先删残件再取唯一
+                // 名**——否则未验证的 "name" 仍占名，新会话落到 name_1，旧残件
+                // 永久留在用户目录（轮 UI-5 P1）。
+                // 轮 UI-4 F1：旧声明量必须先释放，否则 declared_total 单调泄漏，
+                // 远程几轮即可打满 64GiB 封顶令 UDT 槽位 0x02/0x03 全拒（持久 DoS）。
+                if let Some(mut old) = rs.remove(&key) {
+                    release_resume_declared(state, &mut old);
+                    state.resume_gates.lock().expect("resume 门锁").remove(&key);
+                    // **只删未验证的半成品**；已验证完成的是用户文件，换参数/重传
+                    // 都不得删（否则同一 sid 换个 total 就能删掉已交付的文件）。
+                    if !old.verified {
+                        let _ = std::fs::remove_file(&old.save_path);
+                    }
+                }
                 let save_path = cs_unique_save_path(save_dir, &name);
                 // 声明总量记账（轮 UI-2 P2-2）：跨连接存活的断点会话纳入封顶。
                 cs_declare(state, total as u64)?;
-                // 轮 UI-4 F1：同 sid 不同 total 覆盖旧会话——旧声明量必须先释放，
-                // 否则 declared_total 单调泄漏，远程几轮即可打满 64GiB 封顶
-                // 令 UDT 槽位 0x02/0x03 全拒（持久 DoS）。
-                let old = rs.insert(
+                rs.insert(
                     key.clone(),
                     CsResumeState {
-                        save_path,
+                        save_path: save_path.clone(),
                         total: total as u64,
                         received: 0,
                         name: name.clone(),
                         peer_ip: ip.clone(),
                         touched: Instant::now(),
+                        verified: false,
+                        declared_held: true,
                     },
                 );
-                if let Some(old) = old {
-                    cs_release_declared(state, old.total);
-                    state.resume_gates.lock().expect("resume 门锁").remove(&key);
-                }
-                let p = rs.get(&key).expect("刚插入").save_path.clone();
-                Session::New(p)
+                Session::New(save_path)
             }
         }
     };
     match session {
-        Session::Done(path) => {
-            record_recv(opts, peer, total as u64, 1, Instant::now(), "续传传输", &path);
-            let st = state.resume.lock().expect("resume 锁").remove(&key);
-            state.resume_gates.lock().expect("resume 门锁").remove(&key);
-            if let Some(st) = &st {
-                cs_release_declared(state, st.total);
-            }
-            drop(st);
+        Session::Done(_path) => {
+            // 已验证完成态：status 2 零传输（C# 语义）。不重复记账、不摘会话
+            // ——重试收敛于成功；会话由 TTL 清扫释放声明量。
             if let Some(r) = &reporter {
                 r.finish();
             }
@@ -2111,6 +2247,9 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
             r.add(n as u64);
         }
     }
+    // 发布前落盘（轮 UI-5 续 P2）：C# 方言 0x03 此前不 fsync——增量/全文件哈希
+    // 都是从页缓存算出的，掉电后可能短文件而服务端已回 status 2。与 v2 同纪律。
+    f.sync_all()?;
     let mut got = [0u8; 32];
     wire.read_exact(&mut got).await?;
     let computed: [u8; 32] = hasher.finalize().into();
@@ -2118,15 +2257,33 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
         // 哈希失败：丢弃会话与半成品（重试从头）。
         let st = state.resume.lock().expect("resume 锁").remove(key);
         state.resume_gates.lock().expect("resume 门锁").remove(key);
-        if let Some(st) = st {
-            cs_release_declared(state, st.total);
+        if let Some(mut st) = st {
+            release_resume_declared(state, &mut st);
             let _ = std::fs::remove_file(&st.save_path);
         }
         return Ok(false);
     }
+    // 收尾硬校验（轮 UI-5 P1，对齐 v2 resume.rs 轮 4 P0 纵深）：半成品长度必须
+    // == 声明 total——append 位置由 EOF 决定，内存记账不得替代磁盘事实。
+    let plen = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if plen != total {
+        let st = state.resume.lock().expect("resume 锁").remove(key);
+        state.resume_gates.lock().expect("resume 门锁").remove(key);
+        if let Some(mut st) = st {
+            release_resume_declared(state, &mut st);
+            let _ = std::fs::remove_file(&st.save_path);
+        }
+        send_resume_response(wire, total as i64, 3).await?;
+        return Ok(false);
+    }
     // 全文件哈希核验（可选扩展——resume 的拼缝不在段哈希覆盖内）。
     if let Some(expect) = full_hash {
-        let actual = crate::hash::sha256_file(path).unwrap_or_default();
+        // 读失败 = 报错并保留文件——绝不把「读不到」当「内容不符」去删档
+        // （判错方向：杀软/共享冲突的瞬时读失败会误删刚校验通过的完整文件）。
+        let p = path.to_path_buf();
+        let actual = tokio::task::spawn_blocking(move || crate::hash::sha256_file(&p))
+            .await
+            .map_err(|e| proto(e.to_string()))??;
         if !ct_eq(&actual, &expect) {
             let st = state.resume.lock().expect("resume 锁").remove(key);
             state.resume_gates.lock().expect("resume 门锁").remove(key);
@@ -2138,14 +2295,23 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(false);
         }
     }
-    let st = state.resume.lock().expect("resume 锁").remove(key);
+    // 成功：会话保留为「已验证完成」态（同 sid 重问回 status 2 零传输——C#
+    // 协议语义），TTL 清扫时释放声明量；**统计只在此处记一次**（Done 重问
+    // 不得重复入账）。
+    {
+        let mut rs = state.resume.lock().expect("resume 锁");
+        if let Some(st) = rs.get_mut(key) {
+            st.received = total;
+            st.verified = true;
+            st.touched = Instant::now();
+            // 完成即释放声明量（幂等；TTL 清扫不会再扣一次）——已验证会话在
+            // TTL 窗口内不得继续占用 64 GiB 封顶额度（自查：否则大批量同步
+            // 会在 30 分钟内把额度耗尽而误拒新传输）。
+            release_resume_declared(state, st);
+        }
+    }
     state.resume_gates.lock().expect("resume 门锁").remove(key);
-    if let Some(st) = &st {
-        cs_release_declared(state, st.total);
-    }
-    if let Some(st) = st {
-        record_recv(opts, peer, total, 1, Instant::now(), "续传传输", &st.save_path);
-    }
+    record_recv(opts, peer, total, 1, Instant::now(), "续传传输", path);
     if let Some(r) = reporter {
         r.finish();
     }
@@ -2224,7 +2390,10 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
     let reporter = hub.map(|h| h.register("recv", folder.clone(), total_bytes as u64));
     // 会话目录（确定性：<folder>.<guid8>——C# GetFolderSessionDir 同式，重复同步续用）。
     let dir = save_dir.join(format!("{folder}.{}", &guid_hex(&sid)[..8]));
+    // 复用既有目录前先验包含性（junction/符号链接不得把落盘带出 save_dir）。
+    ensure_contained(save_dir, &dir)?;
     std::fs::create_dir_all(&dir)?;
+    ensure_contained(save_dir, &dir)?;
     // 续点扫描：首个不完整条目（C# 同构）。
     let mut resume_index = file_count;
     let mut resume_offset = 0i64;
@@ -2328,7 +2497,10 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let save_path = dir.join(&e.rel);
         if let Some(parent) = save_path.parent() {
+            // 子目录同样可能是指向树外的链接：建目录前后各验一次。
+            ensure_contained(save_dir, parent)?;
             std::fs::create_dir_all(parent)?;
+            ensure_contained(save_dir, parent)?;
         }
         if start == 0 {
             // 外层暂存名同口径 `.trft-part` 后缀（轮 UI-2 P2-1：成功后 2069 行
@@ -2339,21 +2511,23 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             let r = receive_payload(wire, &temp, e.size, &e.rel, limiter, &reporter).await;
             match r {
                 Ok(_) => {
-                    // 轮 UI-4 P3-2：发布走 cs_publish（裸 rename 在 Unix 上静默
-                    // 替换既有目标——0x00 已堵的完整性冒充向量，0x04 路径对齐）。
-                    // 0x04 会话内重发 = 服务端已核对「不 identical」的同名文件
-                    // ——替换是会话语义；cs_publish 的防覆盖守卫针对新到文件，
-                    // 此处先摘旧文件再发布（旧内容已确认过期）。
-                    let _ = std::fs::remove_file(&save_path);
-                    cs_publish(&temp, &save_path).map_err(Error::Io)?;
+                    // 轮 UI-5 P0：同步替换 = 新文件整文件校验通过后**原子覆盖**。
+                    // 发布失败时旧档保持原样（此前先 remove_file 旧档再发布，
+                    // 任一步失败都会让用户上一版文件凭空消失）。
+                    // F3（真机 B5）：发布前把数据落盘——0x04 此前只保证改名落盘
+                    // （F2），断电后可出现「最终名在、内容不符」。与 0x02/0x03 同纪律。
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&temp)
+                        .and_then(|f| f.sync_all())
+                        .map_err(Error::Io)?;
+                    cs_publish_replace(&temp, &save_path).map_err(Error::Io)?;
                 }
                 Err(_) => {
-                    // 残件保留（轮 9 P2-5，对齐 C# WireProtocol "Keep the partial
-                    // file"——改名入续点扫描视野，下一轮 0x04 以 len<size 续传；
-                    // 收到的损坏字节由续传分支的全文件复核兜底，不会假成功）。
-                    // 发布失败仅丢「续件」，不丢数据完整性（下一轮全量重传）。
-                    let _ = std::fs::remove_file(&save_path);
-                    let _ = cs_publish(&temp, &save_path);
+                    // 失败：**不触碰 save_path**（旧档原样保留）。内层半成品已由
+                    // receive_payload 的守卫清理，外层 temp 从未创建；此处仅清理
+                    // 可能存在的空壳。判错方向：宁可多传一次，不得丢既有文件。
+                    let _ = std::fs::remove_file(&temp);
                     return Ok((false, 0, files));
                 }
             }
@@ -3107,6 +3281,78 @@ pub async fn send_text_cs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 轮 UI-5 续 5 判别：tracker/会话表必须有条数上限（declared_total 只封字节），
+    /// 超出按 touched 最旧逐出；resume 只摘会话不删文件（可能是已验证交付）。
+    #[test]
+    fn session_tables_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = CsServerState::default();
+        {
+            let mut t = state.trackers.lock().unwrap();
+            for i in 0..(CS_MAX_TRACKERS + 5) {
+                let p = dir.path().join(format!("t{i}.part"));
+                let mut tr = CsChunkTracker::create(p, 1).unwrap();
+                tr.touched = Instant::now() - Duration::from_secs(i as u64);
+                t.insert(format!("k{i}"), tr);
+            }
+        }
+        {
+            let mut rs = state.resume.lock().unwrap();
+            for i in 0..(CS_MAX_RESUME_SESSIONS + 5) {
+                rs.insert(
+                    format!("s{i}"),
+                    CsResumeState {
+                        save_path: dir.path().join(format!("r{i}")),
+                        total: 1,
+                        received: 0,
+                        name: "x".into(),
+                        peer_ip: "1.1.1.1".into(),
+                        touched: Instant::now() - Duration::from_secs(i as u64),
+                        verified: false,
+                        declared_held: false,
+                    },
+                );
+            }
+        }
+        cs_sweep_stale(&state);
+        assert!(
+            state.trackers.lock().unwrap().len() <= CS_MAX_TRACKERS,
+            "tracker 表必须有上限"
+        );
+        assert!(
+            state.resume.lock().unwrap().len() <= CS_MAX_RESUME_SESSIONS,
+            "会话表必须有上限"
+        );
+    }
+
+    /// 轮 UI-5 自查：会话声明量收尾必须幂等（完成释放后，TTL 清扫/参数变化/
+    /// 失败删除不得重复扣减——否则 declared_total 下溢/额度错乱）。
+    #[test]
+    fn resume_declaration_release_is_idempotent() {
+        use std::sync::atomic::Ordering;
+        let state = CsServerState::default();
+        cs_declare(&state, 1000).unwrap();
+        assert_eq!(state.declared_total.load(Ordering::Relaxed), 1000);
+        let mut st = CsResumeState {
+            save_path: PathBuf::from("x.bin"),
+            total: 1000,
+            received: 1000,
+            name: "x.bin".into(),
+            peer_ip: "127.0.0.1".into(),
+            touched: Instant::now(),
+            verified: true,
+            declared_held: true,
+        };
+        release_resume_declared(&state, &mut st);
+        assert_eq!(state.declared_total.load(Ordering::Relaxed), 0, "完成即释放");
+        release_resume_declared(&state, &mut st);
+        assert_eq!(
+            state.declared_total.load(Ordering::Relaxed),
+            0,
+            "重复收尾不得二次扣减"
+        );
+    }
 
     /// PBKDF2-HMAC-SHA1 已知答案。
     /// 向量 A：RFC 6070 c=4096（20B）。向量 B：Windows .NET Rfc2898DeriveBytes

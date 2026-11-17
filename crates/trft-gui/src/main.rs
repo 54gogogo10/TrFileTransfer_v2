@@ -67,6 +67,7 @@ fn main() {
             commands::recv_stop,
             commands::http_start,
             commands::http_stop,
+            commands::http_info,
             commands::qr_svg,
             commands::verify_start,
             commands::verify_stop,

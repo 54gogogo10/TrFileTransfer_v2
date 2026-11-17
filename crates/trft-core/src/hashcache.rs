@@ -80,7 +80,10 @@ impl HashCache {
                 ) else {
                     continue;
                 };
-                if ttl_secs > 0 && now.saturating_sub(mtime) > ttl_secs {
+                // mtime 全链是**纳秒**（resume/folder/scrub 的 mtime_of 同口径），
+                // TTL 以秒计——先换算再比。旧实现直接 now_secs() 减纳秒 mtime
+                //（饱和为 0）→ 条目永不过期，hash_cache_days 成死配置（轮 UI-5 P2）。
+                if ttl_secs > 0 && now.saturating_sub(mtime / 1_000_000_000) > ttl_secs {
                     continue; // TTL 过期按未命中
                 }
                 map.insert((pf, size, mtime), (h, 0));
@@ -261,15 +264,30 @@ mod tests {
         assert_eq!(c.get("a.bin", 10, 101), None);
     }
 
+    /// 轮 UI-5 P2 判别：生产 mtime 是**纳秒**（`mtime_of`），TTL 以秒计——
+    /// 旧实现直接相减（纳秒 vs 秒，饱和为 0）导致条目永不过期。本测试用
+    /// 生产同款纳秒输入：修复前「8 天前」条目仍命中，必红。
     #[test]
     fn ttl_expiry_misses() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("cache.txt");
         let h = crate::hash::sha256(b"x");
-        let old = now_secs() - 8 * 24 * 3600;
+        let now_ns = now_secs() * 1_000_000_000;
+        let old = now_ns - 8 * 24 * 3600 * 1_000_000_000;
         std::fs::write(&p, entry_line("old.bin", 1, old, &h)).unwrap();
-        assert_eq!(HashCache::load(&p, 7).get("old.bin", 1, old), None);
-        assert_eq!(HashCache::load(&p, 0).get("old.bin", 1, old), Some(h));
+        assert_eq!(
+            HashCache::load(&p, 7).get("old.bin", 1, old),
+            None,
+            "超 TTL 必须按未命中（纳秒 mtime 与秒 TTL 对齐）"
+        );
+        assert_eq!(
+            HashCache::load(&p, 0).get("old.bin", 1, old),
+            Some(h),
+            "TTL=0 永不过期"
+        );
+        // 新鲜条目不得被 TTL 误杀。
+        std::fs::write(&p, entry_line("new.bin", 1, now_ns, &h)).unwrap();
+        assert_eq!(HashCache::load(&p, 7).get("new.bin", 1, now_ns), Some(h));
     }
 
     #[test]
@@ -277,15 +295,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("cache.txt");
         let h = crate::hash::sha256(b"original");
-        let now = now_secs();
+        // 生产 mtime 是纳秒（mtime_of）：秒级输入会被 TTL 判过期（轮 UI-5 修正后）。
+        let now = now_secs() * 1_000_000_000;
         std::fs::write(&p, entry_line("f.txt", 9, now, &h)).unwrap();
         let c = HashCache::load(&p, 7);
+        let cached = c.get("f.txt", 9, now).expect("新鲜条目必须命中");
+        assert_eq!(cached, h, "命中必须返回记录的原始摘要");
         let actual = crate::hash::sha256(b"tampered!");
-        assert_ne!(
-            actual,
-            c.get("f.txt", 9, now).unwrap(),
-            "篡改必须被比对发现"
-        );
+        assert_ne!(actual, cached, "篡改后的内容摘要必须与记录不符");
     }
 
     #[test]

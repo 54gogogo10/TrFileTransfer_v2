@@ -55,6 +55,14 @@ pub struct ReceiverHandle {
 pub struct HttpHandle {
     pub port: u16,
     pub shutdown: tokio::sync::oneshot::Sender<()>,
+    /// `?t=` 令牌（未启用配对码时为 None）——供 `http_info` 在页面重载/
+    /// 无关状态事件后重建分享链接（轮 UI-5 续 3 P2）。
+    pub token: Option<String>,
+    /// 共享目录（展示用）。
+    pub dir: String,
+    /// 启动代际令牌（轮 UI-5 续 6 P2）：占位与收尾同代——bind 窗口内被 stop
+    /// 取走后，迟到的 http_start 收尾凭 ptr_eq 判定放弃（不得复活已停的服务）。
+    pub gen: Arc<()>,
 }
 
 /// 发现应答服务句柄（轮 3 F8：done 标志标记任务已退出，供死任务判定重建）。

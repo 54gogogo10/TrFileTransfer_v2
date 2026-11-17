@@ -14,6 +14,7 @@ pub mod hashcache;
 pub mod limiter;
 pub mod monitor;
 pub mod progress;
+pub mod publish;
 pub mod protocol;
 pub mod scrub;
 pub mod stats;

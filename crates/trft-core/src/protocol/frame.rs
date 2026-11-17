@@ -101,12 +101,11 @@ pub fn sanitize_name(raw: &str) -> Result<String> {
     if name.len() > MAX_NAME_LEN {
         return Err(proto(format!("文件名超过 {MAX_NAME_LEN} 字节")));
     }
-    if name == "."
-        || name == ".."
-        || name.contains("..")
-        || name.contains('/')
-        || name.contains('\\')
-    {
+    // 轮 UI-5 P2：只拒绝「.」「..」与路径分隔符——旧实现对任意 `..` 子串一票
+    // 否决，导致 a..b.txt / v1..2.log 这类合法文件名既发不出也收不了，且与
+    // `sanitize_rel`（逐段判 `..`）口径不一致。裸文件名内出现 `..` 不构成穿越
+    //（分隔符已在下面被拒）。
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return Err(proto(format!("文件名含非法序列: {raw}")));
     }
     check_segment(name, "文件名")?;
@@ -165,6 +164,17 @@ mod tests {
         assert_eq!(sanitize_name("foo ").unwrap(), "foo");
         // RLO 视觉反转
         assert!(sanitize_name("\u{202E}exe.jpg").is_err());
+    }
+
+    /// 轮 UI-5 P2 判别：`..` 作为**子串**不是穿越（分隔符另有拦截），
+    /// 合法文件名不得被误拒；精确段 `..` 仍必须拒绝。
+    #[test]
+    fn accepts_double_dot_inside_name() {
+        assert_eq!(sanitize_name("a..b.txt").unwrap(), "a..b.txt");
+        assert_eq!(sanitize_name("v1..2.log").unwrap(), "v1..2.log");
+        assert!(sanitize_name("..").is_err());
+        assert!(sanitize_name("../x").is_err());
+        assert!(sanitize_name("a\\..\\b").is_err());
     }
 
     #[test]

@@ -257,6 +257,21 @@ fn host_header_of(url: &Url) -> String {
     }
 }
 
+/// 相对重定向 → 绝对 URL（轮 UI-5 续 P2）：必须保留**端口**——旧实现只拼
+/// scheme+host，非默认端口的更新源（如 https://host:8443）相对重定向会掉到
+/// 443/80 打空；IPv6 方括号由 host_header_of 还原。
+fn resolve_redirect(url: &Url, loc: &str) -> String {
+    if loc.contains("://") {
+        return loc.to_string();
+    }
+    format!(
+        "{}://{}{}",
+        if url.https { "https" } else { "http" },
+        host_header_of(url),
+        loc
+    )
+}
+
 async fn request_and_head(url: &Url) -> Result<(BoxIo, Head)> {
     let mut io = open_stream(url).await?;
     let host_header = host_header_of(url);
@@ -328,17 +343,7 @@ async fn http_get(raw_url: &str, max_bytes: usize) -> Result<Vec<u8>> {
             let Some(loc) = head.location else {
                 return Err(proto(format!("重定向缺少 Location（{}）", head.status)));
             };
-            let next = if loc.contains("://") {
-                loc
-            } else {
-                // 相对重定向同样要还原 IPv6 方括号（F9）。
-                format!(
-                    "{}://{}{}",
-                    if url.https { "https" } else { "http" },
-                    bracketed_host(&url.host),
-                    loc
-                )
-            };
+            let next = resolve_redirect(&url, &loc);
             url = parse_url(&next)?;
             continue; // Connection: close，旧连接自然收尾
         }
@@ -727,6 +732,23 @@ pub fn spawn_restarted() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 轮 UI-5 续 P2 判别：相对重定向必须保留端口（旧实现只拼 scheme+host，
+    /// 非默认端口的更新源会掉到 443/80），IPv6 方括号同样还原。
+    #[test]
+    fn relative_redirect_keeps_port() {
+        let u = parse_url("https://example.com:8443/m").unwrap();
+        assert_eq!(resolve_redirect(&u, "/pkg"), "https://example.com:8443/pkg");
+        let d = parse_url("https://example.com/m").unwrap();
+        assert_eq!(resolve_redirect(&d, "/pkg"), "https://example.com/pkg");
+        let l = parse_url("http://127.0.0.1:8080/m").unwrap();
+        assert_eq!(resolve_redirect(&l, "/p"), "http://127.0.0.1:8080/p");
+        assert_eq!(
+            resolve_redirect(&u, "https://cdn.example.com/x"),
+            "https://cdn.example.com/x",
+            "绝对 Location 原样"
+        );
+    }
     use super::*;
     use ed25519_dalek::Signer;
     use ed25519_dalek::SigningKey;

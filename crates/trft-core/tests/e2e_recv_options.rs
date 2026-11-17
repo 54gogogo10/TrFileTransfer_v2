@@ -622,3 +622,44 @@ async fn recv_stats_row_skip_records_existing_path() {
     assert_eq!(rows[0].detail, "已存在（跳过）");
     assert_eq!(rows[0].path, existing.display().to_string());
 }
+
+/// 轮 UI-5 P1 判别：0x09 加密握手在「证明字节之前」被中断（EOF/超时）同样
+/// 必须计入配对失败——旧实现只对 AuthRejected 计数，攻击者只需发 1 字节
+/// flags 就断，即可无限烧 50k 轮 PBKDF2 并完全绕过 10 次锁定门。
+#[tokio::test]
+async fn interrupted_encrypted_handshake_counts_toward_lockout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = recv_base(dir.path().to_path_buf());
+    o.pairing_code = Some("123456".into());
+    o.max_count = None;
+    let gate = o.gate.clone();
+    let (listener, addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(listener, o));
+    for _ in 0..10 {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let hs = trft_core::crypto::handshake::new_handshake().unwrap();
+        let mut hello = vec![0x09u8];
+        hello.extend_from_slice(hs.public());
+        s.write_all(&hello).await.unwrap();
+        let mut resp = [0u8; 66];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], 0x19, "服务端必须回 0x19 + 公钥");
+        s.write_all(&[1u8]).await.unwrap(); // 声明持有证明
+        drop(s); // 尾证明前断连
+    }
+    let ip: std::net::IpAddr = addr.ip();
+    let mut locked = false;
+    for _ in 0..60 {
+        if gate.lock().await.locked(&ip) {
+            locked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        locked,
+        "中断的加密握手必须计入配对失败（10 次即锁定）"
+    );
+    server.abort();
+}

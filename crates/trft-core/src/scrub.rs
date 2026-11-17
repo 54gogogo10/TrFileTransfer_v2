@@ -27,6 +27,9 @@ pub struct VerifyReport {
     pub unreadable: u64,
     /// 与缓存不一致的相对路径（'/' 分隔）。
     pub mismatches: Vec<String>,
+    /// 用户中途停止（轮 UI-5 续 P2）：停止时 `mismatches` 只代表已扫描部分，
+    /// 不得与「完整扫描且全部一致」混同——GUI 必须显式呈现「已中止」。
+    pub stopped: bool,
 }
 
 impl VerifyReport {
@@ -109,9 +112,11 @@ pub fn verify_dir(
 
     // 排序保证确定性（目录枚举顺序不定）。
     files.sort();
+    let mut stopped = false;
     for (i, p) in files.iter().enumerate() {
         if let Some(flag) = stop {
             if flag.load(Ordering::Relaxed) {
+                stopped = true;
                 break;
             }
         }
@@ -152,8 +157,12 @@ pub fn verify_dir(
             Err(_) => report.unreadable += 1,
         }
     }
+    // 停止时**不得补发 (total, total)**（轮 UI-5 续 P2）：否则进度条走满、
+    // 结果面板又因 mismatches 为空而显示「校验完成 / 0 个不一致」——只扫了
+    // 一部分也报完整成功。改为回报实际进度，并由 stopped 标记让上层显式提示。
+    report.stopped = stopped;
     if let Some(cb) = progress.as_mut() {
-        cb(total, total);
+        cb(report.scanned, total);
     }
     report
 }
@@ -233,6 +242,40 @@ mod tests {
         let stop = AtomicBool::new(true); // 直接置停：扫描应为 0（或极少）且不 panic
         let r = verify_dir(dir.path(), &mut cache, Some(&stop), None);
         assert_eq!(r.scanned, 0, "已停标志下不得继续扫描");
+        assert!(r.stopped, "停止必须被标记");
         assert!(r.is_consistent());
+    }
+
+    /// 轮 UI-5 续 P2 判别：**中途**停止（由进度回调触发）时——
+    /// ① `stopped` 必须置真；② 不得补发 (total,total)（旧实现无条件补满，
+    /// GUI 进度条走满 + 0 inconsistent = 假成功）；③ 已扫描数 < 总数。
+    #[test]
+    fn stop_midway_marks_partial_and_does_not_report_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("g{i}.txt")), [i; 256]).unwrap();
+        }
+        let cache_path = cache_file_for(dir.path());
+        let mut cache = HashCache::load(&cache_path, 0);
+        let stop = AtomicBool::new(false);
+        let mut last = (0u64, 0u64);
+        // 借用 last/stop（不 move）：块结束后仍要读取最终进度。
+        let r = {
+            let mut cb = |done: u64, total: u64| {
+                last = (done, total);
+                if done >= 2 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            };
+            verify_dir(dir.path(), &mut cache, Some(&stop), Some(&mut cb))
+        };
+        assert!(r.stopped, "中途停止必须置 stopped");
+        assert!(r.scanned >= 2 && r.scanned < 10, "只应扫描一部分: {}", r.scanned);
+        assert!(
+            last.0 < last.1,
+            "停止时不得补发 (total,total)——实际 ({},{})",
+            last.0,
+            last.1
+        );
     }
 }

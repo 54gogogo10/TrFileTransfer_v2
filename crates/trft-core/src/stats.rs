@@ -276,8 +276,18 @@ pub struct DeviceAgg {
 /// GUI/CLI 调 `summarize` 时注入。
 pub fn today_start_unix() -> u64 {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let midnight = now.date().midnight();
-    midnight.assume_utc().unix_timestamp().max(0) as u64
+    today_start_for(now)
+}
+
+/// 指定时刻所在**本地日**的零点（保留原偏移）。轮 UI-5 P2：旧实现
+/// `midnight().assume_utc()` 丢掉偏移——UTC+8 下「今日」实际从本地 08:00 起算，
+/// 00:00–08:00 的传输被算作昨天。
+fn today_start_for(now: time::OffsetDateTime) -> u64 {
+    now.date()
+        .midnight()
+        .assume_offset(now.offset())
+        .unix_timestamp()
+        .max(0) as u64
 }
 
 /// 聚合快照。`now` 由调用方注入（可测）；`today_start` 同理可传 0 跳过今日桶。
@@ -347,6 +357,23 @@ pub fn export_csv(records: &[StatRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 轮 UI-5 P2 判别：今日边界必须落在**本地**零点（保留偏移）。
+    /// UTC+8 下本地零点 = 前一日 16:00 UTC；旧实现返回本地日期 00:00 UTC。
+    #[test]
+    fn today_start_uses_local_offset() {
+        use time::{OffsetDateTime, UtcOffset};
+        let off = UtcOffset::from_hms(8, 0, 0).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_764_000_000)
+            .unwrap()
+            .to_offset(off);
+        let start = today_start_for(now);
+        assert_eq!(start % 86_400, 16 * 3_600, "本地零点在 UTC 的 16:00");
+        assert_eq!(
+            start,
+            now.date().midnight().assume_offset(off).unix_timestamp() as u64
+        );
+    }
 
     fn rec(time: u64, dir: Direction, peer: &str, bytes: u64) -> StatRecord {
         StatRecord {

@@ -9,7 +9,8 @@ use crate::protocol::frame::{
     sanitize_name, sanitize_rel, MAX_FOLDER_FILES, MAX_TRANSFER_SIZE, STATUS_OK,
 };
 use crate::protocol::io::{
-    read_str_u16, read_u32, read_u64, read_u8, write_str_u16, write_u32, write_u64, write_u8,
+    read_str_u16, read_u32, read_u64, read_u8_long, write_str_u16, write_u32, write_u64,
+    write_u8,
 };
 use crate::transfer::receiver::{publish_part, resolve_root, space_ok, PartGuard, RecvOptions};
 use crate::transfer::resume;
@@ -226,8 +227,10 @@ where
         }
     }
 
-    // 整夹完成确认：接收端权威。
-    let st = read_u8(s).await?;
+    // 整夹完成确认：接收端权威。长窗（300s）——接收端在回执前可能对最后一个
+    // 文件做 Skip 策略的整文件重哈希（冷缓存大文件可达数十秒，轮 UI-5 P2：
+    // 此前用 30s 普通窗口，超时会被误报成「对端拒绝」，而接收端其实已成功）。
+    let st = read_u8_long(s).await?;
     let _ = s.shutdown().await;
     if st != STATUS_OK {
         return Err(Error::Rejected("接收端拒绝了文件夹传输".into()));

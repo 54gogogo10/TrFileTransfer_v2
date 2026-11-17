@@ -524,6 +524,275 @@ RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 
 `devices.rs`、`Cargo.toml`（sha1）、`trft-cli/src/main.rs`、`trft-gui/src/{state,commands}.rs`、
 `trft-gui/dist/{app.js,index.html}`、docs 四册。
 
+---
+
+## 独立审查修复批（2026-11-16，轮 UI-5：P0 + 6×P1）
+
+外部独立审查（6 个并行审查上下文 + 逐条复核）发现 1×P0 + 6×P1，本批全部修复并配
+「去修复必红」判别测试；基线 272 → 280 项全绿（rustc 0 告警，连跑 3 次无 flake）。
+
+1. **P0 0x04 同步更新失败删除既有文件**：旧 Err 分支先删 save_path 再发布一个从未
+   创建的 temp（净效果：用户上一版文件凭空消失、新档未落）。修复：新增
+   cs_publish_replace（同目录 rename 原子覆盖），失败路径不触碰 save_path；
+   receive_payload 增加 PartGuard 清理内层半成品。判别：
+   cs_sync_failure_preserves_existing_file_and_success_replaces（e2e_udt）。
+2. **P1 0x03 已完整零校验**：体收满但尾哈希前断连时 received == total 且会话保留，
+   下一连接直接回 st=2。修复：CsResumeState.verified + 磁盘长度硬校验；未验证会话
+   删除残件并回 st=0/offset 0 整组重来；已验证会话保留以支持 C#「已完整」重问（不重复
+   记账）。判别：cs_resume_body_without_tail_hash_is_not_reported_complete。
+3. **P1 0x02 组装器缺失仍回成功**：并发参数不符/TTL 清扫摘除后块被静默跳过、本连接
+   哈希只覆盖自己收到的字节仍回 ACK 0x01。修复：取不到 tracker 即 Err（整组重发）。
+   说明：仅 TTL/完成后可达，属防御性收口，无独立判别 e2e（已在审查报告登记）。
+4. **P1 0x09 预认证 KDF 放大 + 中断握手不计数**：server_wrap 在证明字节前算 PBKDF2，
+   且 IO 错误不计锁定 → 单主机发 1 字节即断可打满 CPU。修复：先读满 32B 证明再算 KDF；
+   pairing_phase_err 把配对阶段的 Io/Proto 折算 AuthRejected（业务帧后错误不受影响）。
+   判别：interrupted_encrypted_handshake_counts_toward_lockout（e2e_recv_options）。
+5. **P1 UDT 轻量 ACK 无超前校验**：seq_off 可返回 ≈0x3FFFFF00（10 亿次 pop_front），
+   并把 last_ack 推到未来（重传/窗口永久错乱）。修复：轻量分支复用完整 ACK 的
+   cum <= next_seq+1 校验（越界断连）+ off 上界兜底。判别：
+   lite_ack_oversized_breaks_connection_without_spin（引擎单测）。
+6. **P1 Web ?t= 令牌只覆盖首个请求**：页内链接/表单下一次请求无 Cookie 无令牌 → 303。
+   修复：auth_mw 令牌通过即签发会话（issue_session 与登录共用）、attach_session_cookies
+   统一 HttpOnly+SameSite=Strict。判别：token_query_issues_session_for_subsequent_navigation。
+7. **P1 is_upload_part_name 字节切片 panic**：非 ASCII 名（.up 后第 8 字节落在字符中）
+   使共享启动/清理 panic。修复：is_char_boundary(8) 前置守卫。判别：
+   upload_part_name_rejects_multibyte_without_panic（server 单测）。
+
+**判别纪律执行**：上述 1/2/4/5/6/7 六项逐项做「去修复必红」实测（临时回退后对应测试
+转红并记录断言）；3 为防御性收口（见上）。
+
+**文档同步**：WIRE-PROTOCOL §2.1（旧服务端回退默认 fail-closed，删除已被轮 2 PoC 推翻的
+「回退只可能发生在旧服务端上」）、§3（serverOffset = 磁盘事实，删除 max(declared, 实际)）、
+§10.2（0x03 st=2 的验证前置条件、0x04 原子替换语义）。
+
+**修复过程中自查发现并一并修掉的两处**（均配回归测试）：
+   - 已验证会话保留后，同 sid 换 total 不得删除**已交付文件**（只删未验证半成品）——
+     回归：cs_resume_verified_file_survives_param_change；
+   - 完成即释放声明量（declared_held 幂等收尾），否则已验证会话在 TTL 窗口内持续
+     占用 64 GiB 封顶额度，大批量同步会被误拒——回归：resume_declaration_release_is_idempotent。
+
+**同批复核未修（登记后续批）**：0x02 跨 peer 会话逐出 DoS、0x01/0x04 最终判决 30s 窗口、
+0x02/0x03 发布前缺 fsync、sanitize_name 的 .. 子串误拒、配置 .bak 空文件自愈、摘要缓存 TTL
+单位、stats 今日时区/重写字节口径、scrub 停止口径、monitor 失败无退避、Web 多区间/空文件
+416、更新器相对重定向丢端口等（完整清单见审查报告 P2 表）。
+
+---
+
+## P2 收口批（2026-11-16，轮 UI-5 续）
+
+按审查报告 P2 清单先收 8 项（4 个单元可判别 + 2 个超时口径 + 2 个资源上限）；
+基线 280 → **286 项全绿**（rustc 0 告警；clippy 维持 64 条既有风格项，无新增）。
+
+1. **配置 `.bak` 自愈两处**（config.rs）：主文件与 `.bak` 共用 parse_text（空/纯空白
+   一律按损坏——此前 `.bak` 空文本被 serde(default) 吃成默认配置，静默关掉配对码/IP
+   过滤/确认）；保存时只有旧主文件「可解析且合法」才轮换 `.bak`（此前会把截断主文件
+   写成备份，摧毁唯一好备份）。判别：empty_bak_is_not_silently_defaulted、
+   save_keeps_good_bak_when_main_is_broken。
+2. **摘要缓存 TTL 单位**（hashcache.rs）：mtime 是纳秒、TTL 是秒，旧实现直接相减
+   （饱和为 0）→ 条目永不过期，hash_cache_days 成死配置。换算后按文档语义过期；
+   判别：ttl_expiry_misses（改用生产同款纳秒输入，去修复必红）。
+3. **统计「今日」边界时区**（stats.rs）：midnight().assume_utc() 丢掉本地偏移（UTC+8
+   下今日从本地 08:00 起算）。改 assume_offset(now.offset()) + 抽出 today_start_for 可测；
+   判别：today_start_uses_local_offset。
+4. **文件名 `..` 子串误拒**（protocol/frame.rs）：裸文件名内 `..` 不构成穿越，旧实现
+   一票否决导致 a..b.txt / v1..2.log 既发不出也收不了（与 sanitize_rel 口径不一致）。
+   判别：accepts_double_dot_inside_name（精确段 `..`/分隔符仍拒绝）。
+5. **0x01/0x04 最终判决窗口**（folder.rs / resume.rs）：从 30s 普通窗口改 300s 长窗——
+   接收端回执前可能对最后一个文件做整文件重哈希，30s 会误报「对端拒绝」而其实已成功。
+6. **RUDP 非环回 mss 钳制**（transfer/rudp.rs）：远端 60000B 提案钳到 1400，读侧待读
+   缓冲按块计（2048 块）时单连接内存上限从 ≈123MB 降到 ≈2.8MB；判别：
+   peer_mss_clamped_for_non_loopback。
+7. **UDT 对端流窗钳制**（transfer/udt.rs）：ACK 通告的 flow_window 钳到 25600（libudt
+   默认 flight flag）——否则恶意对端报 i32::MAX 可让发送侧把整个待发文件驻留内存；
+   判别：ack_flow_window_is_clamped。
+8. **复查修正**：hashcache 的 tamper_detected_via_cache 原先用秒级 mtime（生产不产生），
+   TTL 修好后会误判过期——改用纳秒并补「命中必须返回原始摘要」断言。
+
+**判别纪律**：1/2/3/4/6/7 六项逐项做「去修复必红」实测（临时回退 → 对应测试转红）；
+5 为超时口径对称性修复（无独立判别 e2e，靠既有 0x01/0x04 e2e 回归覆盖）。
+
+**仍登记后续批**：0x02 跨 peer 会话逐出、0x02/0x03 发布前 fsync、scrub 停止口径、
+monitor 失败退避、Web 多区间/空文件 416、更新器相对重定向端口、0x04 目录复用符号链接
+包含性校验等（见审查报告 P2 表）。
+
+---
+
+## 交互/网络面收口（2026-11-16，轮 UI-5 续 2）
+
+再收 5 项（4 个可判别 + 1 个耐久性）：基线 286 → **291 项全绿**（rustc 0 告警；
+clippy 维持 64 条既有风格项）。
+
+1. **scrub 停止不得报「校验完成」**（scrub.rs + GUI）：`VerifyReport` 增 `stopped`；
+   停止时不再补发 `(total,total)`（改回实际进度）——旧行为让进度条走满、结果面板
+   mismatches 为空，与「完整扫描且全一致」无法区分；前端按 `stopped` 显示「已中止」
+   （新增 L10N 键，zh/en 对称，门禁 bad=0）。判别：
+   stop_midway_marks_partial_and_does_not_report_complete（由进度回调触发中途停止）。
+2. **Web Range 语义**（trft-server/lib.rs）：空文件无 Range 一律 416 → 改 200 +
+   Content-Length: 0（显式 Range 才 416）；多区间/未知单位 Range 从 416 改按 RFC 忽略
+   → 200 全量（aria2/播放器/多线程下载器不再失败）。判别：
+   empty_file_downloads_as_200_without_range、multi_range_and_unknown_unit_fall_back_to_200。
+3. **发布前 fsync**（resume.rs / chunked.rs / cswire.rs）：v2 0x03、0x02 组装、C# 方言
+   0x03 三条路径此前不落盘——哈希从页缓存算出，掉电后最终名可能是短文件/零尾而服务端
+   已报成功。现与 0x00/0x01/0x04 同纪律（回执前 sync_all）。无独立判别测试（耐久性
+   只能在真实掉电场景验证），由既有 0x02/0x03 e2e 回归覆盖。
+4. **monitor 发送失败退避**（monitor.rs）：新增 retry_delay（1s→2s→…→上限 10 分钟）
+   与每文件下次尝试时刻——旧实现失败即回队尾，每轮（默认 1s）对已死对端重连，永久
+   产生连接风暴；失败事件带「第 N 次失败，Ns 后重试」。判别：
+   retry_delay_backs_off_exponentially_and_caps。
+5. **更新器相对重定向保留端口**（update.rs）：抽出 resolve_redirect，用 host_header_of
+   （含端口）而非裸主机——非默认端口的更新源（https://host:8443）相对重定向此前掉到
+   443/80 打空。判别：relative_redirect_keeps_port。
+
+**判别纪律**：1/2/4/5 四项均做「去修复必红」实测；3 为耐久性加固（无判别 e2e）。
+
+**仍登记后续批**：0x02 跨 peer 会话逐出、0x04 目录复用符号链接包含性、cswire 会话表
+条数上限、0x08 解压放大比、Web 下载并发闸的 body 生命周期、GUI http_start/stop 竞态等。
+
+---
+
+## 落盘包含性 + 共享信息保持（2026-11-16，轮 UI-5 续 3）
+
+再收 2 项：基线 291 → **292 项全绿**（rustc 0 告警；clippy 维持 64 条既有风格项；
+L10N 门禁 zh=en=205、bad=0）。
+
+1. **0x04 落盘包含性**（cswire.rs）：0x04 会复用既有会话目录（<folder>.<guid8>），
+   而 save_dir 内预置的 junction/符号链接会把对端可控的相对路径写到保存目录之外
+   （Windows 上 junction 不需要管理员权限；0x00/0x01/0x02/0x03 用随机半成品名或
+   原子建目录，天然不吃这条路径）。新增 ensure_contained：canonicalize 最近存在
+   祖先必须落在 canonical(save_dir) 前缀内；根目录与每个文件的父目录建前/建后各验一次。
+   判别：cs_sync_rejects_junction_escape（Windows：把会话目录换成 mklink /J 指向树外，
+   第二轮同步必须被拒且树外无文件）。
+2. **共享信息不得被通用状态事件清空**（GUI）：`sync-state` 是「任意子系统状态变了」的
+   通用信号，前端旧实现无条件 `httpInfo = null`——任一接收器/监控退出都会把仍在运行的
+   共享显示成「未运行」，链接/二维码再也拿不回来（token 只在后端句柄）。修复：
+   HttpHandle 增 token/dir；新增 http_info 命令；前端仅在 httpRunning=false 时清空，
+   页面重载/重启后也从句柄恢复链接。前端行为无自动化测试（无 JS 测试基建），
+   以 node --check + L10N 门禁 + 真机冒烟为准。
+
+**判别纪律**：第 1 项做「去修复必红」实测（禁用包含性检查后测试转红）；第 2 项为 UI 状态
+修复，登记为需真机冒烟验证。
+
+**仍登记后续批**：0x02 跨 peer 会话逐出、cswire 会话/tracker 表条数上限、0x08 解压放大
+比守卫（需全局解压预算，非单连接比值）、Web 下载并发闸的 body 生命周期（permit 绑 body）、
+GUI http_start/stop 竞态占位、更新安装后进程不重启。
+
+---
+
+## 0x02 会话跨 peer 隔离（2026-11-16，轮 UI-5 续 4）
+
+再收 1 项：基线 292 → **293 项全绿**（rustc 0 告警；clippy 维持 64 条既有风格项）。
+
+**0x02 分块会话逐出按来源分桶**（chunked.rs）：旧策略全局最旧逐出——任意主机开 65
+个组（每帧一个，`total=1` 即可）就能把他人正在传的半成品挤出表并删文件，受害连接
+随后 0x0C 得 0x00、整组失败。修复：会话记录来源 IP；单来源上限 8 组，超限只逐出
+**本来源**最旧且不在组装中的组；全局表（64）满则拒绝新组（fail-closed），绝不跨 peer
+逐出。判别：session_eviction_is_per_peer_and_never_cross_peer（受害会话必须存活 +
+全局满新来源被拒；已做去修复必红实测）。
+
+**仍登记**：cswire 会话/tracker 表条数上限、0x08 解压放大比（需全局预算）、Web 下载
+并发闸的 body 生命周期、GUI http_start/stop 竞态、更新安装后进程不重启。
+
+---
+
+## cswire 跨连接表条数上限（2026-11-16，轮 UI-5 续 5）
+
+再收 1 项：基线 293 → **294 项全绿**（rustc 0 告警；clippy 维持 64 条既有风格项）。
+
+**tracker/会话表条数上限**（cswire.rs）：`declared_total` 只封字节不封条数——每帧
+一个 tracker（或每个 0x03 一个会话）即可无限建条目，每条持半成品句柄/会话名，仅靠
+15 分钟 TTL 回收。新增 `CS_MAX_TRACKERS=64`、`CS_MAX_RESUME_SESSIONS=256`，超出按
+`touched` 最旧逐出；resume 只摘会话/释放声明量、**不删文件**（可能是已验证交付）。
+被逐连接随后得到显式错误（组装器缺失 → 整组重发），不会假成功。判别：
+session_tables_are_capped（已做去修复必红实测）。
+
+**仍登记**：0x08 解压放大比（需全局预算）、Web 下载并发闸的 body 生命周期、
+GUI http_start/stop 竞态、更新安装后进程不重启。
+
+---
+
+## GUI 共享启停竞态（2026-11-16，轮 UI-5 续 6）
+
+再收 1 项：基线 294 → **295 项全绿**（rustc 0 告警；clippy 维持 64 条既有风格项）。
+
+**http_start/stop 竞态**（commands.rs + state.rs）：旧实现 check→bind→insert 有窗口——
+两个并发 http_start 可都通过 `is_some()` 检查，后者覆盖前者（旧服务泄漏且 stop 只能
+停一个）；bind 窗口内的 stop 也看不到占位（报「未运行」而服务仍起来）。修复：
+`HttpHandle` 增 `gen: Arc<()>`；启动**先占位再 bind**（检查与插入同一临界区），bind
+失败按 gen 收回占位；收尾凭 `Arc::ptr_eq` 判定占位仍是本次启动——被 stop 取走则返回
+「共享在启动过程中被停止」，不得复活。判别：
+http_start_placeholder_blocks_double_start_and_detects_stop（并发第二次启动被拒 + stop
+后旧代收尾不得覆盖新代；两处均做去修复必红实测）。
+
+**仍登记**：0x08 解压放大比（需全局预算）、Web 下载并发闸的 body 生命周期、
+更新安装后进程不重启。
+
+---
+
+## Web 下载并发名额绑 body（2026-11-16，轮 UI-5 续 7）
+
+再收 1 项：基线 295 → **296 项全绿**（rustc 0 告警；clippy 维持 64 条既有风格项）。
+
+**permit 生命周期**（trft-server/lib.rs）：并发闸的 permit 原本随中间件返回即释放——
+下载响应体是流式的，慢速客户端（每块隔几秒）可在 body 未读完时重新占名额，32 连接
+上限被绕过（每个慢下载 = 一个长连接 + 空闲并发额度）。修复：中间件把 permit 放进请求
+扩展（`PermitSlot`），下载处理器取出并包进 `PermitReader`（`AsyncRead` 包装，持有
+`OwnedSemaphorePermit`），206/200 流式分支用它构造 `ReaderStream`——名额随 body 销毁
+才归还；非流式路由请求结束时随扩展释放（行为不变）。判别：
+permit_reader_holds_permit_until_dropped（已做去修复必红实测）。
+
+**仍登记**：0x08 解压放大比（需全局预算）、更新安装后进程不重启。
+
+---
+
+## 真机 F3：0x04 发布前数据落盘（2026-11-17，轮 UI-5 续 10）
+
+B5（0x04 覆盖完成瞬间硬断电）暴露：接收端已回「同步完成」，重启后文件在最终名、
+长度满 50 MB，但**内容与覆盖前后的版本都不符**（99.6% 字节不同）——F2 只修了改名
+落盘，0x04 的临时文件**没有数据 fsync**（0x02/0x03 在轮 UI-5 续 2 已补）。
+
+修复：`receive_payload` 写完后、`cs_publish_replace` 前对临时文件 `sync_all`（与
+0x02/0x03 同纪律）。**真机复核**：二次断电后最终名存在、哈希与覆盖后的源一致、无残留。
+基线 299 不变（无新增测试；由 B5 真机用例判别）。
+
+---
+
+## 真机 F2：发布改名必须落盘（2026-11-17，轮 UI-5 续 9）
+
+B3（0x02 500 MiB 完成瞬间硬断电）暴露：**数据落盘了，改名没落盘**——重启后文件仍是
+`b3.bin.<gid>.trft-part`（内容与源哈希完全一致、长度满），而发送端已收到「完成」。
+根因：`publish_part` 用 `hard_link` + `remove_file`（0x04 用 `rename`），二者都不保证
+目录项更新写入磁盘；`sync_all` 只覆盖文件数据，不覆盖父目录。
+
+修复：新增 `publish` 模块——Windows 用 `MoveFileExW`，带 `MOVEFILE_WRITE_THROUGH`：
+`move_noreplace`（不带 REPLACE_EXISTING，天然 fail-if-exists，替换「硬链接 + 删源」）与
+`move_replace`（0x04 覆盖语义）。接入 `publish_part`（0x00/0x01/0x02/0x03）、UDP
+`publish_part_sync`、C# 方言 `cs_publish_replace`、0x04 `publish_replace`。
+
+判别：`publish::tests`（目标存在必失败/成功后源消失/覆盖生效）。
+**真机复核**：同场景再断电一次，重启后 `recv\b3b.bin` 在**最终名**、524,288,000 B、
+`36b7e118…b376` 与源一致，无 `.trft-part` 残留。基线 297 → **299 项全绿**，clippy 无新增。
+
+---
+
+## 真机 F1：0x02 发布后释放文件句柄（2026-11-17，轮 UI-5 续 8）
+
+真机 A14 暴露、自动化测试覆盖不到的缺陷：**0x02 组装完成后会话仍持有最终文件句柄，
+发布出来的文件被锁到会话 TTL（10 分钟）**——用户 10 分钟内打不开/改不了名/删不掉。
+根因：`GroupSession.file` 是对半成品文件的 `File` 句柄，`publish_part` 用 `rename` 换成
+最终名后句柄不变，Windows 上未共享的读者被挡。
+
+修复：`file` 改 `Mutex<Option<File>>`；`finish` 成功后在 file→state 同序锁下置 `None`
+释放；`receive` 的幂等分支（`assembling`/已覆盖）先于取句柄，迟到块仍按幂等忽略，
+异常回收才回「分块组装器已被回收（请整组重发）」。
+
+判别：`finish_releases_published_file_handle`（发布后会话句柄必须为 None；去修复必红）。
+**真机复核**：重新部署后 0x02 传 8 MiB，接收进程存活期间读取成功且哈希与源一致
+（修复前同一读取报 `being used by another process`）。基线 296 → **297 项全绿**，clippy 无新增。
+
+**真机验证**：清单见 [QA-CHECKLIST.md](QA-CHECKLIST.md)——A 段 C# 2.14 互通（含本轮
+改动对应的 A4/A7/A8/A9/A10/A12/A14）、B 段 NTFS 掉电 fsync（0x00–0x04 各 3 次）、
+C 段 GUI 冒烟（共享保活/空文件与多区间 Range/校验中止/监控退避/统计零点）。
+
 ## 对齐批三交付记录（2026-11-13，TECH-STACK §7.31）
 
 **范围**：C# 版（D:\zcode\TrFileTransfer）剩余功能缺口收官——§7.27 G3 登记、IPv6 双栈、

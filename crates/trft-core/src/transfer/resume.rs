@@ -4,7 +4,7 @@
 //! 服务端状态模型：**磁盘文件即状态**。
 //! - 0x03：半成品 `<name>.<ip-fnv>.trft-resume` + 侧车 `.meta`（size+claimed hash）。
 //!   meta 失配 = 陈旧前缀 → 删除从 0 重来（绝不拼接旧版本内容）；
-//!   服务端偏移权威（max(声明, 实际)）；收完整文件重读比对，不一致真删除。
+//!   服务端偏移权威 = **磁盘事实**（声明仅咨询，轮 4 P0）；收完整文件重读比对，不一致真删除。
 //! - 0x04：清单流式过一遍（不物化），逐项由服务端摘要缓存/现算核对，
 //!   位图应答跳过项；同步语义 = 同一根目录、差异文件校验后 rename 覆盖、
 //!   本地已删除文件服务端保留（增量备份）。
@@ -215,7 +215,8 @@ pub(crate) async fn fill_cache_at(opts: &RecvOptions, dest: &Path, size: u64, ha
 
 /// 0x04 同步语义发布：校验后 rename 覆盖（内容不同 = 更新；规格 §3.1 增量备份）。
 async fn publish_replace(part: &Path, dest: &Path) -> Result<()> {
-    tokio::fs::rename(part, dest).await?;
+    // 真机 F2：write-through 覆盖（断电后最终名不丢）。
+    crate::publish::move_replace(part, dest)?;
     Ok(())
 }
 
@@ -358,6 +359,10 @@ where
             }
             remaining -= want as u64;
         }
+        // 发布前落盘（轮 UI-5 续 P2）：0x03 此前不 fsync——整文件哈希是从
+        // 页缓存算出的，掉电后最终名可能是短文件/零尾而服务端已报成功。
+        // 与 0x00/0x01/0x04 同纪律（其结果在回执前已 sync_all）。
+        f.sync_all().await?;
     }
     // 载荷后哈希（防源文件传输中变异：两侧各自独立比对）。
     let trailing: [u8; 32] = read_n(s, 32).await?.try_into().expect("32 字节哈希");
@@ -922,8 +927,9 @@ pub async fn send_folder_resume(
         sent += 1;
     }
 
-    // 带内完成判决（规格 §3.1：正文之后服务端失败不得报成功）。
-    let st = read_u8(&mut s).await?;
+    // 带内完成判决（规格 §3.1：正文之后服务端失败不得报成功）。长窗（300s）——
+    // 服务端可能要先对最后一个文件做整文件重哈希（轮 UI-5 P2：与 0x00/0x03 同口径）。
+    let st = read_u8_long(&mut s).await?;
     let _ = s.shutdown().await;
     if st != STATUS_OK {
         if let Some(r) = &opts.progress {

@@ -86,6 +86,98 @@ async fn token_query_grants_access() {
     assert_eq!(res.status(), StatusCode::SEE_OTHER, "无效令牌必须拒绝");
 }
 
+/// 轮 UI-5 P1 判别：`?t=` 令牌必须顺手签发会话——否则扫码打开根目录后，
+/// 页内链接（/view、/dl、/up）的下一次请求既无 Cookie 也无令牌，全部被打回
+/// /login（规格 §3.4「扫码即可浏览/上传/下载」）。
+#[tokio::test]
+async fn token_query_issues_session_for_subsequent_navigation() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/f.txt"), b"x").unwrap();
+    let secret = [9u8; 32];
+    let app = trft_server::build_router(Arc::new(trft_server::WebState::with_token_secret(
+        dir.path().to_path_buf(),
+        Some(AuthConfig {
+            pairing_code: "123456".into(),
+        }),
+        secret,
+    )));
+    let token = trft_server::token_for(&secret, "123456");
+    let res = send(app.clone(), req("GET", &format!("/?t={token}"))).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let cookies: Vec<String> = res
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+    let sid = cookies
+        .iter()
+        .find_map(|c| {
+            c.split(';')
+                .next()
+                .and_then(|kv| kv.strip_prefix("trft_sid="))
+                .map(String::from)
+        })
+        .expect("?t= 令牌必须签发 trft_sid 会话 Cookie");
+    let cookie = format!("trft_sid={sid}");
+    let res = send(app, req_with("GET", "/view/sub", &[("cookie", &cookie)], Vec::new())).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "令牌签发的会话必须能继续浏览子目录（不得 303 回登录）"
+    );
+}
+
+
+/// 轮 UI-5 续 P2 判别：空文件无 Range 必须 200 + CL=0；带 Range 才 416。
+#[tokio::test]
+async fn empty_file_downloads_as_200_without_range() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+    let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
+    let res = send(app.clone(), req("GET", "/dl/empty.txt")).await;
+    assert_eq!(res.status(), StatusCode::OK, "空文件无 Range 必须 200");
+    let cl = res
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cl, "0");
+    assert_eq!(body_bytes(res.into_body()).await.len(), 0);
+    let res = send(
+        app,
+        req_with("GET", "/dl/empty.txt", &[("range", "bytes=0-")], Vec::new()),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+/// 轮 UI-5 续 P2 判别：多区间/未知单位 Range 必须按 RFC 忽略 → 200 全量
+///（此前一律 416，aria2/IDM/浏览器视频拖动会失败）。
+#[tokio::test]
+async fn multi_range_and_unknown_unit_fall_back_to_200() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.bin"), vec![7u8; 100]).unwrap();
+    let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
+    for hdr in ["bytes=0-1,3-4", "items=0-1"] {
+        let res = send(
+            app.clone(),
+            req_with("GET", "/dl/a.bin", &[("range", hdr)], Vec::new()),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "{hdr} 应降级为 200 全量");
+        assert_eq!(body_bytes(res.into_body()).await.len(), 100);
+    }
+    // 真正不可满足的区间仍必须 416。
+    let res = send(
+        app,
+        req_with("GET", "/dl/a.bin", &[("range", "bytes=999-")], Vec::new()),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
 #[tokio::test]
 async fn login_flow_and_lockout() {
     let dir = tempfile::tempdir().unwrap();
