@@ -2,7 +2,9 @@
 //! 无认证无加密（协议上不可行，规格 §5.2 明示残余风险）——只适用于可信链路。
 //!
 //! 帧布局：20B 公共头 + 载荷
-//! - START: u16 名长 + 名 + u64 大小 + u32 块长 + u8 fec + u8 parity
+//! - START: u16 名长 + 名 + u64 大小 + u32 块长 + u8 fec + u8 parity + [32B SHA-256]
+//!          （哈希为可选尾段：新发送端携带 → 接收端收齐即校验发布，不依赖 END；
+//!          旧发送端不带 → 沿用 END 携带哈希的旧路径，字节布局向后兼容）
 //! - DATA : seq = 全局块序号，载荷 = 该块实际字节（末块 = 余数，不补零；
 //!          RS 编码/恢复内部按块长补零，END 前 set_len 裁剪）
 //! - PARITY: u32 组号 + u8 分片序号(≥k) + 分片载荷
@@ -186,7 +188,10 @@ impl UdpPlan {
         .to_bytes()
     }
 
-    pub fn start_frames(&self) -> Vec<Vec<u8>> {
+    /// START 帧（3 份）。尾段带预期全文 SHA-256：接收端「收齐即校验发布」，
+    /// 不再把 END 当发布的唯一触发（END 全丢时完整文件不会一直停在 .part）。
+    /// 旧接收端解析到 parity 字节即止、忽略尾随 32B，故无需版本升级。
+    pub fn start_frames(&self, hash: &[u8; 32]) -> Vec<Vec<u8>> {
         (0..3)
             .map(|_| {
                 let mut f = self.header(U_F_START, 0).to_vec();
@@ -196,6 +201,7 @@ impl UdpPlan {
                 f.extend_from_slice(&self.chunk_len.to_le_bytes());
                 f.push(if self.fec { 1 } else { 0 });
                 f.push(self.parity_shards);
+                f.extend_from_slice(hash);
                 f
             })
             .collect()
@@ -268,39 +274,71 @@ impl UdpPlan {
         if self.fec {
             let codec = FecCodec::new(FEC_DATA_SHARDS, self.parity_shards as usize)?;
             let groups = self.chunk_count.div_ceil(FEC_DATA_SHARDS as u64);
-            for g in 0..groups {
-                let mut shards: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
-                for s in 0..FEC_DATA_SHARDS as u64 {
-                    let idx = g * FEC_DATA_SHARDS as u64 + s;
-                    let mut shard = vec![0u8; UDP_CHUNK];
-                    if idx < self.chunk_count {
-                        let want = (UDP_CHUNK as u64).min(self.size - idx * self.chunk_len as u64)
-                            as usize;
-                        take_bytes!(shard, want);
-                    }
-                    shards.push(shard);
-                }
-                let all = codec.encode_group(shards)?;
-                for (idx, shard) in all.into_iter().enumerate() {
-                    if idx < FEC_DATA_SHARDS {
-                        let seq = g * FEC_DATA_SHARDS as u64 + idx as u64;
-                        // 末组补零分片不发送：接收端视其为已知零分片。
-                        if seq < self.chunk_count {
-                            // 末块线上载荷 = 实际余数（与接收端精确长度校验配对，轮 1 F2；
-                            // RS 编码分片仍按块长补零——恢复路径写全块长，END 前 set_len 裁剪）。
-                            let real = (self.chunk_len as u64)
-                                .min(self.size - seq * self.chunk_len as u64)
+            // 超块 = FEC_DATA_SHARDS 个组（16 块）。超块内数据帧按列优先发送，同组
+            // 4 个分块在线上恰好间隔 4 个位置：连续 ≤3 个丢包最多每组命中 1 个分片，
+            // r=1 即可恢复。此前按组连续发送，一次 3 连丢就会让整组 4 片全丢，
+            // 只能等下一轮重发（弱网突发丢包下的主要收全率差距）。
+            let groups_per_sb = FEC_DATA_SHARDS as u64;
+            let mut g0 = 0u64;
+            while g0 < groups {
+                let g_end = (g0 + groups_per_sb).min(groups);
+                let n_groups = (g_end - g0) as usize;
+                let r = self.parity_shards as usize;
+                let mut chunked: Vec<Vec<u8>> = Vec::with_capacity(n_groups * FEC_DATA_SHARDS);
+                let mut parity: Vec<Vec<u8>> = Vec::with_capacity(n_groups * r);
+                for g in g0..g_end {
+                    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
+                    for s in 0..FEC_DATA_SHARDS as u64 {
+                        let idx = g * FEC_DATA_SHARDS as u64 + s;
+                        let mut shard = vec![0u8; UDP_CHUNK];
+                        if idx < self.chunk_count {
+                            let want = (UDP_CHUNK as u64)
+                                .min(self.size - idx * self.chunk_len as u64)
                                 as usize;
-                            let frame = self.data_frame(seq, &shard[..real]);
-                            lim.acquire(frame.len() as u64).await;
-                            socket.send_to(&frame, addr).await?;
+                            take_bytes!(shard, want);
                         }
-                    } else {
-                        let frame = self.parity_frame(g as u32, idx as u8, &shard);
+                        shards.push(shard);
+                    }
+                    let all = codec.encode_group(shards)?;
+                    for (idx, shard) in all.into_iter().enumerate() {
+                        if idx < FEC_DATA_SHARDS {
+                            chunked.push(shard);
+                        } else {
+                            parity.push(shard);
+                        }
+                    }
+                }
+                // 数据帧列优先：第 col 列 = 每个组同一位置的块。
+                for col in 0..FEC_DATA_SHARDS {
+                    for gi in 0..n_groups {
+                        let seq = (g0 + gi as u64) * FEC_DATA_SHARDS as u64 + col as u64;
+                        if seq >= self.chunk_count {
+                            continue; // 末组补零分片不发送：接收端视其为已知零分片
+                        }
+                        // 末块线上载荷 = 实际余数（与接收端精确长度校验配对；RS 分片
+                        // 仍按块长补零——恢复路径写全块长，收尾 set_len 裁剪）。
+                        let real = (self.chunk_len as u64)
+                            .min(self.size - seq * self.chunk_len as u64)
+                            as usize;
+                        let frame = self.data_frame(seq, &chunked[gi * FEC_DATA_SHARDS + col][..real]);
                         lim.acquire(frame.len() as u64).await;
                         socket.send_to(&frame, addr).await?;
                     }
                 }
+                // 奇偶帧按 (行, 组) 列优先：突发同样最多打掉同组 1 个校验片。
+                for p in 0..r {
+                    for gi in 0..n_groups {
+                        let group = g0 + gi as u64;
+                        let frame = self.parity_frame(
+                            group as u32,
+                            (FEC_DATA_SHARDS + p) as u8,
+                            &parity[gi * r + p],
+                        );
+                        lim.acquire(frame.len() as u64).await;
+                        socket.send_to(&frame, addr).await?;
+                    }
+                }
+                g0 = g_end;
             }
         } else {
             for idx in 0..self.chunk_count {
@@ -325,38 +363,63 @@ impl UdpPlan {
         if self.fec {
             let codec = FecCodec::new(FEC_DATA_SHARDS, self.parity_shards as usize)?;
             let groups = self.chunk_count.div_ceil(FEC_DATA_SHARDS as u64);
-            for g in 0..groups {
-                let mut shards: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
-                let mut real_lens = [0usize; FEC_DATA_SHARDS];
-                for s in 0..FEC_DATA_SHARDS as u64 {
-                    let idx = g * FEC_DATA_SHARDS as u64 + s;
-                    let mut shard = vec![0u8; UDP_CHUNK];
-                    if idx < self.chunk_count {
-                        let want = (UDP_CHUNK as u64).min(self.size - idx * self.chunk_len as u64)
-                            as usize;
-                        f.read_exact(&mut shard[..want]).await?;
-                        dig.update(&shard[..want]);
-                        real_lens[s as usize] = want;
-                    }
-                    shards.push(shard);
-                }
-                let _ = real_lens;
-                let all = codec.encode_group(shards)?;
-                for (idx, shard) in all.into_iter().enumerate() {
-                    if idx < FEC_DATA_SHARDS {
-                        let seq = g * FEC_DATA_SHARDS as u64 + idx as u64;
-                        // 末组补零分片不发送：接收端视其为已知零分片。
-                        if seq < self.chunk_count {
-                            // 末块线上载荷 = 实际余数（与 send_pass 同口径，轮 1 F2）。
-                            let real = (self.chunk_len as u64)
-                                .min(self.size - seq * self.chunk_len as u64)
+            // 与 send_pass 相同的超块列优先顺序（供顺序判别测试断言）。
+            let groups_per_sb = FEC_DATA_SHARDS as u64;
+            let mut g0 = 0u64;
+            while g0 < groups {
+                let g_end = (g0 + groups_per_sb).min(groups);
+                let n_groups = (g_end - g0) as usize;
+                let r = self.parity_shards as usize;
+                let mut chunked: Vec<Vec<u8>> = Vec::with_capacity(n_groups * FEC_DATA_SHARDS);
+                let mut par: Vec<Vec<u8>> = Vec::with_capacity(n_groups * r);
+                for g in g0..g_end {
+                    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
+                    for s in 0..FEC_DATA_SHARDS as u64 {
+                        let idx = g * FEC_DATA_SHARDS as u64 + s;
+                        let mut shard = vec![0u8; UDP_CHUNK];
+                        if idx < self.chunk_count {
+                            let want = (UDP_CHUNK as u64)
+                                .min(self.size - idx * self.chunk_len as u64)
                                 as usize;
-                            data.push(self.data_frame(seq, &shard[..real]));
+                            f.read_exact(&mut shard[..want]).await?;
+                            dig.update(&shard[..want]);
                         }
-                    } else {
-                        parity.push(self.parity_frame(g as u32, idx as u8, &shard));
+                        shards.push(shard);
+                    }
+                    let all = codec.encode_group(shards)?;
+                    for (idx, shard) in all.into_iter().enumerate() {
+                        if idx < FEC_DATA_SHARDS {
+                            chunked.push(shard);
+                        } else {
+                            par.push(shard);
+                        }
                     }
                 }
+                for col in 0..FEC_DATA_SHARDS {
+                    for gi in 0..n_groups {
+                        let seq = (g0 + gi as u64) * FEC_DATA_SHARDS as u64 + col as u64;
+                        if seq >= self.chunk_count {
+                            continue;
+                        }
+                        let real = (self.chunk_len as u64)
+                            .min(self.size - seq * self.chunk_len as u64)
+                            as usize;
+                        data.push(
+                            self.data_frame(seq, &chunked[gi * FEC_DATA_SHARDS + col][..real]),
+                        );
+                    }
+                }
+                for p in 0..r {
+                    for gi in 0..n_groups {
+                        let group = g0 + gi as u64;
+                        parity.push(self.parity_frame(
+                            group as u32,
+                            (FEC_DATA_SHARDS + p) as u8,
+                            &par[gi * r + p],
+                        ));
+                    }
+                }
+                g0 = g_end;
             }
         } else {
             for idx in 0..self.chunk_count {
@@ -383,6 +446,21 @@ impl UdpPlan {
         f.extend_from_slice(shard);
         f
     }
+}
+
+/// 整文件 SHA-256（异步分块读）：START 携带的预期哈希。
+async fn hash_file_async(path: &Path) -> Result<[u8; 32]> {
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut dig = FileDigester::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        dig.update(&buf[..n]);
+    }
+    Ok(dig.finalize())
 }
 
 /// 单向 UDP 发送：多轮重发，每轮 START×3 → 全部 DATA/PARITY → END×3。
@@ -416,8 +494,10 @@ pub async fn send_file_udp(addr: SocketAddr, path: &Path, opts: &UdpSendOptions)
     if let Some(r) = &opts.progress {
         r.set_total(plan.size * passes as u64);
     }
+    // 预读全文哈希（START 携带）：接收端收齐即校验发布，END 不再是唯一触发点。
+    let claimed = hash_file_async(path).await?;
     for pass in 0..passes {
-        let start_frames = plan.start_frames();
+        let start_frames = plan.start_frames(&claimed);
         for (i, st) in start_frames.iter().enumerate() {
             lim.acquire(st.len() as u64).await;
             socket.send_to(st, addr).await?;
@@ -425,10 +505,17 @@ pub async fn send_file_udp(addr: SocketAddr, path: &Path, opts: &UdpSendOptions)
                 tokio::time::sleep(BURST_GAP).await; // 帧间才间隔（末帧后的等待纯浪费）
             }
         }
-        let hash = plan
+        let sent_hash = plan
             .send_pass(path, &socket, addr, &mut lim, opts.progress.as_ref())
             .await?;
-        let end_frames = plan.end_frames(&hash);
+        if sent_hash != claimed {
+            // 发送中源文件被改写：接收端会按 START 哈希拒绝，日志说明原因。
+            eprintln!(
+                "[警告] 源文件在发送过程中被修改，接收端将按 START 哈希拒绝: {}",
+                path.display()
+            );
+        }
+        let end_frames = plan.end_frames(&claimed);
         for (i, e) in end_frames.iter().enumerate() {
             lim.acquire(e.len() as u64).await;
             socket.send_to(e, addr).await?;
@@ -505,6 +592,8 @@ struct Session {
     dir: PathBuf,
     /// 会话开始时刻（stats 时长记账；轮 1：不再依赖 progress 注入）。
     start: Instant,
+    /// START 尾段携带的预期全文哈希（新发送端）；None = 旧发送端，仍等 END。
+    start_hash: Option<[u8; 32]>,
 }
 
 /// 目录解析器（PerDeviceFolder/AutoArchive；None = 一律 save_dir）。
@@ -615,6 +704,13 @@ impl UdpRecvEngine {
         let chunk_len = u32::from_le_bytes(p[10 + nlen..14 + nlen].try_into().unwrap());
         let fec = p[14 + nlen] == 1;
         let parity_shards = p[15 + nlen].clamp(1, 8);
+        // 尾随 32B 预期哈希（新发送端）；旧发送端止于 parity 字节 → None。
+        let hash_off = 2 + nlen + 14;
+        let start_hash: Option<[u8; 32]> = if p.len() >= hash_off + 32 {
+            Some(p[hash_off..hash_off + 32].try_into().unwrap())
+        } else {
+            None
+        };
         if size > MAX_TRANSFER_SIZE || chunk_len == 0 || chunk_len > 1500 {
             return UdpEvent::Ignored("START 参数越界");
         }
@@ -698,15 +794,34 @@ impl UdpRecvEngine {
                 done: 0,
                 dir,
                 start: Instant::now(),
+                start_hash,
             },
         );
         let chunk_len = self.sessions[&session].chunk_len;
-        UdpEvent::Started {
+        let started = UdpEvent::Started {
             session,
             name: self.sessions[&session].name.clone(),
             size,
             chunk_len,
+        };
+        // 空文件 + START 哈希：没有 DATA 可等，START 本身就是「收齐」。
+        if let Some(ev) = self.try_finalize_complete(session) {
+            return ev;
         }
+        started
+    }
+
+    /// START 带哈希时：全部块到齐（含 FEC 恢复补齐）即校验发布，不依赖 END。
+    /// END 三份全丢的弱网下，完整文件不会一直停在半成品后缀上等下一轮。
+    fn try_finalize_complete(&mut self, session: u64) -> Option<UdpEvent> {
+        let hash = {
+            let s = self.sessions.get(&session)?;
+            if s.done < s.chunk_count {
+                return None;
+            }
+            s.start_hash?
+        };
+        Some(self.finalize(session, hash))
     }
 
     fn on_data(&mut self, session: u64, seq: u64, p: &[u8]) -> UdpEvent {
@@ -738,6 +853,9 @@ impl UdpRecvEngine {
         };
         // 组恢复：DATA 到齐 + 已缓存的 PARITY 可能凑足 k 个已知分片。
         self.try_recover(session, seq / FEC_DATA_SHARDS as u64);
+        if let Some(ev) = self.try_finalize_complete(session) {
+            return ev;
+        }
         UdpEvent::Progress {
             session,
             done,
@@ -790,6 +908,9 @@ impl UdpRecvEngine {
         }
         let (done, total) = (s.done, s.chunk_count);
         self.try_recover(session, group as u64);
+        if let Some(ev) = self.try_finalize_complete(session) {
+            return ev;
+        }
         // 注意：GUI 接线 Progress 事件时必须先加 100ms 节流（规格 §3.1），
         // unbounded channel 在慢消费者下会无界增长。
         UdpEvent::Progress {
@@ -897,17 +1018,33 @@ impl UdpRecvEngine {
     }
 
     fn on_end(&mut self, session: u64, p: &[u8]) -> UdpEvent {
-        let Some(s) = self.sessions.get_mut(&session) else {
-            return UdpEvent::Ignored("无此会话");
+        let (done, total, start_hash) = {
+            let Some(s) = self.sessions.get_mut(&session) else {
+                return UdpEvent::Ignored("无此会话");
+            };
+            s.last_seen = Instant::now();
+            if p.len() < 32 {
+                return UdpEvent::Ignored("END 过短");
+            }
+            (s.done, s.chunk_count, s.start_hash)
         };
-        s.last_seen = Instant::now();
-        if p.len() < 32 {
-            return UdpEvent::Ignored("END 过短");
-        }
-        if s.done < s.chunk_count {
+        if done < total {
             return UdpEvent::Ignored("尚未完整，等待后续轮次");
         }
         let claimed: [u8; 32] = p[..32].try_into().unwrap();
+        // 新发送端 START 已带预期哈希 → 以 START 为准（END 仅作触发/兜底）；
+        // 旧发送端没有 START 哈希 → 沿用 END 携带的哈希。
+        self.finalize(session, start_hash.unwrap_or(claimed))
+    }
+
+    /// 收尾：裁剪末组补零 → fsync → 全文哈希复核 → 原子发布（失败即删半成品）。
+    fn finalize(&mut self, session: u64, claimed: [u8; 32]) -> UdpEvent {
+        let Some(s) = self.sessions.get_mut(&session) else {
+            return UdpEvent::Ignored("无此会话");
+        };
+        if s.done < s.chunk_count {
+            return UdpEvent::Ignored("尚未完整，等待后续轮次");
+        }
         // 校验前先裁掉末组补零。
         if s.file
             .set_len(s.size)
@@ -1282,7 +1419,12 @@ pub async fn serve_udp_on(
                     start,
                 } => {
                     let removed = reports.remove(session);
-                    if let Some((r, ..)) = &removed {
+                    if let Some((r, _chunk_len, size, last, _)) = &removed {
+                        // START 哈希路径在「收齐」同一帧即发布，最后一个 Progress
+                        // 被 Completed 合并——补足末块字节，终态必须等于文件大小。
+                        if *size > *last {
+                            r.add(*size - *last);
+                        }
                         r.finish();
                     }
                     report_order.retain(|s| s != session);
@@ -1343,6 +1485,17 @@ mod tests {
     use super::*;
     use rand_core::RngCore;
 
+    /// 旧发送端的 START（无尾随 32B 哈希）：钉 END 哈希兜底路径 + 向后兼容。
+    fn legacy_start_frames(plan: &UdpPlan) -> Vec<Vec<u8>> {
+        plan.start_frames(&[0u8; 32])
+            .into_iter()
+            .map(|mut f| {
+                f.truncate(f.len() - 32);
+                f
+            })
+            .collect()
+    }
+
     async fn make_file(dir: &Path, name: &str, len: usize) -> (PathBuf, Vec<u8>) {
         let mut data = vec![0u8; len];
         rand_core::OsRng.fill_bytes(&mut data);
@@ -1358,10 +1511,10 @@ mod tests {
         let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        let (data_frames, _parity, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
             eng.handle(&f);
         }
-        let (data_frames, _parity, hash) = plan.build_pass(&src).await.unwrap();
         for d in &data_frames {
             eng.handle(d);
         }
@@ -1388,11 +1541,11 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        let (data_frames, parity, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
             eng.handle(&f);
         }
-        let (data_frames, parity, hash) = plan.build_pass(&src).await.unwrap();
-        // 第 0 组丢 2 个数据分片（seq 0、1），靠 PARITY(4,5) 恢复。
+        // 线上前 2 帧（列优先 → 分属两个组），各丢 1 片，靠 PARITY 恢复。
         for (i, d) in data_frames.iter().enumerate() {
             if i == 0 || i == 1 {
                 continue;
@@ -1428,10 +1581,10 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        let (data_frames, _parity_dropped, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
             eng.handle(&f);
         }
-        let (data_frames, _parity_dropped, hash) = plan.build_pass(&src).await.unwrap();
         // 全部 PARITY 丢失：交付只能依赖 DATA 帧。
         for d in &data_frames {
             eng.handle(d);
@@ -1459,10 +1612,10 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        let (data_frames, _, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
             eng.handle(&f);
         }
-        let (data_frames, _, hash) = plan.build_pass(&src).await.unwrap();
         for d in &data_frames {
             eng.handle(d);
         }
@@ -1493,7 +1646,7 @@ mod tests {
         .await
         .unwrap();
         let data0 = plan0.build_pass(&p0).await.unwrap().0;
-        eng.handle(&plan0.start_frames()[0]);
+        eng.handle(&plan0.start_frames(&[0u8; 32])[0]);
         for i in 1..=64 {
             let (src, _) = make_file(dir.path(), &format!("s{i}.bin"), 10).await;
             let plan = build_plan(
@@ -1505,7 +1658,7 @@ mod tests {
             )
             .await
             .unwrap();
-            eng.handle(&plan.start_frames()[0]);
+            eng.handle(&plan.start_frames(&[0u8; 32])[0]);
         }
         assert_eq!(eng.session_count(), 64);
         // 第 0 个会话应已被逐出。
@@ -1559,7 +1712,8 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        // 旧发送端（START 不带哈希）→ 走 END 哈希兜底路径。
+        for f in legacy_start_frames(&plan) {
             eng.handle(&f);
         }
         let (data_frames, _, _) = plan.build_pass(&src).await.unwrap();
@@ -1599,7 +1753,8 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        // 旧发送端：START 不带哈希（新发送端单块会在首帧即完成，重复帧走抑制路径）。
+        for f in legacy_start_frames(&plan) {
             eng.handle(&f);
         }
         let (data_frames, _, _) = plan.build_pass(&src).await.unwrap();
@@ -1630,10 +1785,10 @@ mod tests {
         .unwrap();
         let out = dir.path().join("out");
         let mut eng = UdpRecvEngine::new(out.clone());
-        for f in plan.start_frames() {
+        let (round1, _, hash1) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash1) {
             eng.handle(&f);
         }
-        let (round1, _, _) = plan.build_pass(&src).await.unwrap();
         for (i, d) in round1.iter().enumerate() {
             if i == 1 || i == 3 {
                 continue; // 首轮丢 2 块
@@ -1704,10 +1859,10 @@ mod tests {
         let mut eng = UdpRecvEngine::with_resolver(out.clone(), Some(resolver));
         let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
         let remote: std::net::IpAddr = "10.9.9.9".parse().unwrap();
-        for f in plan.start_frames() {
+        let (frames, _, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
             eng.handle_from(&f, Some(remote));
         }
-        let (frames, _, hash) = plan.build_pass(&src).await.unwrap();
         for d in &frames {
             eng.handle_from(d, Some(remote));
         }
@@ -1718,5 +1873,127 @@ mod tests {
         assert!(dest.exists(), "UDP 会话按来源 IP 落入 <设备>/<日期>/");
         assert_eq!(std::fs::read(&dest).unwrap(), data);
         assert!(!out.join("u.bin").exists(), "根目录不得出现副本");
+    }
+
+    /// 新发送端 START 带哈希：收齐即发布，不需要 END（END 三份全丢也能交付）。
+    #[tokio::test]
+    async fn start_hash_publishes_without_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, data) = make_file(dir.path(), "nh.bin", 6000).await;
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        let (frames, _, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
+            eng.handle(&f);
+        }
+        let mut completed = false;
+        for d in &frames {
+            if matches!(eng.handle(d), UdpEvent::Completed { .. }) {
+                completed = true;
+            }
+        }
+        assert!(completed, "收齐即应完成（不等 END）");
+        assert_eq!(std::fs::read(out.join("nh.bin")).unwrap(), data);
+        // END 晚到：会话已移除并进入抑制窗口（不得重复发布）。
+        let ev = eng.handle(&plan.end_frames(&hash)[0]);
+        assert!(matches!(ev, UdpEvent::Ignored("已投递抑制")), "{ev:?}");
+        assert_eq!(eng.session_count(), 0);
+    }
+
+    /// START 哈希不符：收齐即校验失败，真删半成品、不发布。
+    #[tokio::test]
+    async fn start_hash_mismatch_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, _) = make_file(dir.path(), "bad2.bin", 2400).await;
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        let (frames, _, _) = plan.build_pass(&src).await.unwrap();
+        let wrong = crate::hash::sha256(b"wrong");
+        for f in plan.start_frames(&wrong) {
+            eng.handle(&f);
+        }
+        let mut last = UdpEvent::Ignored("none");
+        for d in &frames {
+            last = eng.handle(d);
+        }
+        assert!(
+            matches!(last, UdpEvent::Ignored("SHA-256 不一致，已删除")),
+            "实际: {last:?}"
+        );
+        assert!(!out.join("bad2.bin").exists());
+        assert_eq!(eng.session_count(), 0);
+        let leftover: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
+        assert!(
+            leftover.is_empty(),
+            "不得残留: {:?}",
+            leftover.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 空文件：START 带哈希时无 DATA 可等，START 即完成。
+    #[tokio::test]
+    async fn empty_file_publishes_on_start_with_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, data) = make_file(dir.path(), "empty.bin", 0).await;
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        let hash = crate::hash::sha256_file(&src).unwrap();
+        let ev = eng.handle(&plan.start_frames(&hash)[0]);
+        assert!(matches!(ev, UdpEvent::Completed { .. }), "{ev:?}");
+        assert_eq!(std::fs::read(out.join("empty.bin")).unwrap(), data);
+    }
+
+    /// 发送顺序判别：同一 FEC 组的 4 个分块在线上必须间隔 4 个位置。
+    /// 改回「按组连续发送」→ 连续 4 帧里会出现 2 个同组分块，本测试必红。
+    #[tokio::test]
+    async fn interleaved_order_spreads_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, _) = make_file(dir.path(), "ord.bin", 1200 * 16).await; // 16 块 = 1 超块
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let (frames, _, _) = plan.build_pass(&src).await.unwrap();
+        let seqs: Vec<u64> = frames
+            .iter()
+            .map(|f| {
+                assert_eq!(f[1], U_F_DATA);
+                u64::from_le_bytes(f[10..18].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(seqs.len(), 16);
+        for w in seqs.windows(4) {
+            let groups: std::collections::HashSet<u64> = w.iter().map(|s| s / 4).collect();
+            assert_eq!(groups.len(), 4, "连续 4 帧必须分属 4 个组: {w:?}");
+        }
+    }
+
+    /// 突发 3 连丢判别：交织后 3 个连续丢包分属 3 个组，r=2 足够恢复。
+    /// 旧的连续分组下 3 连丢落在同一组 → 整组不可恢复（本测试必红）。
+    #[tokio::test]
+    async fn burst_of_three_consecutive_losses_recovers_with_fec() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, data) = make_file(dir.path(), "burst.bin", 1200 * 16).await;
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        let (frames, parity, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
+            eng.handle(&f);
+        }
+        for (i, d) in frames.iter().enumerate() {
+            if (4..7).contains(&i) {
+                continue; // 线上连续 3 个位置丢失
+            }
+            eng.handle(d);
+        }
+        let mut completed = false;
+        for p in &parity {
+            if matches!(eng.handle(p), UdpEvent::Completed { .. }) {
+                completed = true;
+            }
+        }
+        assert!(completed, "交织后 3 连丢应能由 FEC 补齐");
+        assert_eq!(std::fs::read(out.join("burst.bin")).unwrap(), data);
     }
 }
