@@ -68,6 +68,10 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 }
 
 pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> Result<()> {
+    // TCP 槽位与 UDT 共用 C# 方言应用层（0x01 整夹 + 判决）。
+    if opts.transport == Transport::Tcp {
+        return crate::transfer::cswire::send_folder_cs_tcp(addr, root, opts).await;
+    }
     send_folder_inner(addr, root, opts, None).await
 }
 
@@ -80,6 +84,31 @@ pub async fn send_folder_auto(addr: SocketAddr, root: &Path, opts: &SendOptions)
     // UDT 槽位走 C# 方言 0x01（TECH-STACK §7.30）。
     if opts.transport == crate::transfer::Transport::Udt {
         return crate::transfer::cswire::send_folder_cs(addr, root, opts).await;
+    }
+    // TCP 槽位同走 C# 方言：0x01 失败转 0x04 差量同步（规格 §3.2 AutoRetry）。
+    if opts.transport == Transport::Tcp {
+        let ephemeral = std::env::temp_dir()
+            .join("trft-no-such-ephemeral-dir")
+            .join("c.txt");
+        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::hashcache::HashCache::load(&ephemeral, 0),
+        ));
+        return match crate::transfer::cswire::send_folder_cs_tcp(addr, root, opts).await {
+            Ok(()) => Ok(()),
+            Err(e) => match &e {
+                Error::Config(_) | Error::AuthRejected(_) | Error::Unsupported(_) => Err(e),
+                _ => {
+                    eprintln!("[重试] 整夹发送失败（{e}），改用差量同步");
+                    crate::transfer::cswire::send_folder_sync_cs_tcp(
+                        addr,
+                        root,
+                        opts,
+                        Some(&cache),
+                    )
+                    .await
+                }
+            },
+        };
     }
     // 纯内存缓存（不可写路径 → degraded；TTL 0 = 永不过期——只活本次调用）。
     let ephemeral = std::env::temp_dir()
@@ -133,10 +162,10 @@ async fn send_folder_inner(
         // 经 connect_stack 接线 0x09 加密（轮 1 F3：此前 0x01 直连明文——
         // opts.encrypt 被静默忽略，配对场景载荷全程明文，未声明的降级）。
         // 0x01 为基础帧：无需能力探询、不协商压缩（保持既有线上行为）。
-        Transport::Tcp => {
-            let (mut s, _) = connect_stack(addr, opts, StackPlan::default()).await?;
-            send_folder_over(&mut s, &root_name, &files, opts, cache).await
-        }
+        // TCP 槽位已改走 C# 方言（send_folder/send_folder_auto 顶层拦截）。
+        Transport::Tcp => Err(crate::error::Error::Unsupported(
+            "TCP 槽位不使用 v2 帧协议（已改为 C# 方言 cswire）".into(),
+        )),
         Transport::Quic => {
             // 配对已在 connect_quic_auth 内完成（0x0D 通道绑定 / 旧端回退）。
             let mut s = connect_quic_auth(addr, opts).await?;

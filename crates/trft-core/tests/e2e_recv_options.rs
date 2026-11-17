@@ -368,27 +368,50 @@ async fn sync_per_device_bitmap_skip_consistent() {
         trft_core::hashcache::HashCache::load(&trft_core::hashcache::cache_file_for(&src_root), 7),
     ));
 
+    // C# 方言 0x04 会话目录由 (folder, ip, port) 派生——两轮必须打同一端口，
+    // 否则第二轮换目录 = 全量重传（本测试判别的正是同一会话的位图跳过）。
+    let port = {
+        let (probe, a) = ephemeral_listener().await;
+        drop(probe);
+        a.port()
+    };
+
     // 第一次同步（清单无哈希 → 全发；发送端缓存回填）。
-    let (l1, a1) = ephemeral_listener().await;
-    let s1 = tokio::spawn(serve_on(l1, make_ro(false)));
-    send_folder_resume(
-        a1,
-        &src_root,
-        &SendOptions::default(),
-        stable_session_id(&src_root, "t"),
-        Some(&cache),
-    )
-    .await
-    .unwrap();
-    timeout(Duration::from_secs(10), s1)
+    {
+        let l1 = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let a = l1.local_addr().unwrap();
+        let s1 = tokio::spawn(serve_on(l1, make_ro(false)));
+        send_folder_resume(
+            a,
+            &src_root,
+            &SendOptions::default(),
+            stable_session_id(&src_root, "t"),
+            Some(&cache),
+        )
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(
-        out.join("同步机").join("proj").join("a.txt").exists(),
-        "分目录下 0x04 根目录落点"
-    );
+        timeout(Duration::from_secs(10), s1)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    // 落点是确定性会话目录 <save>/<设备>/<folder>.<guid8>/（C# 同式）。
+    let device_dir = out.join("同步机");
+    let session = std::fs::read_dir(&device_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("proj."))
+                    .unwrap_or(false)
+        })
+        .expect("必须存在 0x04 会话目录 proj.<guid8>");
+    assert!(session.join("a.txt").exists(), "分目录下 0x04 根目录落点");
 
     // 第二次同步（清单携带缓存哈希 → 位图全跳过，总传输量 0）。
     let (stx, mut srx) = mpsc::unbounded_channel();
@@ -397,7 +420,10 @@ async fn sync_per_device_bitmap_skip_consistent() {
         progress: Some(shub.register("send", "sync2", 0)),
         ..Default::default()
     };
-    let (l2, a2) = ephemeral_listener().await;
+    let l2 = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let a2 = l2.local_addr().unwrap();
     let s2 = tokio::spawn(serve_on(l2, make_ro(true)));
     send_folder_resume(
         a2,
@@ -502,11 +528,8 @@ async fn resume_conflict_no_cache_poisoning() {
 /// 修复前 max(声明,实际) 回 99：1MiB 级输入即可绕过磁盘预检写满整盘。
 #[tokio::test]
 async fn resume_offset_authority_is_server_disk() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use trft_core::hash::sha256;
-    use trft_core::protocol::frame::{R_RESUME_NEGO, STATUS_OK, T_RESUME_FILE};
-    use trft_core::protocol::io::{
-        read_u64, read_u8, write_all, write_str_u16, write_u64, write_u8,
-    };
 
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
@@ -514,59 +537,61 @@ async fn resume_offset_authority_is_server_disk() {
     let data = vec![42u8; 100];
     let claimed = sha256(&data);
 
+    // 同一 serve 实例（会话跨连接存活——C# 方言 0x03 的断点语义）。
+    let (listener, addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(listener, recv_base(out.clone())));
+    let sid =
+        trft_core::transfer::cswire::derive_resume_session_guid(&dir.path().join("poc.bin"), 100, addr);
+
     // 连接 1：只发 5 字节载荷即断开。
     {
-        let (listener, addr) = ephemeral_listener().await;
-        let server = tokio::spawn(serve_on(listener, recv_base(out.clone())));
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        write_u8(&mut s, T_RESUME_FILE).await.unwrap();
-        write_str_u16(&mut s, "poc.bin").await.unwrap();
-        write_u64(&mut s, 100).await.unwrap();
-        write_u64(&mut s, 0).await.unwrap(); // declared=0
-        write_u8(&mut s, 1).await.unwrap();
-        write_all(&mut s, &claimed).await.unwrap();
-        // 读协商应答后只发 5 字节。
-        let first = read_u8(&mut s).await.unwrap();
-        assert_eq!(first, R_RESUME_NEGO);
-        let st = read_u8(&mut s).await.unwrap();
-        let off = read_u64(&mut s).await.unwrap();
-        assert_eq!((st, off), (STATUS_OK, 0), "全新会话应从 0 起");
-        write_all(&mut s, &data[..5]).await.unwrap();
-        drop(s); // 掐断——半成品保留（续传语义）
+        // [0x03][sid 16][total i64][offset i64][nameLen i32][name][flag 1][hash 32]
+        let mut hdr = vec![0x03u8];
+        hdr.extend_from_slice(&sid);
+        hdr.extend_from_slice(&100i64.to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes());
+        hdr.extend_from_slice(&("poc.bin".len() as i32).to_le_bytes());
+        hdr.extend_from_slice(b"poc.bin");
+        hdr.push(1);
+        hdr.extend_from_slice(&claimed);
+        s.write_all(&hdr).await.unwrap();
+        let mut resp = [0u8; 10];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], 0x10);
+        assert_eq!(resp[9], 0, "全新会话 status 0");
+        assert_eq!(i64::from_le_bytes(resp[1..9].try_into().unwrap()), 0);
+        s.write_all(&data[..5]).await.unwrap();
+        drop(s); // 掐断——会话保留（续传语义）
         tokio::time::sleep(Duration::from_millis(200)).await;
-        server.abort();
     }
-    // 半成品保留为 0 字节（载荷按整块读取，短传即全无）——正是 PoC 场景：
-    // 0 字节半成品 + meta 合法，客户端随后声明巨大 offset。
-    let part = std::fs::read_dir(&out)
-        .unwrap()
-        .flatten()
-        .find(|e| {
-            let n = e.file_name().to_string_lossy().to_string();
-            n.ends_with(".trft-resume") && !n.ends_with(".meta")
-        })
-        .expect("半成品应保留");
-    assert_eq!(part.metadata().unwrap().len(), 0);
+    // C# 方言 0x03 直接写最终名：已收 5 字节。
+    assert_eq!(
+        std::fs::metadata(out.join("poc.bin")).map(|m| m.len()).unwrap_or(0),
+        5,
+        "断点会话已落盘 5 字节"
+    );
 
-    // 连接 2：declared=99 放大声明。
+    // 连接 2：声明 offset=99（放大）——服务端必须回磁盘事实 5。
     {
-        let (listener, addr) = ephemeral_listener().await;
-        let server = tokio::spawn(serve_on(listener, recv_base(out.clone())));
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        write_u8(&mut s, T_RESUME_FILE).await.unwrap();
-        write_str_u16(&mut s, "poc.bin").await.unwrap();
-        write_u64(&mut s, 100).await.unwrap();
-        write_u64(&mut s, 99).await.unwrap(); // 放大声明
-        write_u8(&mut s, 1).await.unwrap();
-        write_all(&mut s, &claimed).await.unwrap();
-        let first = read_u8(&mut s).await.unwrap();
-        assert_eq!(first, R_RESUME_NEGO);
-        let st = read_u8(&mut s).await.unwrap();
-        let off = read_u64(&mut s).await.unwrap();
+        let mut hdr = vec![0x03u8];
+        hdr.extend_from_slice(&sid);
+        hdr.extend_from_slice(&100i64.to_le_bytes());
+        hdr.extend_from_slice(&99i64.to_le_bytes()); // 放大声明
+        hdr.extend_from_slice(&("poc.bin".len() as i32).to_le_bytes());
+        hdr.extend_from_slice(b"poc.bin");
+        hdr.push(1);
+        hdr.extend_from_slice(&claimed);
+        s.write_all(&hdr).await.unwrap();
+        let mut resp = [0u8; 10];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], 0x10);
+        assert_eq!(resp[9], 1, "续传会话 status 1");
         assert_eq!(
-            (st, off),
-            (STATUS_OK, 0),
-            "偏移权威必须是磁盘事实（0），客户端声明（99）不得生效"
+            i64::from_le_bytes(resp[1..9].try_into().unwrap()),
+            5,
+            "偏移权威必须是磁盘事实（5），客户端声明（99）不得生效"
         );
         server.abort();
     }
@@ -628,7 +653,7 @@ async fn recv_stats_row_skip_records_existing_path() {
 /// flags 就断，即可无限烧 50k 轮 PBKDF2 并完全绕过 10 次锁定门。
 #[tokio::test]
 async fn interrupted_encrypted_handshake_counts_toward_lockout() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let dir = tempfile::tempdir().unwrap();
     let mut o = recv_base(dir.path().to_path_buf());
     o.pairing_code = Some("123456".into());
@@ -638,15 +663,11 @@ async fn interrupted_encrypted_handshake_counts_toward_lockout() {
     let server = tokio::spawn(serve_on(listener, o));
     for _ in 0..10 {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let hs = trft_core::crypto::handshake::new_handshake().unwrap();
+        // C# 方言 0x09 帧：[0x09][codeHash 32][clientPub 72]——只发一部分就断。
         let mut hello = vec![0x09u8];
-        hello.extend_from_slice(hs.public());
+        hello.extend_from_slice(&[7u8; 32 + 40]);
         s.write_all(&hello).await.unwrap();
-        let mut resp = [0u8; 66];
-        s.read_exact(&mut resp).await.unwrap();
-        assert_eq!(resp[0], 0x19, "服务端必须回 0x19 + 公钥");
-        s.write_all(&[1u8]).await.unwrap(); // 声明持有证明
-        drop(s); // 尾证明前断连
+        drop(s); // 证明字节之前断连
     }
     let ip: std::net::IpAddr = addr.ip();
     let mut locked = false;

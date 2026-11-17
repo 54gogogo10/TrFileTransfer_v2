@@ -651,6 +651,16 @@ pub async fn send_file_chunked(
     opts: &SendOptions,
     connections: u8,
 ) -> Result<()> {
+    // TCP 槽位走 C# 方言 0x02（组会话 + 每块判决）——同一并行语义。
+    if opts.transport == crate::transfer::Transport::Tcp {
+        return crate::transfer::cswire::send_file_chunked_cs_tcp(
+            addr,
+            path,
+            opts,
+            connections,
+        )
+        .await;
+    }
     // Outcome 守卫（轮 3 F2）：显式终态之外的所有 `?` 早退（后续连接建连失败、
     // join panic、补发轮建连失败等）也必须发进度终态——否则进度卡永久 running。
     let outcome = crate::progress::Outcome::new(opts.progress.clone());

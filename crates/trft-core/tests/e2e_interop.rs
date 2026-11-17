@@ -17,14 +17,9 @@ mod common;
 use common::{ephemeral_listener, opts, opts_resident, random_file};
 use rand_core::{OsRng, RngCore};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use trft_core::hash::sha256_file;
-use trft_core::protocol::frame::{
-    CAP_CHUNKED, CAP_COMPRESS, CAP_COVERAGE, CAP_RESUME_FILE, CAP_RESUME_FOLDER, R_CAPABILITY,
-    T_CAPABILITY, T_CHUNKED,
-};
-use trft_core::protocol::io::{read_u8, write_all, write_str_u16, write_u32, write_u64, write_u8};
+use trft_core::hash::{sha256, sha256_file};
 use trft_core::transfer::chunked::send_file_chunked;
 use trft_core::transfer::receiver::RecvOptions;
 use trft_core::transfer::resume::send_file_auto;
@@ -174,12 +169,18 @@ async fn matrix_compress_full_stack_roundtrip() {
 
 #[tokio::test]
 async fn capability_frame_reports_feature_bits() {
-    // 0x0A/0x1A：全开服务端 → 5 个能力位；受限服务端 → 位随选项收敛。
+    // 0x0A/0x1A（C# 方言）：bit0 = 0x04 逐文件跳过清单，bit1 = 0x02 组会话 + 0x0B。
+    // 默认全开 = 0x03（与 C# 服务端同）；关闭特性时位随选项收敛。
     async fn probe(addr: std::net::SocketAddr) -> u8 {
+        use tokio::io::AsyncWriteExt;
         let mut s = TcpStream::connect(addr).await.unwrap();
-        write_u8(&mut s, T_CAPABILITY).await.unwrap();
-        assert_eq!(read_u8(&mut s).await.unwrap(), R_CAPABILITY);
-        read_u8(&mut s).await.unwrap()
+        s.write_all(&[0x0Au8, 0x03]).await.unwrap();
+        let mut resp = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut s, &mut resp)
+            .await
+            .unwrap();
+        assert_eq!(resp[0], 0x1A);
+        resp[1]
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -188,26 +189,17 @@ async fn capability_frame_reports_feature_bits() {
         l1,
         opts_resident(dir.path().join("o1"), None),
     ));
-    assert_eq!(
-        probe(a1).await,
-        CAP_CHUNKED | CAP_COVERAGE | CAP_RESUME_FILE | CAP_RESUME_FOLDER | CAP_COMPRESS,
-        "全开服务端必须广播全部能力位"
-    );
+    assert_eq!(probe(a1).await, 0x03, "全开服务端必须广播 bit0|bit1");
 
     let (l2, a2) = ephemeral_listener().await;
     let s2 = tokio::spawn(trft_core::transfer::receiver::serve_on(
         l2,
         RecvOptions {
-            compress: false,
             enable_chunked: false,
             ..opts_resident(dir.path().join("o2"), None)
         },
     ));
-    assert_eq!(
-        probe(a2).await,
-        CAP_RESUME_FILE | CAP_RESUME_FOLDER,
-        "位必须随选项收敛"
-    );
+    assert_eq!(probe(a2).await, 0x01, "位必须随选项收敛");
     s1.abort();
     s2.abort();
 }
@@ -226,39 +218,41 @@ async fn resume_survives_interrupted_transfer() {
         opts_resident(out.clone(), None),
     ));
 
-    // 手工发送 0x03 头 + 一半载荷后掐断（模拟瞬断）。
+    // 手工发送 0x03 头（C# 方言：sid 与 send_file_auto 同派生）+ 一半载荷后掐断。
     let name = "big.bin";
+    let full = sha256_file(&src).unwrap();
+    let sid = trft_core::transfer::cswire::derive_resume_session_guid(&src, data.len() as u64, a1);
     {
+        use tokio::io::AsyncWriteExt;
         let mut s = TcpStream::connect(a1).await.unwrap();
-        write_u8(&mut s, trft_core::protocol::frame::T_RESUME_FILE)
-            .await
-            .unwrap();
-        write_str_u16(&mut s, name).await.unwrap();
-        write_u64(&mut s, data.len() as u64).await.unwrap();
-        write_u64(&mut s, 0).await.unwrap();
-        write_u8(&mut s, 1).await.unwrap();
-        write_all(&mut s, &sha256_file(&src).unwrap())
-            .await
-            .unwrap();
-        // 协商应答。
-        assert_eq!(
-            read_u8(&mut s).await.unwrap(),
-            trft_core::protocol::frame::R_RESUME_NEGO
-        );
-        assert_eq!(read_u8(&mut s).await.unwrap(), 0x01);
-        let off = {
-            let mut b = [0u8; 8];
-            s.read_exact(&mut b).await.unwrap();
-            u64::from_le_bytes(b)
-        };
+        // [0x03][sid 16][total i64][offset i64][nameLen i32][name][flag 1][fullHash 32]
+        let mut hdr = vec![0x03u8];
+        hdr.extend_from_slice(&sid);
+        hdr.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes());
+        hdr.extend_from_slice(&(name.len() as i32).to_le_bytes());
+        hdr.extend_from_slice(name.as_bytes());
+        hdr.push(1);
+        hdr.extend_from_slice(&full);
+        s.write_all(&hdr).await.unwrap();
+        // 0x10 协商应答：[0x10][offset i64][status u8]。
+        let mut resp = [0u8; 10];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], 0x10);
+        assert_eq!(resp[9], 0x00, "首次协商 status 0");
+        let off = i64::from_le_bytes(resp[1..9].try_into().unwrap());
         assert_eq!(off, 0, "首次协商从 0 开始");
         s.write_all(&data[..data.len() / 2]).await.unwrap();
         // 半途掐断：不发尾哈希直接 drop。
         drop(s);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    // 半成品在盘上（重启/重连可恢复），但最终名不存在。
-    assert!(!out.join(name).exists());
+    // C# 方言 0x03 直接写最终名（无 .trft-part）：半成品在盘上，长度短于声明。
+    let partial = std::fs::metadata(out.join(name)).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        partial > 0 && partial < data.len() as u64,
+        "半成品应已落盘且短于声明（实际 {partial}）"
+    );
 
     // 重连 → 服务端从半成品长度接续。
     send_file_auto(a1, &src, &new_client_opts()).await.unwrap();
@@ -287,47 +281,63 @@ async fn coverage_query_reports_written_ranges() {
     let total: u64 = 3 * 1024 * 1024;
     let mut gid = [0u8; 16];
     OsRng.fill_bytes(&mut gid);
+    // 0x0A 协商 bit1（组会话 + 0x0B）——未协商时服务端不认块头里的组 id。
+    async fn connect_neg(addr: std::net::SocketAddr) -> TcpStream {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[0x0Au8, 0x02]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x1A, 0x03]);
+        s
+    }
     {
-        let mut s = TcpStream::connect(a1).await.unwrap();
-        // 块 0（[0,1MiB)）与块 2（[2MiB,3MiB)）——中间留洞。
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // 块 0（[0,1MiB)）与块 2（[2MiB,3MiB)）——中间留洞；每块一条连接
+        // （C# 方言一个连接只承载一个分块），尾随自身哈希。
         for off in [0u64, 2 * 1024 * 1024] {
-            write_u8(&mut s, T_CHUNKED).await.unwrap();
-            write_all(&mut s, &gid).await.unwrap();
-            write_u64(&mut s, off).await.unwrap();
-            write_u64(&mut s, total).await.unwrap();
-            write_str_u16(&mut s, name).await.unwrap();
-            write_u32(&mut s, 1024 * 1024).await.unwrap();
             let payload = vec![0xABu8; 1024 * 1024];
-            write_all(&mut s, &payload).await.unwrap();
+            let mut s = connect_neg(a1).await;
+            let mut hdr = vec![0x02u8];
+            hdr.extend_from_slice(&(total as i64).to_le_bytes());
+            hdr.extend_from_slice(&(off as i64).to_le_bytes());
+            hdr.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+            hdr.extend_from_slice(&(name.len() as i32).to_le_bytes());
+            hdr.extend_from_slice(name.as_bytes());
+            hdr.push(1);
+            hdr.extend_from_slice(&gid);
+            s.write_all(&hdr).await.unwrap();
+            s.write_all(&payload).await.unwrap();
+            s.write_all(&sha256(&payload)).await.unwrap();
+            // 服务端逐块判决（Rust 服务端对 0x02 写 1 字节 ACK）。
+            let mut ack = [0u8; 1];
+            s.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack[0], 0x01, "分块必须被收下");
         }
-        drop(s); // 不发 0x0C：连接结束但会话保留（覆盖查询的前提）
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 查询覆盖率。
-    let mut s = TcpStream::connect(a1).await.unwrap();
-    write_u8(&mut s, trft_core::protocol::frame::T_COVERAGE_QUERY)
-        .await
-        .unwrap();
-    write_all(&mut s, &gid).await.unwrap();
-    assert_eq!(read_u8(&mut s).await.unwrap(), 0x01, "会话必须存活");
-    let n = {
-        let mut b = [0u8; 4];
-        s.read_exact(&mut b).await.unwrap();
-        u32::from_le_bytes(b)
-    };
+    // 查询覆盖率：[0x1B][count i32][start i64][end i64]…
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut s = connect_neg(a1).await;
+    s.write_all(&[0x0Bu8]).await.unwrap();
+    s.write_all(&gid).await.unwrap();
+    let mut head = [0u8; 5];
+    s.read_exact(&mut head).await.unwrap();
+    assert_eq!(head[0], 0x1B, "覆盖应答类型");
+    let n = i32::from_le_bytes(head[1..5].try_into().unwrap());
     assert_eq!(n, 2, "两个不连续区间");
     let mut ranges = Vec::new();
     for _ in 0..n {
         let mut b = [0u8; 16];
         s.read_exact(&mut b).await.unwrap();
-        let off = u64::from_le_bytes(b[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(b[8..].try_into().unwrap());
-        ranges.push((off, len));
+        let start = i64::from_le_bytes(b[..8].try_into().unwrap());
+        let end = i64::from_le_bytes(b[8..].try_into().unwrap());
+        ranges.push((start, end));
     }
     assert_eq!(
         ranges,
-        vec![(0, 1024 * 1024), (2 * 1024 * 1024, 1024 * 1024)]
+        vec![(0, 1024 * 1024), (2 * 1024 * 1024, 3 * 1024 * 1024)]
     );
     s1.abort();
 }

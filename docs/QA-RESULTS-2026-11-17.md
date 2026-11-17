@@ -71,10 +71,29 @@
 |---|---|---|
 | trft（UDT）→ C# 2.14 服务端 | ✅ | C# 侧启动 UDT 18080、目录 `C:\Users\chen\interop\recv`；trft 发送 1 MiB，收到文件哈希 `f5664984…9d35` 与源一致 |
 | C# 2.14 客户端 → trft（UDT）接收端 | ✅ | C# 客户端选 UDT、127.0.0.1:18081、关加密/压缩，发送 1 MiB；trft 接收端最终名 `a11.bin`、哈希 `f5664984…9d35` 与源一致（发布完成有几秒延迟，首发列表会看到满长度 `.trft-part`） |
-| trft（TCP）→ C# 2.14 TCP 服务端 | ❌ **不互通（设计如此）** | C# 侧 TCP 18082 监听；trft 退出码 1、C# 日志「错误」、目录无落盘 |
+| trft（TCP）→ C# 2.14 TCP 服务端 | ✅ **2026-11-17 改造后互通** | 见下节「C# 2.14 TCP 互通改造」（改造前记录：trft 退出码 1、C# 日志「错误」、目录无落盘） |
 | trft（单向 UDP）→ C# 2.14 UDP 服务端 | ❌ **不互通（设计如此）** | C# 侧 UDP 18083 监听；trft 退出码 0（单向发送无回执，**不代表成功**）、C# 日志「错误」、目录无落盘 |
 
 驱动方式：`System.Windows.Automation`（UIA）按 AutomationId 设值/点按钮，无需前台焦点。
+
+## C# 2.14 TCP 互通改造（2026-11-17，CLI 驱动；TECH-STACK §7.56）
+
+TCP 槽位应用层并入 C# 方言后，用 C# 2.14.0.0 自带无头 CLI（`TrFileTransfer.exe send|recv|sync`）
+与 trft CLI 对打，全部 SHA-256 逐字节一致：
+
+| 方向 | 结果 | 证据 |
+|---|---|---|
+| trft（TCP）→ C# 2.14 TCP 服务端 | ✅ | 1 MiB；C# 日志「Resume: src.bin offset=0 … status=0」「Compression (deflate)」「Transfer complete」；落盘哈希一致（C# `Received: …src.bin`） |
+| C# 2.14 TCP 客户端 → trft 接收端 | ✅ | 1 MiB；C# 日志「Connected」「Compression (deflate)」「Transfer complete」；trft 落盘哈希一致 |
+| 配对码 + 0x09 加密（双向） | ✅ | C# 侧「Encrypted session established (AES-256)」/「Connection encrypted (AES-256)」+ 压缩；两侧落盘哈希一致 |
+| 目录 0x01（双向） | ✅ | 3 文件（含中文名/子目录）；C# 侧「Folder transfer complete: fold (3 files)」、trft 侧子目录与中文名完整 |
+| 差量同步 0x04（双向） | ✅ | C#→trft：会话目录 `fold.8e4228f9`；trft→C#：`fold.4b7ed953`（`<folder>.<guid8>`，与 C# 服务端同式） |
+| trft 文本 0x06 → C# | ✅ | C# 日志「Text received: …」 |
+| trft `--chunks` → C# 服务端 | ✅（回退） | C# 服务端对 0x02 不发判决 → 客户端按探针回退 0x03；**只落一份** `src.bin`（修复前会多出 `src_1.bin`） |
+| trft↔trft TCP 回归 | ✅ | 单文件 0x03 / `--chunks 4` 0x02（逐块判决）/ 目录 0x01；CLI 退出码 0、哈希一致 |
+
+驱动方式：`Start-Process` 起 C# CLI 与 trft CLI，日志/哈希比对；无需 UIA（C# CLI 与 GUI 共用同一
+`TransferClient`/`TransferServer` 线协议代码）。
 
 ## 未完成（需人工/其它环境）
 
@@ -82,13 +101,14 @@
 |---|---|
 | B1/B4/B5（0x00/0x03/0x04 掉电） | 与 B3 共用同一发布函数（`publish_part` / `public::move_replace`），代码路径已修复并有单测；剩余为逐路径真机复核，需再次断电 |
 | C1–C12（GUI 冒烟） | 视觉/交互项需人在控制台 |
-| C# 2.14 双向对打 | 需 C# GUI 操作（UDT 槽位） |
+| C# 2.14 GUI 级对打 | UDT/TCP 线协议已由 C# CLI 对打通过（同上节）；GUI 级（文件选择框、气泡）需人在控制台 |
+| TCP 槽位 GUI 冒烟 | 发送面板 TCP 路径由 CLI A 段 + C4 覆盖；改造后建议在真机 GUI 再点一遍（协议栈已换，UI 接线未变） |
 
 ## 运行观察
 
 1. **SMB 缓存/句柄**：同进程 `Get-ChildItem` 可能显示 0 字节；被远端进程持有句柄的文件读取失败——必须新进程复核。
 2. **远程执行**：`schtasks /S ... /U gogo /P a` 可用；带参数的 `/TR` 偶发不启动，改用**硬编码端口的 .bat** 更稳。
-3. **UDT 槽位 `--chunks` 回落 0x03**：0x02 只在 TCP/QUIC/RUDP 成立（A5b/A6/A14 覆盖 TCP）。
+3. **`--chunks` 的协议分叉**：TCP/UDT 走 C# 方言 0x02（UDT/TCP 服务端逐块判决）；对 **C# 服务端**（0x02 无判决）自动回退 0x03；QUIC/RUDP 走 v2 帧 0x02（A5b/A6/A14 覆盖 TCP 旧帧路径，改造后 TCP 由 §7.56 的 CLI 对打覆盖）。
 4. **锁定按来源 IP**：A12 后该 IP 10 分钟内不能做配对相关测试。
 
 ## 清理

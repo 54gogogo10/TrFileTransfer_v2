@@ -14,7 +14,8 @@ use crate::config::DuplicatePolicy;
 use crate::error::{proto, Error, Result};
 use crate::limiter::TokenBucket;
 use crate::transfer::receiver::{
-    confirm_once, conn_precheck, conn_settle, record_recv, resolve_save_dir, RecvOptions,
+    cleanup_part_orphans, confirm_once, conn_precheck, conn_settle, record_recv,
+    resolve_save_dir, tune_tcp, RecvOptions,
 };
 use crate::transfer::udt::{connect_udt, UdtStream};
 use aes::Aes256;
@@ -640,9 +641,12 @@ pub struct CsWire<S> {
     comp_w: Option<CsCompWrite>,
     /// 0x0A 能力探询的服务端应答位（未探询 = 0）。
     pub server_caps: u8,
+    /// 结尾 1 字节判决 ACK 的承载位置（C# 两种传输不同，见下面两个构造器）。
+    ack_on_wire: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> CsWire<S> {
+    /// UDT 槽位：结尾 ACK 走**裸流**（装饰器之外；C# TransferUdt 的 udt_recv 同款）。
     pub fn new(raw: S) -> Self {
         Self {
             raw,
@@ -651,7 +655,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> CsWire<S> {
             comp_r: None,
             comp_w: None,
             server_caps: 0,
+            ack_on_wire: false,
         }
+    }
+
+    /// TCP 槽位：结尾 ACK 走**应用层流**（经加密/压缩装饰器；C# ServerWire
+    /// CompletionAck 在 TCP 上写 active 装饰流，读侧同在装饰流内）。
+    pub fn new_tcp(raw: S) -> Self {
+        Self {
+            ack_on_wire: true,
+            ..Self::new(raw)
+        }
+    }
+
+    /// ACK 是否经装饰器栈（TCP=true / UDT=false）。
+    pub fn ack_on_wire(&self) -> bool {
+        self.ack_on_wire
     }
 
     /// w_* = 本端发送密钥，r_* = 本端接收密钥（调用方按角色推导）。
@@ -880,6 +899,18 @@ pub async fn cs_client_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(CsEcdhOutcome::Encrypted)
 }
 
+/// 认证前奏帧体读（30s 静默窗——发半个 0x09/0x05 就挂住的 peer 不得无限占连接与并发闸）。
+async fn prelude_read<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    out: &mut [u8],
+) -> Result<()> {
+    tokio::time::timeout(PRELUDE_IDLE, wire.raw.read_exact(out))
+        .await
+        .map_err(|_| proto("认证前奏静默超时（30s）"))?
+        .map_err(Error::Io)
+        .map(|_| ())
+}
+
 /// 服务端 0x09（HandleEcdhAuthAsync 同构）。Ok(true) = 已装入加密层；
 /// Ok(false) = 对端有码但本端未启用（status 2，同一连接继续明文）。
 pub async fn cs_server_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
@@ -890,7 +921,7 @@ pub async fn cs_server_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<bool> {
     use p256::ecdh::EphemeralSecret;
     let mut buf = [0u8; 32 + ECDH_PUBLIC_BYTES];
-    wire.raw.read_exact(&mut buf).await?;
+    prelude_read(wire, &mut buf).await?;
     let code_hash = buf[..32].to_vec();
     let c_pub = buf[32..].to_vec();
 
@@ -957,7 +988,7 @@ pub async fn cs_server_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(Error::AuthRejected("配对码校验失败".into()));
     }
     let mut confirm_c = [0u8; 32];
-    wire.raw.read_exact(&mut confirm_c).await?;
+    prelude_read(wire, &mut confirm_c).await?;
     let expect_c = cs_confirm(&auth_key, "c2s-confirm", &c_pub, &s_pub);
     if !ct_eq(&expect_c, &confirm_c) {
         opts.gate.lock().await.success(&peer.ip());
@@ -1004,7 +1035,7 @@ pub async fn cs_server_pairing<S: AsyncRead + AsyncWrite + Unpin>(
     opts: &RecvOptions,
 ) -> Result<()> {
     let mut hash = [0u8; 32];
-    wire.raw.read_exact(&mut hash).await?;
+    prelude_read(wire, &mut hash).await?;
     if opts.pairing_code.is_some() && opts.gate.lock().await.locked(&peer.ip()) {
         wire.raw_write(&[R_PAIRING, 1]).await?;
         return Err(Error::AuthRejected(format!(
@@ -1334,23 +1365,36 @@ fn sync_hash_of(
 pub struct CsOutcome {
     pub success: bool,
     pub is_chunked: bool,
+    /// 0x02 本次连接把组装器补满并完成发布（--count 只在此判定为「收到一份」，
+    /// 与 v2 帧 0x02 的 INCOMPLETE 不计入口径一致）。
+    pub chunk_complete: bool,
     /// 0x03 的终态应答（0x10）即判决——不再发裸 ACK。
     pub has_own_final_response: bool,
     pub rejected: bool,
 }
 
-/// UDT 连接的 C# 方言入口（serve_udt_on 每连接调用；镜像 receiver::handle_conn 形状）。
+/// 连接的 C# 方言入口（serve_udt_on / serve_tcp_on 每连接调用）。
+/// ack_on_wire：结尾判决 ACK 的承载位置（TCP = 装饰器流内；UDT = 裸流带外）。
 pub(crate) async fn handle_conn_cs<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     peer: SocketAddr,
     opts: &RecvOptions,
     served: Arc<AtomicU64>,
     state: Arc<CsServerState>,
+    ack_on_wire: bool,
 ) -> Result<()> {
     let _permit = conn_precheck(peer, opts).await?;
-    let r = conn_cs_inner(stream, peer, opts, &state).await;
-    // 限量模式计数口径与 TCP 同：只计成功处理的连接（被拒/失败不得消耗名额）。
-    let handled = if r.is_ok() { 1 } else { 0 };
+    let (r, outcome) = conn_cs_inner(stream, peer, opts, &state, ack_on_wire).await;
+    // 限量模式计数口径与 v2 帧同：只计**真实完成**的连接——被拒/失败/0x02 的
+    // 中间块（INCOMPLETE）都不得消耗名额（否则 --count 1 的分块发送收首块即退）。
+    let handled = if r.is_ok()
+        && outcome.success
+        && (!outcome.is_chunked || outcome.chunk_complete)
+    {
+        1
+    } else {
+        0
+    };
     conn_settle(&r, handled, peer, opts, &served).await;
     r
 }
@@ -1360,8 +1404,13 @@ async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     peer: SocketAddr,
     opts: &RecvOptions,
     state: &Arc<CsServerState>,
-) -> Result<()> {
-    let mut wire = CsWire::new(stream);
+    ack_on_wire: bool,
+) -> (Result<()>, CsOutcome) {
+    let mut wire = if ack_on_wire {
+        CsWire::new_tcp(stream)
+    } else {
+        CsWire::new(stream)
+    };
     let mut authed = false;
     let mut confirmed = false;
     let mut per_file_skip = false;
@@ -1380,8 +1429,17 @@ async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         &mut outcome,
     )
     .await;
+    // 认证前奏阶段的传输中断折算为认证失败（轮 UI-5 P1 口径，v2 帧同纪律）：
+    // 否则攻击者「发 1 字节 0x09 就断」即可无限烧 50k 轮 PBKDF2 并绕过配对锁定。
+    let res = match res {
+        Err(e) if !authed && opts.pairing_code.is_some() => {
+            Err(crate::transfer::receiver::pairing_phase_err(e, true))
+        }
+        other => other,
+    };
 
-    // 裸 ACK（UDT 特有：在装饰器之外）。0x03 自带终态应答，不发（与 C# 同）。
+    // 结尾 1 字节判决。0x03 自带终态应答（0x10），不发（与 C# 同）。
+    // 承载位置随传输：UDT 裸流（装饰器之外）/ TCP 应用层流（装饰器之内）。
     let ack = if outcome.rejected {
         Some(0x00u8)
     } else if outcome.is_chunked || !outcome.has_own_final_response {
@@ -1390,10 +1448,14 @@ async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         None
     };
     if let Some(b) = ack {
-        let _ = wire.raw_write(&[b]).await;
+        if wire.ack_on_wire() {
+            let _ = wire.write_all(&[b]).await;
+        } else {
+            let _ = wire.raw_write(&[b]).await;
+        }
     }
     let _ = wire.shutdown().await;
-    res
+    (res, outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1427,6 +1489,16 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
                     return Err(proto("前奏帧数超限"));
                 }
                 let code_ref = opts.pairing_code.clone().unwrap_or_default();
+                // RecvOptions.encrypt=false：本端明确拒绝 0x09 加密升级（v2 同口径，
+                // 规格 §5.1 的开关在 C# 方言槽位同样必须生效——不得静默加密/明文续）。
+                if !opts.encrypt {
+                    let mut resp = vec![R_ECDH, 1u8];
+                    resp.extend_from_slice(&[0u8; ECDH_PUBLIC_BYTES]);
+                    resp.extend_from_slice(&[0u8; 32]);
+                    let _ = wire.raw_write(&resp).await;
+                    outcome.rejected = true;
+                    return Err(Error::AuthRejected(format!("{peer}: 本端未启用加密（拒绝 0x09）")));
+                }
                 if cs_server_ecdh(wire, &code_ref, peer, opts).await? {
                     *authed = true;
                 }
@@ -1474,8 +1546,12 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 let mut caps = [0u8; 1];
                 wire.read_exact(&mut caps).await?;
+                // 能力位：bit0 = 0x04 逐文件跳过清单，bit1 = 0x02 组会话 + 0x0B。
+                // 默认全开（C# 服务端恒 0x03）；RecvOptions 关闭对应特性时置 0
+                // ——客户端据此跳过该特性（与 C# 客户端「bit 缺失即不用」同语义）。
+                let server_caps = (opts.enable_resume as u8) | ((opts.enable_chunked as u8) << 1);
                 // 同 0x08：0x1A 应答必须经装饰器栈（此时可能已压缩+加密）。
-                wire.write_all(&[R_CAPS, 0x03]).await?;
+                wire.write_all(&[R_CAPS, server_caps]).await?;
                 *per_file_skip = caps[0] & 0x01 != 0;
                 *chunk_sessions = caps[0] & 0x02 != 0;
             }
@@ -1504,6 +1580,16 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let hub = opts.progress.clone();
     let limiter_ref = &mut limiter;
 
+    // 特性门（RecvOptions.enable_chunked/enable_resume=false 模拟旧对端/显式关闭）：
+    // 关闭的帧集一律按「对端不认识该帧」处理——拒收并断连，客户端据此走降级路径。
+    if !opts.enable_chunked && matches!(transfer_type, F_CHUNK | F_COVER_Q) {
+        outcome.rejected = true;
+        return Err(Error::Rejected("本端未启用分块帧（0x02/0x0B）".into()));
+    }
+    if !opts.enable_resume && matches!(transfer_type, F_RESUME | F_FOLDER_RESUME) {
+        outcome.rejected = true;
+        return Err(Error::Rejected("本端未启用续传帧（0x03/0x04）".into()));
+    }
     match transfer_type {
         F_SINGLE => {
             handle_single_file(wire, peer, opts, &save_dir, confirmed, limiter_ref, hub.as_ref())
@@ -1516,7 +1602,7 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
         }
         F_CHUNK => {
             outcome.is_chunked = true;
-            let ok = handle_chunk(
+            let (ok, complete) = handle_chunk(
                 wire,
                 peer,
                 opts,
@@ -1529,6 +1615,7 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .await?;
             outcome.success = ok;
+            outcome.chunk_complete = complete;
         }
         F_RESUME => {
             let ok = handle_resume(
@@ -1609,9 +1696,80 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+
+/// TCP 槽位的 C# 方言 serve（互通改造：TCP 应用层与 UDT 同为 cswire）。
+/// CsServerState 提到 serve 层——分块组装器 / 断点会话 / 组归属跨连接共享，
+/// 与 serve_udt_on 同构（每连接只拿 Arc）。
+pub async fn serve_tcp_on(listener: tokio::net::TcpListener, opts: RecvOptions) -> Result<()> {
+    cleanup_part_orphans(&opts.save_dir);
+    crate::transfer::resume::cleanup_resume_orphans(&opts.save_dir);
+    let served = Arc::new(AtomicU64::new(0));
+    let state = Arc::new(CsServerState::default());
+    match opts.max_count {
+        // 限量模式（CLI --count）：串行处理，收满即停（与 v2 帧同口径：只有
+        // 真实完成的一次传输才计数——0x02 的中间块不计）。
+        Some(max) => loop {
+            if served.load(std::sync::atomic::Ordering::Relaxed) >= max {
+                return Ok(());
+            }
+            match listener.accept().await {
+                Ok((s, peer)) => {
+                    tune_tcp(&s);
+                    if let Err(e) =
+                        handle_conn_cs(s, peer, &opts, served.clone(), state.clone(), true).await
+                    {
+                        eprintln!("[连接失败] {e}");
+                    }
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        },
+        // 常驻模式：并发处理（并发闸在 conn_precheck 内）。
+        None => {
+            let mut set = tokio::task::JoinSet::new();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        tune_tcp(&stream);
+                        while set.try_join_next().is_some() {}
+                        let o = opts.clone();
+                        let counter = served.clone();
+                        let st = state.clone();
+                        set.spawn(async move {
+                            if let Err(e) =
+                                handle_conn_cs(stream, peer, &o, counter, st, true).await
+                            {
+                                eprintln!("[连接失败] {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        while set.join_next().await.is_some() {}
+                        return Err(Error::Io(e));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* ============ 帧处理器（服务端收） ============ */
 
 type CsReporter = Option<crate::progress::Reporter>;
+
+/// 接收进度卡注册（带对端 IP——GUI 设备徽标依赖；v2 帧 record 同口径）。
+fn register_recv(
+    hub: Option<&crate::progress::ProgressHub>,
+    peer: SocketAddr,
+    name: String,
+    total: u64,
+) -> CsReporter {
+    hub.map(|h| {
+        let r = h.register("recv", name, total);
+        r.set_peer(&peer.ip().to_string());
+        r
+    })
+}
 
 /// 收一个载荷到 `<save_path>.part-<rnd>` 临时文件并校验尾随 SHA-256；
 /// 哈希过了才换名（C# .part-<guid> 同策略，防半成品占名）。返回内容哈希。
@@ -1707,7 +1865,7 @@ async fn handle_single_file<S: AsyncRead + AsyncWrite + Unpin>(
     wire.read_exact(&mut name_buf).await?;
     let name = cs_safe_name(&String::from_utf8_lossy(&name_buf), "received_file");
     confirm_once(peer, opts, confirmed).await?;
-    let reporter = hub.map(|h| h.register("recv", name.clone(), size as u64));
+    let reporter = register_recv(hub, peer, name.clone(), size as u64);
     let base = save_dir.join(&name);
     let save_path = cs_unique_save_path(save_dir, &name);
     let hash = receive_payload(wire, &save_path, size as u64, &name, limiter, &reporter).await?;
@@ -1724,6 +1882,8 @@ async fn handle_single_file<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(r) = &reporter {
                 r.finish();
             }
+            // 跳过也要记一行（沿 v2 帧口径：detail=已存在（跳过），path=既有文件全路径）。
+            record_recv(opts, peer, 0, 1, Instant::now(), "已存在（跳过）", &base);
             return Ok(0);
         }
     }
@@ -1759,10 +1919,12 @@ async fn handle_folder<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(proto("0x01 文件数非法"));
     }
     confirm_once(peer, opts, confirmed).await?;
-    let reporter = hub.map(|h| h.register("recv", folder.clone(), 0));
+    let reporter = register_recv(hub, peer, folder.clone(), 0);
     let folder_dir = cs_unique_save_path(save_dir, &folder);
     std::fs::create_dir_all(&folder_dir)?;
     let mut total = 0u64;
+    // Skip 策略需要逐文件比对既有目录——收集 (rel, size, hash) 以便收尾归并。
+    let mut received: Vec<(String, u64, [u8; 32])> = Vec::new();
     for _ in 0..file_count {
         let mut fh = [0u8; 10];
         wire.read_exact(&mut fh).await?;
@@ -1783,11 +1945,61 @@ async fn handle_folder<S: AsyncRead + AsyncWrite + Unpin>(
             std::fs::create_dir_all(parent)?;
         }
         let display = format!("{folder}/{rel}");
-        receive_payload(wire, &save_path, size as u64, &display, limiter, &reporter).await?;
+        let hash =
+            receive_payload(wire, &save_path, size as u64, &display, limiter, &reporter).await?;
+        received.push((rel, size as u64, hash));
         total += size as u64;
         if let Some(r) = &reporter {
             r.add(1);
         }
+    }
+    // Skip 策略（目录级，对齐 v2 帧 0x01 语义）：重名根目录已存在时**复用**它，
+    // 逐文件比对——一致即丢弃新副本；不全一致才把新副本并入既有目录（冲突改名）。
+    // 绝不整目录改名为 lib_1（那正是 Skip 要避免的重复副本）。
+    let base = save_dir.join(&folder);
+    if opts.duplicate == DuplicatePolicy::Skip && folder_dir != base && base.is_dir() {
+        let mut all_dup = true;
+        let mut kept_bytes = 0u64;
+        let mut kept_files = 0u32;
+        for (rel, size, hash) in &received {
+            let src = folder_dir.join(rel);
+            let dest = base.join(rel);
+            let dup = std::fs::metadata(&dest)
+                .map(|m| m.len() == *size)
+                .unwrap_or(false)
+                && crate::hash::sha256_file(&dest)
+                    .map(|h| ct_eq(&h, hash))
+                    .unwrap_or(false);
+            if dup {
+                let _ = std::fs::remove_file(&src);
+                continue;
+            }
+            all_dup = false;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            cs_publish(&src, &dest).map_err(Error::Io)?;
+            kept_bytes += *size;
+            kept_files += 1;
+        }
+        let _ = std::fs::remove_dir_all(&folder_dir);
+        if let Some(r) = &reporter {
+            r.finish();
+        }
+        if all_dup {
+            // 整夹同内容副本：不落新副本、不记账（零传输的「已存在」）。
+            return Ok((0, 0));
+        }
+        record_recv(
+            opts,
+            peer,
+            kept_bytes,
+            kept_files,
+            Instant::now(),
+            "整夹发送",
+            &base,
+        );
+        return Ok((kept_bytes, kept_files));
     }
     if let Some(r) = &reporter {
         r.finish();
@@ -1807,7 +2019,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
     confirmed: &mut bool,
     limiter: &mut Option<TokenBucket>,
     hub: Option<&crate::progress::ProgressHub>,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let mut hdr = [0u8; 28];
     wire.read_exact(&mut hdr).await?;
     let total = i64::from_le_bytes(hdr[..8].try_into().expect("8B"));
@@ -1840,7 +2052,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
         None
     };
     confirm_once(peer, opts, confirmed).await?;
-    let reporter = hub.map(|h| h.register("recv", name.clone(), total as u64));
+    let reporter = register_recv(hub, peer, name.clone(), total as u64);
     let tracker_key = match &group_key {
         Some(g) => {
             // 组归属绑定（防外来 peer 写入他人组装——C# ChunkSessionPeers 同防线）。
@@ -1942,7 +2154,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             cs_release_declared(state, tr.total);
             let _ = std::fs::remove_file(&tr.save_path);
         }
-        return Ok(false);
+        return Ok((false, false));
     }
     if complete {
         let t = state
@@ -1979,7 +2191,8 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-    Ok(true)
+    // (本块哈希核对通过, 本块是否补满组装并完成发布)
+    Ok((true, complete))
 }
 
 impl CsChunkTracker {
@@ -2029,7 +2242,7 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
         None
     };
     confirm_once(peer, opts, confirmed).await?;
-    let reporter = hub.map(|h| h.register("recv", name.clone(), total as u64));
+    let reporter = register_recv(hub, peer, name.clone(), total as u64);
 
     let key = guid_hex(&sid);
     // 单飞锁（轮 6 P1——同名 sid 两连接并发 append 会交错写坏文件；C# ResumeLocks
@@ -2387,41 +2600,47 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok((false, 0, 0));
     }
     confirm_once(peer, opts, confirmed).await?;
-    let reporter = hub.map(|h| h.register("recv", folder.clone(), total_bytes as u64));
+    let reporter = register_recv(hub, peer, folder.clone(), total_bytes as u64);
     // 会话目录（确定性：<folder>.<guid8>——C# GetFolderSessionDir 同式，重复同步续用）。
     let dir = save_dir.join(format!("{folder}.{}", &guid_hex(&sid)[..8]));
     // 复用既有目录前先验包含性（junction/符号链接不得把落盘带出 save_dir）。
     ensure_contained(save_dir, &dir)?;
     std::fs::create_dir_all(&dir)?;
     ensure_contained(save_dir, &dir)?;
-    // 续点扫描：首个不完整条目（C# 同构）。
+    // 续点扫描：首个不完整条目（C# 同构）。strict（SyncVerifyContent）不采信
+    // 既有文件（缓存/盘上摘要），一律全量重收——与 v2 帧 0x04 的 strict 同口径
+    // （规格 §3.3；「同步逐字节核对」不得被摘要缓存短路）。
     let mut resume_index = file_count;
     let mut resume_offset = 0i64;
-    for (i, e) in manifest.iter().enumerate() {
-        let p = dir.join(&e.rel);
-        if !p.exists() {
-            resume_index = i as i32;
-            resume_offset = 0;
-            break;
-        }
-        let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        if len == e.size {
-            let actual = sync_hash_of(state, &p, e.size);
-            if ct_eq(&actual, &e.hash) {
-                continue;
+    if opts.strict_verify {
+        resume_index = 0;
+    } else {
+        for (i, e) in manifest.iter().enumerate() {
+            let p = dir.join(&e.rel);
+            if !p.exists() {
+                resume_index = i as i32;
+                resume_offset = 0;
+                break;
+            }
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if len == e.size {
+                let actual = sync_hash_of(state, &p, e.size);
+                if ct_eq(&actual, &e.hash) {
+                    continue;
+                }
+                resume_index = i as i32;
+                resume_offset = 0;
+                break;
+            }
+            if len > 0 && len < e.size {
+                resume_index = i as i32;
+                resume_offset = len as i64;
+                break;
             }
             resume_index = i as i32;
             resume_offset = 0;
             break;
         }
-        if len > 0 && len < e.size {
-            resume_index = i as i32;
-            resume_offset = len as i64;
-            break;
-        }
-        resume_index = i as i32;
-        resume_offset = 0;
-        break;
     }
     let status: u8 = if resume_index >= file_count {
         2
@@ -2469,7 +2688,8 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             let mut h = [0u8; 32];
             wire.read_exact(&mut h).await?;
             let p = dir.join(cs_sanitize_rel(&String::from_utf8_lossy(&pb)));
-            let identical = p.exists()
+            let identical = !opts.strict_verify
+                && p.exists()
                 && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) == e.size
                 && ct_eq(&sync_hash_of(state, &p, e.size), &e.hash);
             answers.push(if identical { 0u8 } else { 1u8 });
@@ -2653,10 +2873,19 @@ pub async fn cs_connect_tcp(
     addr: SocketAddr,
     opts: &crate::transfer::sender::SendOptions,
 ) -> Result<CsWire<tokio::net::TcpStream>> {
-    let stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(Error::Io)?;
-    Ok(cs_handshake(CsWire::new(stream), opts, 0).await?.0)
+    Ok(cs_connect_tcp_full(addr, opts, 0).await?.0)
+}
+
+/// 同 cs_connect_tcp，带 0x0A 能力探询位（0x01 = 0x04 逐文件跳过；0x02 = 0x02
+/// 分块组会话 + 0x0B 覆盖查询）。返回 (线, 服务端能力位)。
+pub async fn cs_connect_tcp_full(
+    addr: SocketAddr,
+    opts: &crate::transfer::sender::SendOptions,
+    caps_req: u8,
+) -> Result<(CsWire<tokio::net::TcpStream>, u8)> {
+    // 与 v2 发送端同口径的调优：连接超时 10s、src_port 绑定、NODELAY、4MB 缓冲。
+    let stream = crate::transfer::sender::connect(addr, opts.src_port).await?;
+    cs_handshake(CsWire::new_tcp(stream), opts, caps_req).await
 }
 
 /// 已建连流上的 C# 认证栈（UDT/TCP 共用）。
@@ -2727,7 +2956,16 @@ pub async fn cs_read_final_ack<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut CsWire<S>,
 ) -> Result<()> {
     let mut ack = [0u8; 1];
-    tokio::time::timeout(ACK_TIMEOUT, wire.raw_read_exact(&mut ack))
+    // TCP：判决经装饰器栈（C# ClientWire.ConfirmCompletionAsync 读 active 流）；
+    // UDT：裸流带外 ACK（C# RunUdtTransfer udt_recv 直读 socket）。
+    let read = async {
+        if wire.ack_on_wire() {
+            wire.read_exact(&mut ack).await
+        } else {
+            wire.raw_read_exact(&mut ack).await
+        }
+    };
+    tokio::time::timeout(ACK_TIMEOUT, read)
         .await
         .map_err(|_| proto("等待对端完成确认超时（30s）"))?
         .map_err(Error::Io)?;
@@ -2758,6 +2996,9 @@ pub async fn cs_send_file<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(crate::error::config_err("文件超过声明上限（1 PiB）"));
     }
     let reporter = opts.progress.as_ref();
+    if let Some(r) = reporter {
+        r.set_total(size);
+    }
 
     // [0x00][size i64][nameLen i32][name]
     let mut header = Vec::with_capacity(1 + 12 + name.len());
@@ -2835,6 +3076,13 @@ pub async fn cs_send_folder<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let reporter = opts.progress.as_ref();
+    if let Some(r) = reporter {
+        let total: u64 = files
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        r.set_total(total);
+    }
 
     // [0x01][folderNameLen i16][folderName][fileCount i32]
     let mut header = Vec::new();
@@ -2910,7 +3158,438 @@ pub async fn cs_send_text<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(bytes.len() as u64)
 }
 
-/* ============ 高层发送入口（sender.rs 的 Transport::Udt 分支调用） ============ */
+/* ============ 客户端：0x03 续传 / 0x02 分块（TCP 槽位，互通改造） ============ */
+
+/// 0x03 会话 GUID：稳定派生（同一文件 × 同一目标 → 同一会话），跨进程/重跑可续。
+/// 公开给集成测试构造「中断后重连」的同一会话（生产路径由本模块内部调用）。
+pub fn derive_resume_session_guid(path: &Path, size: u64, addr: SocketAddr) -> [u8; 16] {
+    use sha1::Digest as _;
+    let key = format!(
+        "resume|{}|{}|{}|{}",
+        path.to_string_lossy().to_lowercase(),
+        size,
+        addr.ip(),
+        addr.port()
+    );
+    let h = sha1::Sha1::digest(key.as_bytes());
+    h[..16].try_into().expect("SHA1 >= 16B")
+}
+
+/// 读 0x10 判决（10 字节：[0x10][offset i64][status u8]，长窗口）。EOF = 对端
+/// 不认 0x03（旧对端/未启用）→ Unsupported（调用方回退 0x00 全量）。
+async fn read_resume_response<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    what: &str,
+) -> Result<(u64, u8)> {
+    let mut resp = [0u8; 10];
+    let r = tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp)).await;
+    let eof = |e: &io::Error| e.kind() == io::ErrorKind::UnexpectedEof;
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if eof(&e) => {
+            return Err(Error::Unsupported(format!(
+                "对端未提供 0x03 续传判决（{what}）"
+            )))
+        }
+        Ok(Err(e)) => return Err(Error::Io(e)),
+        Err(_) => return Err(proto(format!("0x10 续传应答超时（300s，{what}）"))),
+    }
+    if resp[0] != R_RESUME {
+        return Err(proto(format!("0x10 续传应答类型不符（{what}）")));
+    }
+    let off = i64::from_le_bytes(resp[1..9].try_into().expect("8B"));
+    if off < 0 {
+        return Err(proto("续传应答偏移非法"));
+    }
+    Ok((off as u64, resp[9]))
+}
+
+/// 单次 0x03 发送（已建连的线）。返回本次实际发送字节（服务端已有 = 0）。
+/// claimed：整文件 SHA-256（调用方在建连之前算好——C# 同纪律）。
+pub(crate) async fn cs_send_file_resume_on<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    addr: SocketAddr,
+    path: &Path,
+    claimed: [u8; 32],
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<u64> {
+    let raw = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| crate::error::config_err("路径没有合法 UTF-8 文件名"))?;
+    let name = crate::protocol::frame::sanitize_name(raw)?;
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_file() {
+        return Err(crate::error::config_err("路径不是普通文件"));
+    }
+    let size = meta.len();
+    if size == 0 {
+        return Err(Error::Unsupported("空文件不走 0x03 续传".into()));
+    }
+    if size > CS_MAX_TRANSFER {
+        return Err(crate::error::config_err("文件超过声明上限（1 PiB）"));
+    }
+    let sid = derive_resume_session_guid(path, size, addr);
+    let reporter = opts.progress.as_ref();
+
+    // 头：[0x03][sessionId 16][total i64][resumeOffset i64][nameLen i32][name]
+    //     [verifyFlag 1][fullHash 32]。
+    let mut header = Vec::with_capacity(1 + 16 + 8 + 8 + 4 + name.len() + 33);
+    header.push(F_RESUME);
+    header.extend_from_slice(&sid);
+    header.extend_from_slice(&(size as i64).to_le_bytes());
+    header.extend_from_slice(&0i64.to_le_bytes());
+    header.extend_from_slice(&(name.len() as i32).to_le_bytes());
+    header.extend_from_slice(name.as_bytes());
+    header.push(1);
+    header.extend_from_slice(&claimed);
+    wire.write_all(&header).await?;
+
+    let (server_off, status) = read_resume_response(wire, "协商").await?;
+    match status {
+        0 | 1 => {}
+        2 => {
+            // 服务端已持有完整文件（同 sid 重试收敛）：零传输成功。
+            if let Some(r) = reporter {
+                r.set_total(size);
+                r.finish();
+            }
+            return Ok(0);
+        }
+        3 => {
+            return Err(Error::Rejected(
+                "服务端全文件校验失败（源文件已变化？需整文件重发）".into(),
+            ))
+        }
+        _ => return Err(proto(format!("0x10 续传状态未知: {status}"))),
+    }
+    if server_off > size {
+        return Err(proto(format!("续传偏移 {server_off} 超出文件大小 {size}")));
+    }
+    if let Some(r) = reporter {
+        r.set_total(size);
+    }
+
+    // 从服务端权威偏移起发送 + 增量 SHA-256（服务端对续传文件按增量核对）。
+    let mut f = tokio::fs::File::open(path).await?;
+    use tokio::io::AsyncSeekExt as _;
+    f.seek(std::io::SeekFrom::Start(server_off)).await?;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut lim = TokenBucket::new(opts.speed_limit_bps);
+    let mut buf = vec![0u8; crate::transfer::CHUNK];
+    let mut remaining = size - server_off;
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        let n = f.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{name}: 源文件读取提前结束"),
+            )));
+        }
+        lim.acquire(n as u64).await;
+        hasher.update(&buf[..n]);
+        wire.write_all(&buf[..n]).await?;
+        if let Some(r) = reporter {
+            r.add(n as u64);
+        }
+        remaining -= n as u64;
+    }
+    let inc: [u8; 32] = hasher.finalize().into();
+    wire.write_all(&inc).await?;
+
+    let (_, fin) = read_resume_response(wire, "终态").await?;
+    match fin {
+        2 => {
+            if let Some(r) = reporter {
+                r.finish();
+            }
+            Ok(size - server_off)
+        }
+        3 => Err(Error::Rejected(
+            "服务端全文件校验失败（服务端已丢弃该文件）".into(),
+        )),
+        _ => Err(proto(format!("0x10 续传终态未知: {fin}"))),
+    }
+}
+
+/// 0x03 的 TCP 单次尝试（建连 + 握手 + 发送）。
+pub(crate) async fn cs_send_file_resume_tcp_once(
+    addr: SocketAddr,
+    path: &Path,
+    claimed: [u8; 32],
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<u64> {
+    let mut wire = cs_connect_tcp(addr, opts).await?;
+    let n = cs_send_file_resume_on(&mut wire, addr, path, claimed, opts).await?;
+    let _ = wire.shutdown().await;
+    Ok(n)
+}
+
+/// 发一个 0x02 分块（已建连的线，能力位 0x02 已协商）。判决 = 服务端对 0x02
+/// 写的 1 字节 ACK（Rust 服务端总发；C# 服务端不发 → EOF → Unsupported）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cs_send_chunk_on<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    name: &str,
+    path: &Path,
+    offset: u64,
+    len: u64,
+    total: u64,
+    group: Option<[u8; 16]>,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<()> {
+    // 头：[0x02][total i64][offset i64][chunk i64][nameLen i32][name][flag 1 + gid 16]?
+    let mut header = Vec::with_capacity(1 + 28 + name.len() + 17);
+    header.push(F_CHUNK);
+    header.extend_from_slice(&(total as i64).to_le_bytes());
+    header.extend_from_slice(&(offset as i64).to_le_bytes());
+    header.extend_from_slice(&(len as i64).to_le_bytes());
+    header.extend_from_slice(&(name.len() as i32).to_le_bytes());
+    header.extend_from_slice(name.as_bytes());
+    if let Some(g) = group {
+        header.push(1);
+        header.extend_from_slice(&g);
+    }
+    wire.write_all(&header).await?;
+
+    let mut f = tokio::fs::File::open(path).await?;
+    use tokio::io::AsyncSeekExt as _;
+    f.seek(std::io::SeekFrom::Start(offset)).await?;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut lim = TokenBucket::new(opts.speed_limit_bps);
+    let mut buf = vec![0u8; crate::transfer::CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        let n = f.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{name}: 源文件读取提前结束"),
+            )));
+        }
+        lim.acquire(n as u64).await;
+        hasher.update(&buf[..n]);
+        wire.write_all(&buf[..n]).await?;
+        if let Some(r) = &opts.progress {
+            r.add(n as u64);
+        }
+        remaining -= n as u64;
+    }
+    let hash: [u8; 32] = hasher.finalize().into();
+    wire.write_all(&hash).await?;
+
+    // 判决：0x01 收下（含本块补满并已发布）/ 0x00 拒绝 / EOF = 对端不发判决。
+    let mut ack = [0u8; 1];
+    let read = async {
+        if wire.ack_on_wire() {
+            wire.read_exact(&mut ack).await
+        } else {
+            wire.raw_read_exact(&mut ack).await
+        }
+    };
+    match tokio::time::timeout(ACK_TIMEOUT, read).await {
+        Ok(Ok(())) => match ack[0] {
+            0x01 => Ok(()),
+            0x00 => Err(Error::Rejected("分块被对端拒绝（哈希或会话）".into())),
+            other => Err(proto(format!("分块判决字节异常: 0x{other:02X}"))),
+        },
+        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Err(Error::Unsupported(
+            "对端不提供 0x02 分块判决（旧对端），需回退整文件发送".into(),
+        )),
+        Ok(Err(e)) => Err(Error::Io(e)),
+        Err(_) => Err(proto("分块判决超时（30s）")),
+    }
+}
+
+
+
+/// 单块单连接发送（含 3 次网络重试；判决类错误不重试）。分块编排与探针共用。
+#[allow(clippy::too_many_arguments)]
+async fn send_chunk_conn_once(
+    addr: SocketAddr,
+    opts: &crate::transfer::sender::SendOptions,
+    path: &Path,
+    name: &str,
+    range: (u64, u64),
+    size: u64,
+    gid: [u8; 16],
+) -> Result<()> {
+    let mut last: Option<Error> = None;
+    for _ in 0..3 {
+        let attempt = async {
+            let (mut wire, caps) = cs_connect_tcp_full(addr, opts, 0x02).await?;
+            if caps & 0x02 == 0 {
+                return Err(Error::Unsupported(
+                    "对端不支持 0x02 分块组会话（旧对端）".into(),
+                ));
+            }
+            cs_send_chunk_on(&mut wire, name, path, range.0, range.1 - range.0, size, Some(gid), opts)
+                .await?;
+            let _ = wire.shutdown().await;
+            Ok(())
+        }
+        .await;
+        match attempt {
+            Ok(()) => return Ok(()),
+            // 判决类（旧对端/被拒/配置）不重试：重试只会重复同一结果。
+            Err(e @ Error::Unsupported(_))
+            | Err(e @ Error::Rejected(_))
+            | Err(e @ Error::Config(_)) => return Err(e),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| proto("分块重试耗尽")))
+}
+
+/// 0x02 探针建连：要求服务端 caps bit1（组会话 + 逐块判决），否则 Unsupported。
+async fn cs_connect_tcp_probe(
+    addr: SocketAddr,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<CsWire<tokio::net::TcpStream>> {
+    let (wire, caps) = cs_connect_tcp_full(addr, opts, 0x02).await?;
+    if caps & 0x02 == 0 {
+        return Err(Error::Unsupported(
+            "对端不支持 0x02 分块组会话（旧对端）".into(),
+        ));
+    }
+    Ok(wire)
+}
+
+/// TCP 槽位并行分块（C# 0x02：一连接一块 + 组会话 id）。每块等 Rust 服务端的
+/// 1 字节判决；C# 服务端不发判决 → Unsupported（调用方回退整文件发送）。
+pub async fn send_file_chunked_cs_tcp(
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+    connections: u8,
+) -> Result<()> {
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
+    let raw = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| crate::error::config_err("路径没有合法 UTF-8 文件名"))?;
+    let name = crate::protocol::frame::sanitize_name(raw)?;
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_file() {
+        return Err(crate::error::config_err("路径不是普通文件"));
+    }
+    let size = meta.len();
+    if size == 0 {
+        return Err(crate::error::config_err(
+            "分块传输不支持空文件（应改为直接发送）",
+        ));
+    }
+    if size > CS_MAX_TRANSFER {
+        return Err(crate::error::config_err("文件超过声明上限（1 PiB）"));
+    }
+    // 组 id 每次调用全新：源文件变化必须换组全量重发（v2 帧 0x02 同纪律）。
+    let mut gid = [0u8; 16];
+    {
+        use rand_core::RngCore as _;
+        rand_core::OsRng.fill_bytes(&mut gid);
+    }
+    let ranges = crate::transfer::chunked::split_ranges(size, connections.clamp(1, 8) as usize);
+    let started = Instant::now();
+    if let Some(r) = &opts.progress {
+        r.set_total(size);
+    }
+    // 能力探针（实机教训）：C# 服务端对 0x02 不发判决，若先发真分块再回退，
+    // 对端已建组装器占住最终名 → 0x03 回退落成 src_1.bin（重复文件）。
+    // 用**非法头**（chunk=0）探判决能力：两侧都会在解析头时直接拒绝、不建组装器、
+    // 不落盘；Rust 服务端回 1 字节 0x00，C# 服务端直接断连（EOF）。
+    {
+        let mut wire = cs_connect_tcp_probe(addr, opts).await?;
+        let mut hdr = vec![0x02u8];
+        hdr.extend_from_slice(&(size as i64).to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes()); // chunk = 0 → 非法头
+        hdr.extend_from_slice(&1i32.to_le_bytes());
+        hdr.push(b'x');
+        wire.write_all(&hdr).await?;
+        let mut ack = [0u8; 1];
+        match tokio::time::timeout(ACK_TIMEOUT, wire.read_exact(&mut ack)).await {
+            Ok(Ok(())) => { /* 有判决（本仓库服务端） */ }
+            Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(Error::Unsupported(
+                    "对端不提供 0x02 分块判决（C# 服务端不发），改用整文件续传".into(),
+                ))
+            }
+            Ok(Err(e)) => return Err(Error::Io(e)),
+            Err(_) => return Err(proto("0x02 能力探针超时（30s）")),
+        }
+        let _ = wire.shutdown().await;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for range in ranges {
+        let opts2 = opts.clone();
+        let path2 = path.to_path_buf();
+        let name2 = name.clone();
+        set.spawn(async move {
+            send_chunk_conn_once(addr, &opts2, &path2, &name2, range, size, gid).await
+        });
+    }
+    let mut results: Vec<Result<()>> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        results.push(joined.map_err(|e| proto(e.to_string())).and_then(|r| r));
+    }
+    if let Some(e) = results.iter().find_map(|r| match r {
+        Err(Error::Unsupported(m)) => Some(Error::Unsupported(m.clone())),
+        _ => None,
+    }) {
+        return Err(e);
+    }
+    if let Some(e) = results.iter().find_map(|r| match r {
+        Err(Error::Rejected(m)) => Some(Error::Rejected(m.clone())),
+        Err(Error::Config(m)) => Some(Error::Config(m.clone())),
+        _ => None,
+    }) {
+        return Err(e);
+    }
+    if let Some(e) = results.iter().find_map(|r| match r {
+        Err(Error::Io(e)) => Some(Error::Io(io::Error::new(e.kind(), e.to_string()))),
+        Err(Error::Protocol(m)) => Some(proto(m.clone())),
+        Err(Error::AuthRejected(m)) => Some(Error::AuthRejected(m.clone())),
+        Err(Error::Crypto(m)) => Some(Error::Crypto(m.clone())),
+        _ => None,
+    }) {
+        return Err(e);
+    }
+    outcome.finish();
+    crate::transfer::sender::record_stats(
+        opts,
+        addr,
+        size,
+        1,
+        started,
+        &format!("分块传输×{connections}"),
+        &name,
+    );
+    Ok(())
+}
+
+/* ============ 高层发送入口（sender.rs 的 Transport::Udt/Tcp 分支调用） ============ */
+
+/// 0x00 发送体（已建连、已认证的线；UDT/TCP 共用）+ 发送侧统计。
+pub(crate) async fn send_file_cs_on<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+    started: Instant,
+) -> Result<()> {
+    let bytes = cs_send_file(wire, path, opts).await?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    crate::transfer::sender::record_stats(opts, addr, bytes, 1, started, "单文件", &name);
+    Ok(())
+}
 
 /// UDT 槽位发单文件（建连 + 认证 + 0x00 + 统计）。
 pub async fn send_file_cs(
@@ -2922,14 +3601,29 @@ pub async fn send_file_cs(
     let started = Instant::now();
     let res = async {
         let mut wire = cs_connect_stack(addr, opts).await?;
-        let bytes = cs_send_file(&mut wire, path, opts).await?;
+        send_file_cs_on(&mut wire, addr, path, opts, started).await?;
         let _ = wire.shutdown().await;
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-        crate::transfer::sender::record_stats(opts, addr, bytes, 1, started, "单文件", &name);
+        Ok(())
+    }
+    .await;
+    if res.is_ok() {
+        outcome.finish();
+    }
+    res
+}
+
+/// TCP 槽位发单文件（同一 C# 方言应用层；互通改造——TCP 与 UDT 共用 0x00）。
+pub async fn send_file_cs_tcp(
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<()> {
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
+    let started = Instant::now();
+    let res = async {
+        let mut wire = cs_connect_tcp(addr, opts).await?;
+        send_file_cs_on(&mut wire, addr, path, opts, started).await?;
+        let _ = wire.shutdown().await;
         Ok(())
     }
     .await;
@@ -3080,12 +3774,18 @@ pub(crate) async fn cs_send_folder_sync<S: AsyncRead + AsyncWrite + Unpin>(
         wire.write_all(&m).await?;
     }
 
-    // 0x11 判决（长窗口）。
+    // 0x11 判决（长窗口）。EOF = 对端不认 0x04（旧对端/未启用）→ Unsupported。
     let mut resp = [0u8; 18];
-    tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp))
-        .await
-        .map_err(|_| proto("0x11 同步判决应答超时（300s）"))?
-        .map_err(Error::Io)?;
+    match tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(Error::Unsupported(
+                "对端不支持文件夹同步（0x04，旧对端或未启用）".into(),
+            ))
+        }
+        Ok(Err(e)) => return Err(Error::Io(e)),
+        Err(_) => return Err(proto("0x11 同步判决应答超时（300s）")),
+    }
     if resp[0] == 0x00 {
         // 接收前确认未通过：服务端写判决字节后拒绝（C# C_RejectedByPeer 同判）。
         return Err(Error::Rejected("被对端拒绝接收（接收前确认未通过）".into()));
@@ -3212,6 +3912,27 @@ pub(crate) async fn cs_send_folder_sync<S: AsyncRead + AsyncWrite + Unpin>(
     Ok((sent_bytes, sent_files))
 }
 
+/// 0x04 差量同步的公共尾段（清单 → 头/清单流 → 判决 → 差量发送 → 统计）。
+#[allow(clippy::too_many_arguments)]
+async fn folder_sync_cs_after_connect<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    addr: SocketAddr,
+    path: &Path,
+    manifest: &CsSyncManifest,
+    caps: u8,
+    opts: &crate::transfer::sender::SendOptions,
+    started: Instant,
+    name: &str,
+) -> Result<()> {
+    let per_file_skip = caps & 0x01 != 0;
+    let sid = derive_sync_session_guid(&path.to_string_lossy(), &addr.ip().to_string(), addr.port());
+    let (bytes, files) =
+        cs_send_folder_sync(wire, manifest, sid, per_file_skip, opts).await?;
+    let _ = wire.shutdown().await;
+    crate::transfer::sender::record_stats(opts, addr, bytes, files, started, "文件夹同步", name);
+    Ok(())
+}
+
 /// UDT 槽位差量同步（v2 → C# 0x04；会话 GUID 与 C# DeriveSyncSession 同式，
 /// 同一 (folder, target) 的重复同步与 C# 客户端互相接力）。
 pub async fn send_folder_sync_cs(
@@ -3233,20 +3954,66 @@ pub async fn send_folder_sync_cs(
         let manifest = build_sync_manifest(path, client_cache).await?;
         // 0x01 能力位（逐文件跳过清单）随认证栈协商。
         let (mut wire, caps) = cs_connect_stack_full(addr, opts, 0x01).await?;
-        let per_file_skip = caps & 0x01 != 0;
-        let sid =
-            derive_sync_session_guid(&path.to_string_lossy(), &addr.ip().to_string(), addr.port());
-        let (bytes, files) =
-            cs_send_folder_sync(&mut wire, &manifest, sid, per_file_skip, opts).await?;
-        let _ = wire.shutdown().await;
-        crate::transfer::sender::record_stats(opts, addr, bytes, files, started, "文件夹同步", &name);
-        Ok(())
+        folder_sync_cs_after_connect(
+            &mut wire, addr, path, &manifest, caps, opts, started, &name,
+        )
+        .await
     }
     .await;
     if res.is_ok() {
         outcome.finish();
     }
     res
+}
+
+/// TCP 槽位差量同步（0x04，C# 方言）——Tcp 与 Udt 同一应用层。
+pub async fn send_folder_sync_cs_tcp(
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+    client_cache: Option<&std::sync::Arc<tokio::sync::Mutex<crate::hashcache::HashCache>>>,
+) -> Result<()> {
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
+    let started = Instant::now();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("folder")
+        .to_string();
+    let res = async {
+        let manifest = build_sync_manifest(path, client_cache).await?;
+        let (mut wire, caps) = cs_connect_tcp_full(addr, opts, 0x01).await?;
+        folder_sync_cs_after_connect(
+            &mut wire, addr, path, &manifest, caps, opts, started, &name,
+        )
+        .await
+    }
+    .await;
+    if res.is_ok() {
+        outcome.finish();
+    }
+    res
+}
+
+/// 0x01 发送体（已建连的线；UDT/TCP 共用）+ 发送侧统计。
+pub(crate) async fn send_folder_cs_on<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+    started: Instant,
+) -> Result<()> {
+    let (bytes, files) = cs_send_folder(wire, path, opts).await?;
+    crate::transfer::sender::record_stats(
+        opts,
+        addr,
+        bytes,
+        files,
+        started,
+        "目录",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("目录"),
+    );
+    Ok(())
 }
 
 /// UDT 槽位发目录（建连 + 认证 + 0x01 + 统计）。
@@ -3259,19 +4026,8 @@ pub async fn send_folder_cs(
     let started = Instant::now();
     let res = async {
         let mut wire = cs_connect_stack(addr, opts).await?;
-        let (bytes, files) = cs_send_folder(&mut wire, path, opts).await?;
+        send_folder_cs_on(&mut wire, addr, path, opts, started).await?;
         let _ = wire.shutdown().await;
-        crate::transfer::sender::record_stats(
-            opts,
-            addr,
-            bytes,
-            files,
-            started,
-            "目录",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("目录"),
-        );
         Ok(())
     }
     .await;
@@ -3279,6 +4035,43 @@ pub async fn send_folder_cs(
         outcome.finish();
     }
     res
+}
+
+/// TCP 槽位发目录（0x01，C# 方言）。
+pub async fn send_folder_cs_tcp(
+    addr: SocketAddr,
+    path: &Path,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<()> {
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
+    let started = Instant::now();
+    let res = async {
+        let mut wire = cs_connect_tcp(addr, opts).await?;
+        send_folder_cs_on(&mut wire, addr, path, opts, started).await?;
+        let _ = wire.shutdown().await;
+        Ok(())
+    }
+    .await;
+    if res.is_ok() {
+        outcome.finish();
+    }
+    res
+}
+
+/// 0x06 发送体（已建连的线；UDT/TCP 共用）+ 发送侧统计。
+pub(crate) async fn send_text_cs_on<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut CsWire<S>,
+    addr: SocketAddr,
+    text: &str,
+    opts: &crate::transfer::sender::SendOptions,
+    started: Instant,
+) -> Result<()> {
+    if let Some(r) = &opts.progress {
+        r.set_total(text.len() as u64);
+    }
+    let n = cs_send_text(wire, text).await?;
+    crate::transfer::sender::record_stats(opts, addr, n, 0, started, "文本消息", "<文本>");
+    Ok(())
 }
 
 /// UDT 槽位发文本（建连 + 认证 + 0x06 + 统计）。
@@ -3289,9 +4082,21 @@ pub async fn send_text_cs(
 ) -> Result<()> {
     let started = Instant::now();
     let mut wire = cs_connect_stack(addr, opts).await?;
-    let n = cs_send_text(&mut wire, text).await?;
+    send_text_cs_on(&mut wire, addr, text, opts, started).await?;
     let _ = wire.shutdown().await;
-    crate::transfer::sender::record_stats(opts, addr, n, 0, started, "文本消息", "<文本>");
+    Ok(())
+}
+
+/// TCP 槽位发文本（0x06，C# 方言）。
+pub async fn send_text_cs_tcp(
+    addr: SocketAddr,
+    text: &str,
+    opts: &crate::transfer::sender::SendOptions,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut wire = cs_connect_tcp(addr, opts).await?;
+    send_text_cs_on(&mut wire, addr, text, opts, started).await?;
+    let _ = wire.shutdown().await;
     Ok(())
 }
 

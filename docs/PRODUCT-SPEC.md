@@ -46,7 +46,7 @@
 
 1. **完整性优先** —— 每个文件带 SHA-256 并在接收端重算比对；服务端对续传偏移、完成判定拥有权威；对「结果未知却报成功」零容忍。
 2. **免安装单文件** —— 逻辑层 + UI 编译为单个 exe，**无原生库依赖**（QUIC = quinn 纯 Rust、RUDP = 原生 Rust 自研、UDT4 = 原生 Rust 复刻 libudt 4.x——与原 C# 版的 udt.dll P/Invoke 不同，运行时零提取零注册）；不写注册表（除可选的开机自启）、无服务、无驱动。
-3. **协议谱系完整** —— 同一套线协议跑在四种传输上：TCP（通用）、QUIC（加密 + 指纹钉扎）、RUDP（自研可靠 UDP 流，弱网；曾名 UDT）、裸 UDP 单向（多轮重发 + Reed-Solomon 前向纠错，无回传链路）；另加第 5 槽位 **UDT**（原生 Rust 复刻 libudt 4.x + C# 方言应用层——与原 C# 版 2.14 直接互传，TECH-STACK §7.30）。
+3. **协议谱系完整** —— 五种传输：TCP（通用，与原 C# 版 TCP 应用层逐字节互通）、QUIC（加密 + 指纹钉扎）、RUDP（自研可靠 UDP 流，弱网；曾名 UDT）、裸 UDP 单向（多轮重发 + Reed-Solomon 前向纠错，无回传链路）、**UDT**（原生 Rust 复刻 libudt 4.x）。TCP 与 UDT 共用 C# 方言应用层，均与原 C# 版 2.14 直接互传（TECH-STACK §7.30/§7.56）。
 4. **隐私与可控** —— 数据只在局域网内流动；更新源强制 https；接收侧具备认证、确认、过滤三层控制。
 
 ### 1.4 设计原则（产品工程宪法）
@@ -82,10 +82,10 @@
 
 | 协议 | 传输层 | 回传链路 | 配对码/加密/压缩 | 断点续传 | 适用 |
 |------|--------|----------|------------------|----------|------|
-| TCP | 可靠字节流 | 有 | 全部支持 | 0x03 / 0x04 / 分块覆盖率续传 | 通用、防火墙友好 |
+| TCP | 可靠字节流 | 有 | 全部支持（C# 方言：0x09 ECDH 需配对码，0x05 明文门，0x08 压缩） | 0x03 断点 / 0x04 目录同步 / 0x02 并发分块（组会话 + 0x0B） | 通用、防火墙友好；**与原 C# 版 2.14 TCP 互通**（WIRE-PROTOCOL §10，TECH-STACK §7.56） |
 | QUIC | QUIC（quinn，TLS 1.3 + 自签证书 + 0x0D 通道绑定） | 有 | 配对支持；机密性由 TLS 承担；压缩支持 | 同 TCP | 加密传输 / `--pin` 钉扎 |
 | RUDP | 自研可靠 UDP 流（`transfer::rudp`，ARQ+SACK+固定窗口；与 UDT4/任何外部协议不做包级互通，WIRE-PROTOCOL.md §7；曾名 UDT，见 §9.2 更名行） | 有 | 全部支持（线协议同 TCP，0x09 加密可选） | 同 TCP | 高丢包链路 |
-| UDT | 真 UDT4 协议（`transfer::udt` 引擎 + `transfer::cswire` C# 方言应用层；**唯一与原 C# 版 2.14 互通的槽位**——WIRE-PROTOCOL.md §9/§10，TECH-STACK §7.30） | 有 | 单文件/目录/文本收发 + 0x02 并发分块/0x03 断点/0x04 目录同步（接收 + `(Rust)` 差量同步客户端双向——会话 GUID 与 C# DeriveSyncSession 同式互认，TECH-STACK §7.31）（C# 方言全帧集）；0x09 ECDH 加密（CNG blob + PBKDF2-HMAC-SHA1，与 C# 逐字节互通） | C# 方言（小端、CNG 公钥 blob、裸流 1B ACK） | 与原 C# 版安装互传 |
+| UDT | 真 UDT4 协议（`transfer::udt` 引擎 + `transfer::cswire` C# 方言应用层；与原 C# 版 2.14 互通——WIRE-PROTOCOL.md §9/§10，TECH-STACK §7.30） | 有 | 单文件/目录/文本收发 + 0x02 并发分块/0x03 断点/0x04 目录同步（接收 + `(Rust)` 差量同步客户端双向——会话 GUID 与 C# DeriveSyncSession 同式互认，TECH-STACK §7.31）（C# 方言全帧集）；0x09 ECDH 加密（CNG blob + PBKDF2-HMAC-SHA1，与 C# 逐字节互通） | C# 方言（小端、CNG 公钥 blob、裸流 1B ACK） | 与原 C# 版安装互传 |
 | 单向 UDP | 裸 UDP 数据报 | **无** | **不支持**（无握手通道，帮助文案明示） | 「落盘即状态」：重发即续传 | 单向链路、极简接收端 |
 
 **通用传输行为**（四协议共用，除非注明）：
@@ -242,7 +242,7 @@
 
 ### 4.3 版本互通矩阵
 
-`(Rust)` 本实现**与原 C# 版不做互通承诺——唯一例外：UDT 槽位**（TECH-STACK §7.30：原生 Rust 复刻 libudt 4.x + C# 方言应用层，与 C# 2.14 实机双向对打通过；见 WIRE-PROTOCOL.md §9/§10）。其余槽位（TCP/QUIC/RUDP/单向 UDP）线协议帧语义同源但字节布局以 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md) 为准，且不实现 C# 版的 0x07/0x17 旧版加密通道。自互通正确性由自互通矩阵 e2e 钉住（`tests/e2e_interop.rs`）：新旧特性组合 × 降级路径全矩阵覆盖；UDT 槽位的互通正确性由 `tests/e2e_udt.rs`（C# 方言测试客户端）+ C# 实机对打记录（REVIEW-LOG §7.30 交付记录）钉住。
+`(Rust)` 本实现**与原 C# 版不做互通承诺——例外：TCP 与 UDT 两个槽位**（两者共用 C# 方言应用层：TCP 自 TECH-STACK §7.56、UDT 自 §7.30 起与 C# 2.14 实机双向对打通过；见 WIRE-PROTOCOL.md §9/§10）。其余槽位（QUIC/RUDP/单向 UDP）线协议帧语义同源但字节布局以 [WIRE-PROTOCOL.md](WIRE-PROTOCOL.md) 为准，且不实现 C# 版的 0x07/0x17 旧版加密通道。自互通正确性由自互通矩阵 e2e 钉住（`tests/e2e_interop.rs`）：新旧特性组合 × 降级路径全矩阵覆盖；方言槽位的互通正确性由 `tests/e2e_udt.rs`（C# 方言测试客户端）+ C# 实机对打记录（REVIEW-LOG §7.30/§7.56 交付记录）钉住。TCP 槽位的应用层语义与 v2 帧的差异（无码不加密、0x03 直写最终名、0x04 会话目录、C# 服务端 0x02 无判决）见 TECH-STACK §7.56「已知语义差异」。
 
 | 客户端 \ 服务器 | 同版本 | 旧特性集（能力协商未宣告） |
 |-----------------|--------|---------------------------|

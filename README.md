@@ -2,14 +2,14 @@
 
 **面向局域网的点对点文件传输工具**：单文件免安装、全程 SHA-256 完整性校验，覆盖「日常互传 → 增量备份 → 弱网 / 无回传链路 → 无头自动化」全谱系场景。
 
-> **English** — LAN peer-to-peer file transfer in a single executable: no install, end-to-end SHA-256 verification, five transports (TCP / QUIC / RUDP / **UDT (interop with the original C# edition)** / one-way UDP + Reed-Solomon FEC), GUI + CLI + web share. This README is primarily in Chinese; see [Docs](#文档) for design documents.
+> **English** — LAN peer-to-peer file transfer in a single executable: no install, end-to-end SHA-256 verification, five transports (TCP / QUIC / RUDP / UDT, with **TCP and UDT interoperating with the original C# edition** / one-way UDP + Reed-Solomon FEC), GUI + CLI + web share. This README is primarily in Chinese; see [Docs](#文档) for design documents.
 
 ---
 
 ## 特性
 
 - **四种传输协议**，同一套校验与续传能力：
-  - **TCP** —— 通用、防火墙友好；
+  - **TCP** —— 通用、防火墙友好；应用层与原 C# 版 TCP 逐字节互通（2026-11-17 改造：明文/压缩/0x09 加密/目录/同步，SHA-256 逐字节一致；TECH-STACK §7.56）；
   - **QUIC**（quinn）—— 传输层 TLS 1.3 加密 + 可选证书指纹钉扎（`--pin`）；
   - **RUDP** —— 原生 Rust 实现的自研可靠 UDP 流（ARQ + SACK 重传），高丢包 Wi-Fi 更稳；线协议与 TCP 完全一致，0x09 加密可选（曾名 UDT——因与 UDT4 协议重名更名，不做包级互通）；
   - **UDT** —— 原生 Rust 复刻 libudt 4.x + C# 方言应用层，**与原 C# 版 2.14 直接互传**（实机双向验证：明文/0x09 加密/目录/压缩，SHA-256 逐字节一致；TECH-STACK §7.30）；

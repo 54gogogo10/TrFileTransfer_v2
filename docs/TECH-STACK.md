@@ -436,6 +436,16 @@
 53. **Web 下载并发名额绑 body（轮 UI-5 续 7，2026-11-16）**：基线 295 → **296 项全绿**（clippy 无新增）。
    - 中间件把 permit 放进请求扩展（`PermitSlot`），下载处理器取出外包 `PermitReader`（持有 `OwnedSemaphorePermit` 的 `AsyncRead`）构造流式 body——名额随 body 销毁才归还；旧实现 permit 随中间件返回即释放，慢速下载可无限并发绕过 32 上限；判别：permit_reader_holds_permit_until_dropped。
 
+57. **TCP 槽位互通改造：TCP 应用层并入 C# 方言（2026-11-17）**：TCP 槽位改走 `transfer::cswire`（与 UDT 同一应用层），兑现「trft ↔ C# 2.14 TCP 双向互通」；v2 帧只保留 QUIC/RUDP。基线 299 维持全绿（本轮以迁移既有断言为主，未新增用例）。
+   - **分步**：① 服务端入口泛化到 `S: AsyncRead + AsyncWrite`、拆出 `cs_handshake`（665f99e，无行为变化）；② 收发两端接入 TCP + 判决 ACK 分叉 + 测试迁移（本次）。
+   - **判决 ACK 分叉（C# 同款）**：TCP 的结尾 1 字节判决写/读**装饰器流之内**；UDT 仍在裸流带外。`CsWire::new_tcp` 承载该差异；服务端 `handle_conn_cs(..., ack_on_wire)` 由 serve 层传入。
+   - **客户端补全**：新增 0x03 续传客户端（会话 GUID 由 (路径, 大小, 目标) 确定性派生，跨进程可续；`st=3` 全哈希不符显式失败）、0x02 并行分块客户端（组会话 + 逐块判决）、0x01/0x06/0x04 的 `_on`/`_tcp` 拆分；`sender/folder/resume/chunked` 的 TCP 分支全部改道 cswire，v2 路径在 `connect_stack` 对 TCP 显式短路（fail-closed）。
+   - **能力位与选项**：`RecvOptions.enable_resume/enable_chunked` 映射到 0x1A 的 bit0/bit1（默认 0x03，与 C# 相同）；关闭的帧集显式拒收（旧对端模拟语义保留）；`RecvOptions.encrypt=false` 时服务端拒收 0x09（配置开关在方言槽位同样生效）。
+   - **0x02 判决探针（实机教训）**：C# 服务端对 0x02 不发判决；若先发真分块再回退，对端已建组装器占住最终名 → 0x03 回退落成 `src_1.bin` 重复文件（真机复现）。改为先发**非法头**（chunk=0）探判决能力：两侧都在解析头时拒绝、不建组装器、不落盘；Rust 服务端回 1 字节 0x00，C# 服务端断连 → 客户端据此回退。
+   - **安全对齐**：认证前奏帧体读加 30s 静默窗（发半个 0x09 即挂的连接不得占闸）；认证前被中断的握手折算为 `AuthRejected` 计入配对锁定（否则「发 1 字节就断」可无限烧 PBKDF2 并绕过 10 次锁定门）；0x00 Skip 命中补记统计行（`已存在（跳过）` + 既有文件全路径）；目录级 Skip 语义在 0x01 落地（复用既有根目录逐文件比对，不再产生 `lib_1`）。
+   - **实机互通（C# 2.14.0.0 CLI，全部 SHA-256 逐字节一致）**：C#→trft TCP 单文件（明文/压缩、0x09 加密+配对码）、trft→C# TCP 单文件（0x03 明文/加密）、双向目录 0x01、双向差量同步 0x04（会话目录 `<folder>.<guid8>`）、trft→C# 文本 0x06、trft→C# `--chunks` 优雅回退 0x03（无重复落盘）；trft↔trft TCP 回归（单文件 0x03 / 分块 0x02 / 目录 0x01）同批通过。
+   - **已知语义差异**（协议固有，文档登记）：① 无配对码时 C# 方言不做 0x09（密钥源自配对码），v2 的「匿名加密」在 TCP 槽位不再存在；② 0x03 直接写最终名（无 `.trft-part` 中间态）；③ 0x04 落盘到确定性会话目录（与 C# 服务端一致），`send_folder_auto` 的 0x01→0x04 回退因此与 0x01 目录不共用落点；④ C# 服务端不给 0x02 判决，跨实现 `--chunks` 走回退；⑤ **与旧版 trft 的 TCP 线不互通**（v2 帧 → C# 方言属线格式替换；同版本自互通 + C# 2.14 互通由 e2e/实机覆盖，升级需两端同步）。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

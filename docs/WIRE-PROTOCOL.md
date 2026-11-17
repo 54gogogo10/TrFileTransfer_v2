@@ -3,7 +3,7 @@
 | 项 | 内容 |
 |------|------|
 | 文档性质 | **字节级协议权威**（产品级语义见 [PRODUCT-SPEC.md](PRODUCT-SPEC.md) §4；实现以 `trft-core::protocol` 与本文为准，二者由判别测试互锁） |
-| 适用范围 | 本 Rust 实现自互通；**与原 C# 版不做互通承诺——唯一例外：UDT 槽位**（§9，与原 C# 2.14 的 libudt 4.x + 其 TCP 同构应用协议互通，TECH-STACK §7.30） |
+| 适用范围 | 本 Rust 实现自互通；**与原 C# 版不做互通承诺——例外：TCP 与 UDT 两个槽位**（§10，与原 C# 2.14 的 TCP/UDT 应用层逐字节一致；TECH-STACK §7.30 与 §7.56）；QUIC/RUDP/单向 UDP 仍走 §3 的 v2 帧 |
 | 字节序 | 多字节整数一律**小端（LE）** |
 | 字符串 | UTF-8；`u16 长度 + 字节` 前缀式（下记 `str16`）；路径段以 `/` 分隔 |
 | 抽取基线 | M3'（2026-10-31）：0x00–0x06、0x08–0x0C、0x10/0x11/0x1A 全量落地 |
@@ -23,8 +23,11 @@ TCP / RUDP（自研可靠 UDP 流，§7）
 ```
 
 - 装饰器包裹顺序固定为 `encrypt(compress(plain))`——压缩内层、加密外层（规格 §4.1）。
-- QUIC 槽位：TLS 1.3 承担机密性，流上**先发 1 字节协议版本号 `0x02`** 再进帧层；
-  TCP 槽位无版本前缀（未知帧 fail-closed 兜底）。
+- **TCP 槽位的应用层是 §10 的 C# 方言**（2026-11-17 互通改造，TECH-STACK §7.56）：
+  TCP 上不再使用 §3 的 v2 帧布局；v2 帧只剩 QUIC / RUDP 两个槽位。TCP 的
+  认证/压缩/能力前奏与 0x00–0x06/0x0B 帧、结尾判决 ACK 全部与 C# 2.14 逐字节一致。
+- **QUIC 槽位**：TLS 1.3 承担机密性，流上**先发 1 字节协议版本号 `0x02`** 再进帧层。
+- QUIC 槽位无 v2 帧的版本前缀；未知帧 fail-closed 兜底。
 - RUDP 槽位（§7）：机密性由可选 0x09 承担（与 TCP 同口径），版本协商在 HS 包内完成
   （公共头 ver 字节），流上无版本前缀。
 - 前导组合顺序：认证在前（`0x09` 首选 → `0x05` 明文门）、`0x0A` 能力协商、`0x08` 压缩协商次之，
@@ -402,12 +405,18 @@ UDT 槽位是**逐字节复刻原 C# 版内嵌 libudt 4.x** 的第二条 UDP 可
 - 收尾：任一端 `poll_shutdown`/drop → SHUTDOWN 控制包 → 对端排空后读侧 EOF；
   无 RST 概念（中止 = 直接关）。
 
-## 10. C# 方言应用层（UDT 槽位专用；与 C# 版 TCP 协议同构）
+## 10. C# 方言应用层（TCP + UDT 两槽位；与 C# 版 TCP 协议逐字节一致）
 
-C# 版 UDT 槽位复用其 TCP 应用协议：**整数一律小端、UTF-8 名、每文件尾随
-32B SHA-256**，与 §3 的 v2 帧布局**不同**（字段顺序/长度编码均异——勿混用）。
-实现在 `trft-core::transfer::cswire`，权威参考 C# 版 `WireProtocol.cs`/
-`WireCrypto.cs`/`WireCompress.cs`。
+C# 版把同一套应用协议用在 TCP 与 UDT 两个槽位上。本实现自 2026-11-17 起让
+**TCP 槽位也走这一层**（`transfer::cswire`，与 UDT 共用代码）：**整数一律小端、
+UTF-8 名、每文件尾随 32B SHA-256**，与 §3 的 v2 帧布局**不同**（字段顺序/长度
+编码均异——勿混用）。权威参考 C# 版 `WireProtocol.cs`/`WireCrypto.cs`/
+`WireCompress.cs`。
+
+**判决 ACK 的承载位置随传输不同（C# 同款分叉）**：TCP 上写/读**装饰器流之内**
+（`ServerWire.CompletionAck`，加密/压缩都包裹它）；UDT 上写/读**裸流带外**
+（`UdtNative.udt_send/recv`，装饰器之外）。0x03 的终态应答（0x10）即判决，
+两种情况都不发 ACK。
 
 ### 10.1 前奏帧（挂传输类型前，≤8 帧任意顺序；客户端响应读超时 8s）
 
@@ -416,29 +425,29 @@ C# 版 UDT 槽位复用其 TCP 应用协议：**整数一律小端、UTF-8 名�
 | 0x09 ECDH | `[09][SHA256(code) 32][clientPub 72]` | `[19][st][serverPub 72][confirmS 32]` → 客户端 `[confirmC 32]` | st：0=加密 / 1=码错（拒） / 2=对端未配对（同连接明文续用）；P-256 ECDH，公钥 = CNG ECCPUBLICBLOB 72B `[magic "ECK1" **大端** FourCC][cbKey 32 LE][X 32 BE][Y 32 BE]`；材料 = SHA256(共享点 X)；authKey = SHA256(`"tf-ecdh-auth"`‖材料‖PBKDF2-HMAC-SHA1(code, SHA256(clientPub‖serverPub), 50000, 32B))；confirm = HMAC-SHA256(authKey, 标签‖clientPub‖serverPub)（标签 `s2c-confirm`/`c2s-confirm`）；会话密钥 = SHA256(SHA256(0x00×16‖authKey)‖purpose)（purpose `c2s-enc/c2s-mac/s2c-enc/s2c-mac`）；段 = `[seq i64 LE][len i32 LE][HMAC-SHA256 截 16][AES-256-CTR]`（计数器 0 起全 16B 大端递增、跨段持续、seq 逐方向递增，段 ≤256KB） |
 | 0x05 配对 | `[05][SHA256(code) 32]` | `[15][st]` | st 0=过 / 1=拒；服务端无码时 lenient 接受 |
 | 0x08 压缩 | `[08][随机 16]` | `[18][st]` | st 0=收 / 非 0=婉拒（同连接明文续用，不重连）；**认证前不得协商**（配对必需的服务端拒收） |
-| 0x0A 能力 | `[0A][caps]` | `[1A][0x03]` | bit0=0x04 每文件跳过清单、bit1=0x02 分块组会话 + 0x0B |
+| 0x0A 能力 | `[0A][caps]` | `[1A][0x03]` | bit0=0x04 每文件跳过清单、bit1=0x02 分块组会话 + 0x0B。C# 服务端恒回 0x03；本实现默认 0x03，`RecvOptions` 关闭对应特性时置 0（客户端按位缺失即不用） |
 
-层叠顺序：应用字节 → 0x08 deflate 段 → 0x09 加密段 → 裸流；
-**结尾 1 字节 ACK 走裸流**（装饰器之外——UDT 特有）。段格式（0x08）：
+层叠顺序：应用字节 → 0x08 deflate 段 → 0x09 加密段 → 裸流。结尾 1 字节 ACK：
+**TCP 走装饰器流内、UDT 走裸流带外**（见本节开头）。段格式（0x08）：
 `[len u32 LE | 0x80000000=stored][payload]`（raw deflate，≤64MB）。
 
-### 10.2 传输帧（v2 服务端收发全实现；v2 客户端发 0x00/0x01/0x06/0x04——0x04 为差量同步客户端，会话 GUID 与 C# DeriveSyncSession 同式，§7.31）
+### 10.2 传输帧（TCP/UDT 两端收发全实现；客户端已发 0x00/0x01/0x02/0x03/0x04/0x06/0x0B）
 
 | 帧 | 布局（LE） | 应答 |
 |---|---|---|
-| 0x00 单文件 | `[00][size i64][nameLen i32][name][data][sha256 32]` | 裸 ACK 0x01/0x00 |
-| 0x01 目录 | `[01][folderNameLen i16][folderName][fileCount i32]` + 每文件 `[size i64][pathLen i16][relPath][data][sha256 32]` | 裸 ACK |
-| 0x02 分块 | `[02][totalSize i64][chunkOffset i64][chunkSize i64][nameLen i32][name][groupFlag u8][groupId 16B ×flag=1][data][sha256 32]` | 每连接裸 ACK（组会话经 0x0A bit1 协商；范围合并组装，完成即 Complete） |
-| 0x03 断点 | `[03][sessionId 16B][totalSize i64][resumeOffset i64][nameLen i32][name][verifyFlag u8][fullHash 32 ×flag=1]` | `[10][offset i64][st]`（0 新传/1 续传/2 已完整/3 全哈希不符——**服务端权威 offset**）；收增量 + **增量 sha256** 后 `[10][total][2]`；0x03 不发裸 ACK |
+| 0x00 单文件 | `[00][size i64][nameLen i32][name][data][sha256 32]` | 判决 ACK 0x01/0x00 |
+| 0x01 目录 | `[01][folderNameLen i16][folderName][fileCount i32]` + 每文件 `[size i64][pathLen i16][relPath][data][sha256 32]` | 判决 ACK |
+| 0x02 分块 | `[02][totalSize i64][chunkOffset i64][chunkSize i64][nameLen i32][name][groupFlag u8][groupId 16B ×flag=1][data][sha256 32]` | 每连接判决 ACK（组会话经 0x0A bit1 协商；范围合并组装，完成即发布）。**C# 服务端不发这条 ACK**：客户端以「非法头探针」探测判决能力，缺失即回退整文件续传（避免对端已建组装器后再落一份 `name_1`） |
+| 0x03 断点 | `[03][sessionId 16B][totalSize i64][resumeOffset i64][nameLen i32][name][verifyFlag u8][fullHash 32 ×flag=1]` | `[10][offset i64][st]`（0 新传/1 续传/2 已完整/3 全哈希不符——**服务端权威 offset**）；收增量 + **增量 sha256** 后 `[10][total][2]`；0x03 不发判决 ACK |
 | 0x04 目录续传 | `[04][sessionId 16][folderNameLen i16][folderName][fileCount i32][totalBytes i64]` + 清单 `[size i64][pathLen i16][relPath][fullHash 32]` | `[11][resumeFileIndex i64][resumeOffset i64][st]`；bit0 协商时客户端再发每文件声明 + 服务端逐个回 1B（0 跳过/1 发送）；落盘目录 `<folder>.<guid8>` |
-| 0x06 文本 | `[06][len i32][utf8 ≤1MB]` | 裸 ACK |
+| 0x06 文本 | `[06][len i32][utf8 ≤1MB]` | 判决 ACK |
 | 0x0B 覆盖查询 | `[0B][groupId 16B]` | `[1B][count i32]` + count×`[start i64][endExclusive i64]` |
 
 - 名称/路径净化与 C# 同构：`SafeName`（裸名 + 尾点空格 + 保留名前缀）、
   `SanitizeRelativePath`（`/` 归一 + `..`/`.`/空段 → `_` + `:` → `_` + 尾点空格）、
   重名 `name_1.ext`；GUID 在线上为 16B 不透明字节。
-- 帧非法/未知类型：显式拒收；被拒流量经裸 NACK（0x00）快速失败；
-  0x03 的终态应答即判决（无裸 ACK，与 C# 同）。
+- 帧非法/未知类型：显式拒收；被拒流量经判决 NACK（0x00）快速失败
+  （TCP 在装饰器流内、UDT 在裸流）；0x03 的终态应答即判决（无判决 ACK，与 C# 同）。
 - **0x03 `st=2`（已完整）的成立条件**（轮 UI-5 P1）：尾哈希通过 + 磁盘长度 == `totalSize`
   （+ verifyFlag=1 时的全文件哈希通过）。体收满但尾哈希前断连的会话视为**未验证**，
   重连回 `st=0` / offset 0 整组重传；未验证残件在重来前被删除。

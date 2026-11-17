@@ -198,36 +198,39 @@ async fn pairing_lockout_after_ten_failures() {
     server.abort();
 }
 
-/// 手工构造明文 0x00 帧（绕过 sender），用于哈希不一致与明文组合测试。
+/// 手工构造明文 0x00 帧（C# 方言布局，绕过 sender），用于哈希不一致与明文组合测试。
+/// 返回服务端写的首字节：0x00 = 拒绝判决；0x15 = 认证要求（R_PAIRING 前导）。
 async fn raw_send_file_broken_hash(
     addr: std::net::SocketAddr,
     name: &str,
     payload: &[u8],
     code: Option<&str>,
 ) -> Result<u8, Box<dyn std::error::Error>> {
-    use trft_core::protocol::frame::{sanitize_name, T_SINGLE_FILE};
-    use trft_core::protocol::io::{read_n, read_u8, write_all, write_str_u16, write_u64, write_u8};
-
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await?;
     if let Some(code) = code {
-        // 明文 0x05 门（协议 v2）：宣告 → 盐 → 证明。
-        write_u8(&mut s, trft_core::protocol::frame::T_PAIRING).await?;
-        let salt = read_n(&mut s, 16).await?;
-        let k = trft_core::crypto::kdf::derive_pairing_key(code, &salt);
-        let proof = trft_core::crypto::kdf::pairing_proof(&k, &salt);
-        write_all(&mut s, &proof).await?;
-        let st = read_u8(&mut s).await?;
-        assert_eq!(st, trft_core::protocol::frame::STATUS_OK);
+        // 明文 0x05 门（C# 方言）：[0x05][SHA256(code)] → [0x15][status]。
+        let mut frame = vec![0x05u8];
+        frame.extend_from_slice(&trft_core::hash::sha256(code.as_bytes()));
+        s.write_all(&frame).await?;
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await?;
+        assert_eq!(resp[0], 0x15, "0x05 应答类型");
+        assert_eq!(resp[1], 0x00, "正确配对码必须被接受");
     }
-    let name = sanitize_name(name)?;
-    write_u8(&mut s, T_SINGLE_FILE).await?;
-    write_str_u16(&mut s, &name).await?;
-    write_u64(&mut s, payload.len() as u64).await?;
-    write_all(&mut s, payload).await?;
+    let name = name.replace(['/', '\\'], "_");
+    // [0x00][size i64 LE][nameLen i32 LE][name][payload][sha256 32]
+    let mut frame = vec![0x00u8];
+    frame.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+    frame.extend_from_slice(&(name.len() as i32).to_le_bytes());
+    frame.extend_from_slice(name.as_bytes());
+    frame.extend_from_slice(payload);
     // 故意写错误哈希。
-    write_all(&mut s, &trft_core::hash::sha256(b"wrong")).await?;
-    let st = read_u8(&mut s).await?;
-    Ok(st)
+    frame.extend_from_slice(&trft_core::hash::sha256(b"wrong"));
+    s.write_all(&frame).await?;
+    let mut st = [0u8; 1];
+    s.read_exact(&mut st).await?;
+    Ok(st[0])
 }
 
 #[tokio::test]
@@ -281,15 +284,12 @@ async fn plaintext_pairing_roundtrip_and_deterministic_reject() {
     };
     send_file(addr, &src, &ok).await.unwrap();
 
-    // 无码明文 → 确定性拒绝（读到的状态字节必须是 0x00，而非随机的盐字节）。
+    // 无码明文 → 确定性拒绝（服务端先写 0x15 认证要求前导，再断连；
+    // 不得把随机盐/密钥字节当判决——C# 方言同语义）。
     let st = raw_send_file_broken_hash(addr, "x.bin", b"zz", None)
         .await
         .unwrap();
-    assert_eq!(
-        st,
-        trft_core::protocol::frame::STATUS_REJECT,
-        "无码必须确定性拒绝"
-    );
+    assert_eq!(st, 0x15, "无码必须确定性拒绝（0x15 认证要求）");
 
     server.abort();
     assert!(out.join("p.txt").exists());
@@ -463,12 +463,22 @@ async fn sync_strict_verify_bypasses_digest_cache() {
         ),
     ));
 
+    // C# 方言 0x04 的会话目录由 (folder, ip, port) 派生——三次同步必须打同一端口
+    // 才能复用同一会话目录（否则每次都换目录 = 每次都全量，正是本测试要判别的点）。
+    let port = {
+        let (probe, a) = ephemeral_listener().await;
+        drop(probe);
+        a.port()
+    };
     let run_sync = |strict: bool| {
         let src = src.clone();
         let out = out.clone();
         let cache = cache.clone();
         async move {
-            let (listener, addr) = ephemeral_listener().await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
             let (ptx, _prx) = mpsc::unbounded_channel();
             let hub = trft_core::progress::ProgressHub::new(ptx);
             let mut ropts = opts(out.clone(), None, 1);

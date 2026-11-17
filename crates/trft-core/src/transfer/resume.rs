@@ -706,6 +706,10 @@ pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -
     if opts.transport == crate::transfer::Transport::Udt {
         return crate::transfer::cswire::send_file_cs(addr, path, opts).await;
     }
+    // TCP 槽位：0x03 续传（C# 方言）优先，旧对端降级 0x00 全量——与 v2 同策略。
+    if opts.transport == crate::transfer::Transport::Tcp {
+        return send_file_auto_cs_tcp(addr, path, opts).await;
+    }
     let meta = tokio::fs::metadata(path).await?;
     if !meta.is_file() {
         return Err(config_err("路径不是普通文件"));
@@ -795,6 +799,88 @@ pub async fn send_file_auto(addr: SocketAddr, path: &Path, opts: &SendOptions) -
     unreachable!("重试循环必在内部返回")
 }
 
+/// TCP 槽位的 0x03 自动续传（C# 方言）：退避重试共 3 次，旧对端降级 0x00；
+/// 空文件走 0x00（0x03 拒绝 0 字节）。
+async fn send_file_auto_cs_tcp(
+    addr: SocketAddr,
+    path: &Path,
+    opts: &SendOptions,
+) -> Result<()> {
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_file() {
+        return Err(config_err("路径不是普通文件"));
+    }
+    let size = meta.len();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if size == 0 {
+        let started0 = std::time::Instant::now();
+        let r = crate::transfer::sender::send_file(addr, path, opts).await;
+        if r.is_ok() {
+            crate::transfer::sender::record_stats(opts, addr, 0, 1, started0, "空文件", &name);
+        }
+        return r;
+    }
+    if size > MAX_TRANSFER_SIZE {
+        return Err(config_err("文件超过 1 PiB 声明上限"));
+    }
+    // 完整哈希必须在建连之前算完（规格 §3.1；C# SendResumableAsync 同纪律）。
+    let p = path.to_path_buf();
+    let claimed = tokio::task::spawn_blocking(move || sha256_file(&p))
+        .await
+        .map_err(|e| proto(e.to_string()))??;
+    let started = std::time::Instant::now();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        }
+        match crate::transfer::cswire::cs_send_file_resume_tcp_once(addr, path, claimed, opts).await
+        {
+            Ok(sent) => {
+                if let Some(r) = &opts.progress {
+                    r.finish();
+                }
+                crate::transfer::sender::record_stats(
+                    opts, addr, sent, 1, started, "续传传输", &name,
+                );
+                return Ok(());
+            }
+            Err(Error::Unsupported(_)) => {
+                // 旧对端/未启用：降级 0x00 全量（不计入重试退避；0x00 自带终态上报）。
+                let r = crate::transfer::sender::send_file(addr, path, opts).await;
+                if r.is_ok() {
+                    crate::transfer::sender::record_stats(
+                        opts,
+                        addr,
+                        size,
+                        1,
+                        started,
+                        "续传不可用，改为直接发送",
+                        &name,
+                    );
+                }
+                return r;
+            }
+            Err(e @ (Error::AuthRejected(_) | Error::Rejected(_))) => {
+                if let Some(r) = &opts.progress {
+                    r.fail();
+                }
+                return Err(e);
+            }
+            Err(e) if attempt == 2 => {
+                if let Some(r) = &opts.progress {
+                    r.fail();
+                }
+                return Err(e);
+            }
+            Err(_) => continue,
+        }
+    }
+    unreachable!("重试循环必在内部返回")
+}
+
 // ============ 0x04 客户端 ============
 
 /// 0x04 文件夹续传/同步发送。
@@ -809,6 +895,17 @@ pub async fn send_folder_resume(
 ) -> Result<()> {
     if !root.is_dir() {
         return Err(config_err("路径不是目录"));
+    }
+    // TCP 槽位：0x04 差量同步（C# 方言）。session_id 是 v2 帧字段；cswire 用
+    // 确定性会话 GUID 派生（同一目录 × 同一目标 → 同一会话），此处忽略。
+    if opts.transport == crate::transfer::Transport::Tcp {
+        return crate::transfer::cswire::send_folder_sync_cs_tcp(
+            addr,
+            root,
+            opts,
+            client_cache,
+        )
+        .await;
     }
     let raw = root
         .file_name()

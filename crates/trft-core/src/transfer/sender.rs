@@ -252,19 +252,11 @@ pub(crate) async fn connect_stack(
     plan: StackPlan,
 ) -> Result<(BoxStream, u8)> {
     let mut s: BoxStream = match opts.transport {
+        // TCP 槽位已改走 C# 方言应用层（cswire）——v2 帧仅剩 QUIC/RUDP 槽位。
         Transport::Tcp => {
-            let t = connect(addr, opts.src_port).await?;
-            t.set_nodelay(true).ok();
-            if opts.encrypt {
-                // 0x09 加密握手；证明绑定公钥转写，认证在握手中完成。
-                let (enc, _authed) =
-                    encrypted::client_wrap(t, opts.pairing_code.as_deref()).await?;
-                Box::new(enc)
-            } else {
-                let mut t = t;
-                authenticate(&mut t, opts.pairing_code.as_deref()).await?;
-                Box::new(t)
-            }
+            return Err(Error::Unsupported(
+                "TCP 槽位不使用 v2 帧协议（已改为 C# 方言 cswire）".into(),
+            ))
         }
         Transport::Quic => {
             // 配对已在 connect_quic_auth 内完成（含 0x0D 通道绑定/旧端回退）。
@@ -386,26 +378,19 @@ where
 }
 
 pub async fn send_file(addr: SocketAddr, path: &Path, opts: &SendOptions) -> Result<()> {
-    let outcome = crate::progress::Outcome::new(opts.progress.clone());
     if opts.transport == Transport::Udt {
         // UDT 槽位走 C# 方言（0x00）——与原 C# 版互通（TECH-STACK §7.30）。
         return crate::transfer::cswire::send_file_cs(addr, path, opts).await;
     }
+    if opts.transport == Transport::Tcp {
+        // TCP 槽位与 UDT 共用 C# 方言应用层（TCP 互通改造）：0x00 单文件 + 判决。
+        return crate::transfer::cswire::send_file_cs_tcp(addr, path, opts).await;
+    }
+    // 终态守卫必须在 cswire 早退之后创建：cswire 自带同款守卫，外层再持一份
+    // 会在其 finish 之后 Drop 出一次假的 failed 事件（UDT 路径旧有缺陷）。
+    let outcome = crate::progress::Outcome::new(opts.progress.clone());
     let res = match opts.transport {
-        Transport::Tcp => {
-            let s = connect(addr, opts.src_port).await?;
-            s.set_nodelay(true).ok();
-            if opts.encrypt {
-                // 0x09 加密握手；证明绑定公钥转写，认证在握手中完成。
-                let (mut enc, _authed) =
-                    encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
-                stream_send_file(&mut enc, path, opts).await
-            } else {
-                let mut s = s;
-                authenticate(&mut s, opts.pairing_code.as_deref()).await?;
-                stream_send_file(&mut s, path, opts).await
-            }
-        }
+        Transport::Tcp => unreachable!("Tcp 分支已在函数顶部拦截"),
         Transport::Quic => {
             let mut s = connect_quic_auth(addr, opts).await?;
             stream_send_file(&mut s, path, opts).await
@@ -435,20 +420,12 @@ pub async fn send_text(addr: SocketAddr, text: &str, opts: &SendOptions) -> Resu
     if opts.transport == Transport::Udt {
         return crate::transfer::cswire::send_text_cs(addr, text, opts).await;
     }
+    if opts.transport == Transport::Tcp {
+        // TCP 槽位与 UDT 共用 C# 方言应用层（0x06 文本 + 判决）。
+        return crate::transfer::cswire::send_text_cs_tcp(addr, text, opts).await;
+    }
     let res = match opts.transport {
-        Transport::Tcp => {
-            let s = connect(addr, opts.src_port).await?;
-            s.set_nodelay(true).ok();
-            if opts.encrypt {
-                let (mut enc, _authed) =
-                    encrypted::client_wrap(s, opts.pairing_code.as_deref()).await?;
-                stream_send_text(&mut enc, text).await
-            } else {
-                let mut s = s;
-                authenticate(&mut s, opts.pairing_code.as_deref()).await?;
-                stream_send_text(&mut s, text).await
-            }
-        }
+        Transport::Tcp => unreachable!("Tcp 分支已在函数顶部拦截"),
         Transport::Quic => {
             let mut s = connect_quic_auth(addr, opts).await?;
             stream_send_text(&mut s, text).await

@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, Semaphore};
-use tokio::task::JoinSet;
 
 /// 规格 §4.1/§6.1：按来源 IP 计数锁定——10 次失败锁 10 分钟，成功清零。
 const LOCKOUT_THRESHOLD: u32 = 10;
@@ -499,7 +498,7 @@ pub fn cleanup_part_orphans(dir: &Path) {
 /// 对端延迟 ACK 交互下可迟到 ~40-200ms，文件夹多小文件逐文件放大）+ 收/发
 /// 缓冲 4MB（规格 §6.2；发送侧 `sender::connect` 同口径——Linux accepted
 /// socket 不继承 listener 选项，逐连接设最稳；失败仅忽略）。
-fn tune_tcp(s: &tokio::net::TcpStream) {
+pub(crate) fn tune_tcp(s: &tokio::net::TcpStream) {
     let _ = s.set_nodelay(true);
     let sock = socket2::SockRef::from(s);
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
@@ -507,52 +506,10 @@ fn tune_tcp(s: &tokio::net::TcpStream) {
 }
 
 pub async fn serve_on(listener: TcpListener, opts: RecvOptions) -> Result<()> {
-    cleanup_part_orphans(&opts.save_dir);
-    resume::cleanup_resume_orphans(&opts.save_dir);
-    let served = Arc::new(AtomicU64::new(0));
-    match opts.max_count {
-        // 限量模式（CLI --count）：串行处理，收满即停——避免已阻塞的 accept
-        // 在计数达标后仍醒不过来。
-        Some(max) => loop {
-            if served.load(Ordering::Relaxed) >= max {
-                return Ok(());
-            }
-            match listener.accept().await {
-                Ok((s, peer)) => {
-                    tune_tcp(&s);
-                    if let Err(e) = handle_conn(s, peer, &opts, served.clone()).await {
-                        eprintln!("[连接失败] {e}");
-                    }
-                }
-                Err(e) => return Err(Error::Io(e)),
-            }
-        },
-        // 常驻模式：并发处理所有连接（带并发闸）。
-        None => {
-            let mut set = JoinSet::new();
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        // 收割已完成任务（轮 5 P2-3 组：JoinSet 完成条目驻留
-                        // ~190B/连接——仅 accept 出错分支 join 的话万级连接 ≈ 2MB）。
-                        tune_tcp(&stream);
-                        while set.try_join_next().is_some() {}
-                        let o = opts.clone();
-                        let counter = served.clone();
-                        set.spawn(async move {
-                            if let Err(e) = handle_conn(stream, peer, &o, counter).await {
-                                eprintln!("[连接失败] {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        while set.join_next().await.is_some() {}
-                        return Err(Error::Io(e));
-                    }
-                }
-            }
-        }
-    }
+    // TCP 槽位与 UDT 槽位共用 C# 方言应用层（互通改造）：连接分发/认证/压缩/能力、
+    // 0x00/0x01/0x02/0x03/0x04/0x06 全帧集与 C# 2.14 逐字节一致。并发闸、配对
+    // 锁定、IP 过滤、确认门、PerDevice/AutoArchive 仍由 RecvOptions 同一套接线承担。
+    crate::transfer::cswire::serve_tcp_on(listener, opts).await
 }
 
 /// 连接前置检查（并发闸 + 配对锁定）与后置记账（锁定计数/成功清零）。

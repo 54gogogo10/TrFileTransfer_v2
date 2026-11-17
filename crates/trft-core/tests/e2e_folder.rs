@@ -100,9 +100,9 @@ async fn folder_skip_drops_identical_copy() {
     );
 }
 
-/// 轮 1 F3 判别：0x01 文件夹发送必须遵循 opts.encrypt——服务端关加密
-/// （0x09 首帧必拒）+ 客户端开加密 → 发送必须失败。修复前 send_folder 直连
-/// 明文（忽略 encrypt）→ 发送假性成功，本测试必红。
+/// 轮 1 F3 判别（C# 方言口径）：0x01 文件夹发送必须遵循 opts.encrypt——配对码
+/// 在两侧一致、客户端开加密、服务端 encrypt=false（明确拒绝 0x09）→ 发送必须失败。
+/// 修复前 send_folder 直连明文（忽略 encrypt）→ 发送假性成功，本测试必红。
 #[tokio::test]
 async fn folder_send_honors_encrypt_option() {
     let dir = tempfile::tempdir().unwrap();
@@ -116,13 +116,18 @@ async fn folder_send_honors_encrypt_option() {
         listener,
         RecvOptions {
             save_dir: out.clone(),
-            encrypt: false, // 服务端拒绝 0x09 升级
+            pairing_code: Some("246810".into()),
+            encrypt: false, // 服务端明确拒绝 0x09 升级
             max_count: Some(1),
             ..Default::default()
         },
     ));
-    // 客户端默认 encrypt=true → 必须走 0x09 → 被服务端拒绝 → 发送失败。
-    let r = send_folder(addr, &src, &SendOptions::default()).await;
+    // 客户端代码一致且 encrypt=true → 必须走 0x09 → 被服务端拒绝 → 发送失败。
+    let o = SendOptions {
+        pairing_code: Some("246810".into()),
+        ..Default::default()
+    };
+    let r = send_folder(addr, &src, &o).await;
     assert!(
         r.is_err(),
         "服务端拒绝 0x09 时，开加密的文件夹发送必须失败（不得静默明文降级）"
@@ -217,8 +222,21 @@ async fn folder_send_falls_back_to_resume_after_failure() {
     trft_core::transfer::folder::send_folder_auto(f_addr, &src, &opts)
         .await
         .expect("0x01 中断后必须经 0x04 差量续传收敛（规格 §3.2 AutoRetry）");
-    assert!(out.join("proj").join("a.bin").exists(), "文件 a 必须落盘");
-    assert!(out.join("proj").join("b.bin").exists(), "文件 b 必须落盘");
+    // C# 方言 0x04 落在确定性会话目录 <save>/<folder>.<guid8>（与 C# 服务端同式；
+    // 0x01 的半成品留在 <save>/proj，两者不共用目录——协议固有语义）。
+    let session = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("proj."))
+                    .unwrap_or(false)
+        })
+        .expect("必须存在 0x04 会话目录 proj.<guid8>");
+    assert!(session.join("a.bin").exists(), "文件 a 必须落盘");
+    assert!(session.join("b.bin").exists(), "文件 b 必须落盘");
     common::assert_no_leftovers(&out);
     server.abort();
     proxy.abort();
