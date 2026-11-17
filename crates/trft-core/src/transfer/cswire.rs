@@ -3841,11 +3841,21 @@ pub(crate) async fn cs_send_folder_sync<S: AsyncRead + AsyncWrite + Unpin>(
         wire.write_all(&m).await?;
     }
 
-    // 0x11 判决（长窗口）。EOF = 对端不认 0x04（旧对端/未启用）→ Unsupported。
+    // 0x11 判决（长窗口）。对端不认 0x04 时可能优雅关闭（EOF），也可能在读到
+    // 类型字节后直接断开（入站残留帧头 → Linux/macOS 回 RST）——两者同判
+    // Unsupported，调用方才能给出「旧对端/未启用」的明确结论。
     let mut resp = [0u8; 18];
     match tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp)).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            ) =>
+        {
             return Err(Error::Unsupported(
                 "对端不支持文件夹同步（0x04，旧对端或未启用）".into(),
             ))

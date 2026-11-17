@@ -555,10 +555,15 @@ mod tests {
         cfg.poll_interval = Duration::from_millis(100);
         let h = tokio::spawn(run_monitor(cfg));
 
-        // 等待发送完成（事件或落盘判定，5s 兜底）。
+        // 等待发送完成（**按内容**判定，5s 兜底）。0x03 续传路径先建最终名再写
+        // 数据——只看 exists() 会在文件刚创建、内容未落盘时提前读到 0 字节
+        // （Linux CI 实红）。
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if out.join("auto.bin").exists() {
+            if std::fs::read(out.join("auto.bin"))
+                .map(|d| d == b"monitor me")
+                .unwrap_or(false)
+            {
                 break;
             }
             if let Ok(ev) = erx.try_recv() {
