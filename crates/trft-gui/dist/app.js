@@ -56,7 +56,7 @@ const L10N = {
     verify_done: "校验完成", verify_stopped: "校验已中止（仅扫描了部分文件）", send_fail: "发送失败", lang_locked: "传输进行中，语言切换已锁定",
     queue_sent: "队列已全部执行", queue_full: "队列已达 500 项上限",
     udp_file_only: "单向 UDP 仅支持单文件（无握手通道）",
-    udt_code_warn: "UDT 互通协议的配对认证以未加盐哈希上线（C# 2.14 互锁约束）：嗅探可离线爆破配对码。该场景建议 12 位配对码，或改用 TCP/QUIC/RUDP 槽位",
+    udt_code_warn: "TCP/UDT 走 C# 方言的配对认证以未加盐哈希上线（C# 2.14 互锁约束）：嗅探可离线爆破配对码。该场景建议 12 位配对码，或改用 QUIC/RUDP 槽位",
     tab_stats: "历史",
     stats_summary: "统计概览", refresh: "刷新", export_csv: "导出 CSV", stats_clear: "全部清除",
     st_today: "今日次数", st_today_bytes: "今日流量", st_week_bytes: "7 天流量", st_total: "累计次数", st_total_bytes: "累计流量",
@@ -136,7 +136,7 @@ const L10N = {
     verify_done: "Verify finished", verify_stopped: "Verify stopped (partial scan)", send_fail: "Send failed", lang_locked: "Language locked during transfers",
     queue_sent: "Queue finished", queue_full: "Queue reached the 500-item limit",
     udp_file_only: "One-way UDP supports single files only (no handshake channel)",
-    udt_code_warn: "The UDT interop protocol sends an unsalted pairing-code hash on the wire (C# 2.14 interop constraint): sniffing enables offline brute force. Use a 12-digit code here, or switch to TCP/QUIC/RUDP.",
+    udt_code_warn: "TCP/UDT (C# dialect) send an unsalted pairing-code hash on the wire (C# 2.14 interop constraint): sniffing enables offline brute force. Use a 12-digit code here, or switch to QUIC/RUDP.",
     tab_stats: "History",
     stats_summary: "Overview", refresh: "Refresh", export_csv: "Export CSV", stats_clear: "Clear all",
     st_today: "Today", st_today_bytes: "Today bytes", st_week_bytes: "7-day bytes", st_total: "Total count", st_total_bytes: "Total bytes",
@@ -486,9 +486,9 @@ function sendRequest(kindOverride) {
     nofec: $("#send-nofec").checked,
     pin: null,
   };
-  // 安全轮 P1-1 缓解：UDT 槽位 + 配对码 = 未加盐码哈希上线（C# 互锁协议固有
-  // 约束，线格式不可改）——按会话一次告警，指引用户加长配对码或换槽位。
-  if (req.proto === "udt" && req.code && !udtCodeWarned) {
+  // 安全轮 P1-1 缓解：TCP/UDT（C# 方言）+ 配对码 = 未加盐码哈希上线（C# 互锁
+  // 协议固有约束，线格式不可改）——按会话一次告警，指引加长配对码或换槽位。
+  if ((req.proto === "udt" || req.proto === "tcp") && req.code && !udtCodeWarned) {
     udtCodeWarned = true;
     toast(t("udt_code_warn"), "warn");
     log("warn", t("udt_code_warn"));
