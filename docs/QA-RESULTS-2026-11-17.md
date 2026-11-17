@@ -170,6 +170,14 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 | **VM trft `sync` → 宿主 trft（反向 0x04）** | ✅ | 会话目录 `syncsrc2.ace398b9/`，两文件哈希一致 |
 | **VM trft `--code` → 宿主 C# 接收端（0x09）** | ✅ | 补 C# 程序的入站规则后 8 MiB 通过；C# 日志 `Connection encrypted (AES-256)` + `deflate` + `Resume: big8.bin offset=0`，落盘哈希一致 |
 
+
+### 单向 UDP（新 VM 192.168.50.50，§7.59 改造后）
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 宿主 trft → VM trft（`--proto udp`，2 轮 + FEC 2，限速 50 MB/s） | ✅ | 8 MiB / 1.14s，VM 落盘 SHA-256 一致；接收端日志 `[接收-UDP] 收到 udp8.bin`（START 哈希路径：收齐即发布） |
+| VM → 宿主（同一命令反向） | ⚠️ 环境阻断 | 宿主入站 UDP 无防火墙规则（现有 `trft-test` 仅 TCP/19611）→ 包被丢弃、宿主无落盘；同链路 TCP 反向 8 MiB 通过（路由正常）。补规则：`netsh advfirewall firewall add rule name=trft-udp dir=in action=allow program="D:\zcode\TrFileTransfer_v2\target\release\trft.exe" protocol=udp localport=19701` |
+
 **清理**：VM 上本轮创建的计划任务（trft-recv1/3/4/5、trft-send1、trft-sendA–D）与新增的 exe/bat/日志/接收目录/同步源已删除；SMB 映射保留（`net use \\10.143.208.49\C$`，此前既有记忆映射）。VM 上更早会话遗留的 `trft-test` 负载（a2.bin 5GiB 等）未动。宿主侧临时目录（revA–D、big64）已清。
 
 ## 未完成（需人工/其它环境）
