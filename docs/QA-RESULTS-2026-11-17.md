@@ -138,6 +138,7 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 | **st=3（源文件变更）** | ✅ | 断点 1 MiB 后改同尺寸内容：重发失败「服务端全文件校验失败（服务端已丢弃该文件）」且接收端清空；再发成功、新内容哈希一致 |
 | 0x05 明文配对（双向）+ `--srcport` | ✅ | C# `--noencrypt --code`→trft 与 trft→C# 均哈希一致；trft 带 `--srcport 45678` 发送成功 |
 | 测试基线 | ✅ | **301 项全绿**（新增 `aborted_chunk_is_not_counted_as_covered` 判别用例） |
+
 ## 未完成（需人工/其它环境）
 
 | ID | 原因 |
