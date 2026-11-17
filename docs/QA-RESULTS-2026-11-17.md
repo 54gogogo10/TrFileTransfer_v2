@@ -86,6 +86,7 @@ TCP 槽位应用层并入 C# 方言后，用 C# 2.14.0.0 自带无头 CLI（`TrF
 | trft（TCP）→ C# 2.14 TCP 服务端 | ✅ | 1 MiB；C# 日志「Resume: src.bin offset=0 … status=0」「Compression (deflate)」「Transfer complete」；落盘哈希一致（C# `Received: …src.bin`） |
 | C# 2.14 TCP 客户端 → trft 接收端 | ✅ | 1 MiB；C# 日志「Connected」「Compression (deflate)」「Transfer complete」；trft 落盘哈希一致 |
 | 配对码 + 0x09 加密（双向） | ✅ | C# 侧「Encrypted session established (AES-256)」/「Connection encrypted (AES-256)」+ 压缩；两侧落盘哈希一致 |
+| 明文/关压缩（双向） | ✅ | C# `--noencrypt --nocompress`（不读判决 ACK）与 trft `--nocompress` 均完整落盘，哈希一致 |
 | 目录 0x01（双向） | ✅ | 3 文件（含中文名/子目录）；C# 侧「Folder transfer complete: fold (3 files)」、trft 侧子目录与中文名完整 |
 | 差量同步 0x04（双向） | ✅ | C#→trft：会话目录 `fold.8e4228f9`；trft→C#：`fold.4b7ed953`（`<folder>.<guid8>`，与 C# 服务端同式） |
 | trft 文本 0x06 → C# | ✅ | C# 日志「Text received: …」 |
