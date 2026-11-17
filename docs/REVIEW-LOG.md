@@ -938,3 +938,5 @@ TCP 199 / QUIC 179 / UDT 161；真机矩阵 14/14 + GUI 0x02 复验全 SHA-256 �
 
 **验证**：`cargo check --workspace --all-targets` 0 警告；clippy 余留均为风格类（参数个数/初始化写法，非本轮引入）；`cargo test --workspace --no-fail-fast` **302 项全绿**；CI 三平台矩阵复跑。
 
+**补记（2026-11-18，复审后的后续批）**：① cswire 0x00/0x01 接收路径补 fsync（回执前落盘，与 0x02/0x03/v2 同纪律，021a5e8）；② 单向 UDP 可靠性对齐——START 尾段哈希/收齐即发布、FEC 超块列优先交织、收尾哈希/发布异步化（TECH-STACK §7.59，16c17a6/0115a6c）；全量基线 302 → **308 项全绿**，真机 192.168.50.50 双向 8 MiB 哈希一致，CI 三平台通过。
+
