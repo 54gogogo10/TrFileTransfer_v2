@@ -96,6 +96,30 @@ TCP 槽位应用层并入 C# 方言后，用 C# 2.14.0.0 自带无头 CLI（`TrF
 驱动方式：`Start-Process` 起 C# CLI 与 trft CLI，日志/哈希比对；无需 UIA（C# CLI 与 GUI 共用同一
 `TransferClient`/`TransferServer` 线协议代码）。
 
+## GUI 真机冒烟：TCP 槽位改造后（2026-11-17，CDP 驱动真机 exe）
+
+`cargo build -p trft-gui` 后以 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+启动真机 exe，用 CDP `Runtime.evaluate` 驱动 DOM（填值/点击），落盘一律以 SHA-256 复核；
+对端用 trft CLI 与 C# 2.14 CLI，避免手工拨号误差。
+
+| 项 | 结果 | 证据（GUI 日志 / 落盘） |
+|---|---|---|
+| GUI 接收（TCP）← CLI 发送 | ✅ | 接收卡绿点 `0.0.0.0:19200`、启动禁用/停止可用；日志 `gui-recv.bin`；1.5 MB 哈希一致；最近文件列表出现该文件 |
+| GUI 发送（TCP 0x03 + 压缩）→ CLI | ✅ | `传输完成: gui-send.bin` + `#1 OK`；2 MiB 哈希一致 |
+| GUI 并行分块（0x02，4 路）→ CLI | ✅ | 8 MiB；`传输完成: gui-chunk.bin` + `#2 OK`；哈希一致 |
+| GUI 发送 + 配对码（0x09） | ✅ | 先出安全告警（TCP 已纳入），随后 `传输完成` + `#3 OK`；带码 CLI 接收端哈希一致 |
+| C# 2.14 客户端 → GUI 接收（0x09 + 压缩） | ✅ | C# 日志「Encrypted session established / compression / Transfer complete」；GUI 日志收到 `cs-to-gui.bin`；3 MiB 哈希一致 |
+| GUI 目录发送（0x01 整夹） | ✅ | `gui-folder/f1.bin`（500 000 B 哈希一致）+ `gui-folder/sub/说明.txt`（中文内容正确） |
+| GUI 目录发送（0x04 差量同步） | ✅ | 会话目录 `gui-folder.95bcbd8a/`（与 C# 服务端同式），文件哈希一致 |
+| GUI 文本发送（0x06） | ✅ | 接收端打印 `[文本] GUI 文本互通 hello 😀` |
+| 接收器停止/改端口重启 | ✅ | 停止后绿点灭、启动恢复；19204 重启后 C# 加密连接可收 |
+| JS 异常/控制台错误 | 0 | CDP eval 无 exception；日志无 error（两条 err 是驱动脚本先填端口后切协议、目标落到 8080 的拒绝连接，属驱动失误非产品缺陷） |
+| 环境复原 | ✅ | 测试设置的配对码已从设置页清空并保存；测试结束关闭 GUI 进程 |
+
+驱动脚本：`.zcode/gui-cdp.mjs`（gitignored，CDP eval/eval-file/shot/front）。
+截图（真机窗口）：`target/tmp/gui-01..02.png`（窗口失去前台后 WebView2 合成器不再出新帧，
+后续断言以 DOM/文件系统为准）。
+
 ## 未完成（需人工/其它环境）
 
 | ID | 原因 |
@@ -103,7 +127,7 @@ TCP 槽位应用层并入 C# 方言后，用 C# 2.14.0.0 自带无头 CLI（`TrF
 | B1/B4/B5（0x00/0x03/0x04 掉电） | 与 B3 共用同一发布函数（`publish_part` / `public::move_replace`），代码路径已修复并有单测；剩余为逐路径真机复核，需再次断电 |
 | C1–C12（GUI 冒烟） | 视觉/交互项需人在控制台 |
 | C# 2.14 GUI 级对打 | UDT/TCP 线协议已由 C# CLI 对打通过（同上节）；GUI 级（文件选择框、气泡）需人在控制台 |
-| TCP 槽位 GUI 冒烟 | 发送面板 TCP 路径由 CLI A 段 + C4 覆盖；改造后建议在真机 GUI 再点一遍（协议栈已换，UI 接线未变） |
+| ~~TCP 槽位 GUI 冒烟~~ | ✅ 已补：见上节「GUI 真机冒烟：TCP 槽位改造后」 |
 
 ## 运行观察
 
