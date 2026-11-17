@@ -907,7 +907,9 @@ async fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, String> {
 
 /// 自 `port+1` 起探测同传输的下一个可用端口（≤ +10）。
 fn next_free_port(proto: Proto, ip: std::net::IpAddr, port: u16) -> Option<u16> {
-    for p in (port + 1)..=(port.saturating_add(10).min(65535)) {
+    // 起点用 checked：port=65535 没有「下一个」端口（饱和回探自身会让探测误判）。
+    let start = port.checked_add(1)?;
+    for p in start..=start.saturating_add(9) {
         let addr = SocketAddr::new(ip, p);
         let free = match proto {
             // QUIC/RUDP/UDT 均走 UDP 传输（轮 7 P3：此前误用 TCP 探测）。

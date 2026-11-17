@@ -213,9 +213,7 @@ async fn cs_dialect_chunked_group_assembles_file() {
     // 每连接：0x0A 能力（bit1）→ 0x02 分块段 → 裸 ACK。
     let mut handles = Vec::new();
     for i in 0..concurrency {
-        let addr = addr;
         let payload = payload.clone();
-        let group_id = group_id;
         handles.push(tokio::spawn(async move {
             let stream = trft_core::transfer::udt::connect_udt(addr, None).await.unwrap();
             let mut wire = CsWire::new(stream);

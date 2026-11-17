@@ -774,7 +774,7 @@ pub async fn send_file_chunked(
                     size,
                     1,
                     started,
-                    &format!("分块传输（补发）"),
+                    "分块传输（补发）",
                     &name,
                 );
                 return Ok(());

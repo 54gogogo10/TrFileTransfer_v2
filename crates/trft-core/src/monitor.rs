@@ -10,7 +10,7 @@
 //!   重试，不阻塞队首）；已消失文件直接丢弃；未就绪/失败日志按文件节流
 //!   （首报立即、后续 60 秒一次）；成功后移入「已发送文件/」（重名追加序号）。
 
-use crate::error::{config_err, Error, Result};
+use crate::error::{config_err, Result};
 use crate::transfer::resume::send_file_auto;
 use crate::transfer::sender::SendOptions;
 use crate::transfer::udp::{send_file_udp, UdpSendOptions};
@@ -443,11 +443,6 @@ fn throttled_log(map: &mut HashMap<String, Instant>, name: &str, f: impl FnOnce(
         map.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3600));
         f();
     }
-}
-
-/// 便捷构造：错误归一（GUI 命令层用）。
-pub fn describe_error(e: &Error) -> String {
-    e.to_string()
 }
 
 #[cfg(test)]

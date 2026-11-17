@@ -36,7 +36,6 @@ pub const FLAG_UDT: u8 = 16;
 
 /// C# 版发现协议的 flags 位（DeviceDiscovery.cs：bit1=UDT bit2=配对）——
 /// 裸 0xD1 探测的应答与 C# 响应解析共用。
-pub const CS_FLAG_TCP: u8 = 1;
 pub const CS_FLAG_UDT: u8 = 2;
 pub const CS_FLAG_PAIRING: u8 = 4;
 

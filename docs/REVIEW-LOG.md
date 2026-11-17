@@ -917,3 +917,24 @@ TCP 199 / QUIC 179 / UDT 161；真机矩阵 14/14 + GUI 0x02 复验全 SHA-256 �
 **判别检查**：新增 `.zcode/check_l10n.js`（zh/en 字典损坏简写键、data-i18n/t() 引用缺键、两侧键不对称三类校验，bad=0 为过；本 bug 在该脚本下必红）。
 
 **复测全绿**：页面异常 0、控制台错误 0、6/6 标签切换 PASS、IPC 三命令（get_app_state/list_addresses/stats_summary）真实回数、设置页 19 项回填、qr-address 下拉 JS 填充=4（初始化完整证据）、错误 toast 0；亮/暗双主题截图归档 `.zcode/ui-preview/shots/real-smoke2-*`。VLM 亮色误判为深色一事再次印证：程序化验证优先于 VLM 臆测。
+
+## 附加复审（2026-11-17，TCP 互通改造后）
+
+**范围/方法**：4 个 crate（约 3 万行）——`cargo clippy --workspace --all-targets` 全量；600 个 `pub` 项引用扫描（剔除定义自身后为 0 引用者判死）；网络面解析器（cswire / v2 帧 / UDP/RUDP/UDT）、Web 管理面、更新链、Tauri 配置与前端渲染逐点复核。
+
+**发现与修复**
+
+| 级别 | 位置 | 问题 | 处置 |
+|---|---|---|---|
+| P2 | `cswire::cs_server_ecdh` | 客户端证明（c2s-confirm）校验失败时误调 `gate.success()`——锁定计数被清零，记账方向与「配对码错误」相反 | 改 `gate.fail()` |
+| P2 | `cswire::handle_folder_resume` | 清单 `Vec::with_capacity(file_count)`（上限 1,000,000 ≈ 56MB/连接）× 64 并发 ≈ 3.5GB 预分配 DoS | 容量提示封顶 1024，逐项增长 |
+| P2 | `trft-gui::next_free_port` | `port + 1` 在 port=65535 时 debug 构建溢出 panic（端口探测属用户可触发路径） | `saturating_add(1)` |
+| P3 | 六处 | 死代码：`ACK_WORDS_FULL/EXT`、`CS_FLAG_TCP`、`describe_error`、`spawn_restarted`、`SessionKeys::client_view/server_view` | 删除；600 个 pub 项扫描已无 0 引用者 |
+| P3 | `cswire` 等 | 重复的「对端关闭形态」判定（两处）、0x05 状态分支同块、`format!` 字面量、测试未用 import/冗余重绑定 | 提取 `peer_closed()`；化简；清理 |
+
+**复核为无问题（抽样）**：cswire 线上长度全部前置校验（名称 4096 / 文本 1MB / 传输 1PiB / 区间 8192 / tracker 64 / 声明 64GiB）；AES-256-CTR + HMAC-SHA256 段绑定 seq、先验 MAC 后解密、16B 截断标签；解压 `take(MAX+1)` 炸弹防线；更新链 ed25519 verify_strict + https 强制 + 换入前/暂存后双重重校验 + 回滚；Web 登录锁定（10 次/10 分钟）、会话 HttpOnly+SameSite=Strict、CSRF 双提交（哈希后 ct_eq）、列表 `html_escape`/`url_escape`、上传字段数/大小/空闲超时；三套路径净化器（v2 严格 / C# 宽容 / Web 反斜杠归一）对 `..`、绝对路径、ADS、保留名、格式字符判定一致；`Command::new` 全部 argv 传参（无 shell 拼接）；Tauri CSP 严格、前端渲染走 `textContent`（唯一 `innerHTML` 是本地生成的二维码 SVG）。
+
+**登记不改（风险已声明）**：① 0x09 收到 status=2（对端无配对码）时明文降级，仅 stderr 提示——release GUI 不可见（C# 语义，改动即破互通）；② Web 共享目录内的符号链接/junction 会被跟随（读/删可越出共享根，属运维配置面）；③ 0x03 直接写最终名（本机预置符号链接可被跟随，需对保存目录有写权限）；④ 配对码 KDF 为 C# 兼容的 PBKDF2-SHA1/50k，6 位码可离线爆破（GUI 已告警，建议 12 位或 QUIC/RUDP）。
+
+**验证**：`cargo check --workspace --all-targets` 0 警告；clippy 余留均为风格类（参数个数/初始化写法，非本轮引入）；`cargo test --workspace --no-fail-fast` **302 项全绿**；CI 三平台矩阵复跑。
+

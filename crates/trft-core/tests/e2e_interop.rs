@@ -365,7 +365,6 @@ async fn chunk_hash_mismatch_drops_group_then_full_resend_publishes() {
 /// 对端 0x0B 查询得「0 缺口」→ 一块不补就报成功，磁盘上只剩 .trft-part。
 #[tokio::test]
 async fn aborted_chunk_is_not_counted_as_covered() {
-    use tokio::io::AsyncWriteExt;
     use trft_core::hash::sha256;
 
     let dir = tempfile::tempdir().unwrap();

@@ -20,16 +20,6 @@ pub struct SessionKeys {
     pub s2c_conf: [u8; 32],
 }
 
-impl SessionKeys {
-    pub fn client_view(&self) -> (&SegmentCipher, &SegmentCipher) {
-        (&self.c2s, &self.s2c)
-    }
-
-    pub fn server_view(&self) -> (&SegmentCipher, &SegmentCipher) {
-        (&self.s2c, &self.c2s)
-    }
-}
-
 /// 一次未完成的握手：持有己方临时私钥与公钥（SEC1 未压缩 65 字节）。
 pub struct Handshake {
     secret: EphemeralSecret,

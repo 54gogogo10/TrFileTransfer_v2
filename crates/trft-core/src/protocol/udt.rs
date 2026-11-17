@@ -365,10 +365,8 @@ pub fn decode_loss(words: &[u32]) -> Option<Vec<i32>> {
 }
 
 /* ============ ACK 载荷 ============ */
-
-/// ACK 载荷字数：轻量 ACK 1（仅 cum）；完整 ACK 4（cum/rtt/rttvar/buf）或 6（+speed/bw）。
-pub const ACK_WORDS_FULL: usize = 4;
-pub const ACK_WORDS_EXT: usize = 6;
+// ACK 载荷按实际字数动态解析（1/4/6 字各有语义），不设编译期常量——
+// 此前两个未使用常量已删除。
 
 #[cfg(test)]
 mod tests {

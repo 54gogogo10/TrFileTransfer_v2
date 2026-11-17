@@ -721,15 +721,6 @@ pub async fn run_update(
     }
 }
 
-/// 重启进程（换入后调用）：启动同路径 exe 并让调用方自行退出。
-pub fn spawn_restarted() -> Result<()> {
-    let exe = std::env::current_exe().map_err(|e| proto(e.to_string()))?;
-    std::process::Command::new(exe)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| proto(format!("重启失败: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
 

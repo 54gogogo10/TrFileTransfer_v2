@@ -991,7 +991,9 @@ pub async fn cs_server_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
     prelude_read(wire, &mut confirm_c).await?;
     let expect_c = cs_confirm(&auth_key, "c2s-confirm", &c_pub, &s_pub);
     if !ct_eq(&expect_c, &confirm_c) {
-        opts.gate.lock().await.success(&peer.ip());
+        // 代码对但证明对不上 = 对端持有不同会话密钥（中间人/异常客户端）——
+        // 记账方向必须与「配对失败」一致；旧实现误记为 success 会清零锁定计数。
+        opts.gate.lock().await.fail(&peer.ip());
         return Err(Error::AuthRejected("客户端证明校验失败".into()));
     }
     opts.gate.lock().await.success(&peer.ip());
@@ -1042,10 +1044,9 @@ pub async fn cs_server_pairing<S: AsyncRead + AsyncWrite + Unpin>(
             "{peer}: 配对失败次数过多，已临时锁定"
         )));
     }
-    let status = if code.is_empty() {
+    // 未启用配对（code 为空）时 0x05 一律放行（C# lenient path，等价于无鉴权）。
+    let status = if code.is_empty() || ct_eq(&hash, &sha256_code(code)) {
         0u8
-    } else if ct_eq(&hash, &sha256_code(code)) {
-        0
     } else {
         1
     };
@@ -2607,7 +2608,9 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
     {
         return Ok((false, 0, 0));
     }
-    let mut manifest: Vec<ManifestEntry> = Vec::with_capacity(file_count as usize);
+    // 容量提示封顶：file_count 上限 1,000,000（64 条并发连接下预分配可达数 GB）。
+    // 合法清单逐项增长即可，提示只影响首次扩容次数。
+    let mut manifest: Vec<ManifestEntry> = Vec::with_capacity((file_count as usize).min(1024));
     let mut manifest_total = 0u64;
     for _ in 0..file_count {
         let mut fh = [0u8; 10];
@@ -3213,6 +3216,19 @@ pub fn derive_resume_session_guid(path: &Path, size: u64, addr: SocketAddr) -> [
 
 /// 读 0x10 判决（10 字节：[0x10][offset i64][status u8]，长窗口）。EOF = 对端
 /// 不认 0x03（旧对端/未启用）→ Unsupported（调用方回退 0x00 全量）。
+/// 「对端不认识这帧」在 TCP 上的两种长相：优雅关闭（EOF）与 RST/Aborted/BrokenPipe
+/// （对端一读到类型字节就断开、入站缓冲里还压着未读帧头——Linux/macOS 回 RST）。
+/// 协商阶段两者都归 Unsupported，调用方才能降级；传输中段只当 IO 错误重试。
+fn peer_closed(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
 async fn read_resume_response<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut CsWire<S>,
     what: &str,
@@ -3220,22 +3236,9 @@ async fn read_resume_response<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(u64, u8)> {
     let mut resp = [0u8; 10];
     let r = tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp)).await;
-    // 「对端不认识这帧」在 TCP 上有两种长相：优雅关闭（EOF）与 RST（对端一读到
-    // 类型字节就断开、入站缓冲里还压着未读的帧头——Linux/macOS 会回 RST）。
-    // 协商阶段两者都归 Unsupported，调用方才能降级 0x00；终态阶段只认 EOF，
-    // 免得把「传完却被重置」误判成旧对端而整文件重发。
-    let closed = |e: &io::Error| {
-        matches!(
-            e.kind(),
-            io::ErrorKind::UnexpectedEof
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::ConnectionAborted
-                | io::ErrorKind::BrokenPipe
-        )
-    };
     match r {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if unsupported_on_close && closed(&e) => {
+        Ok(Err(e)) if unsupported_on_close && peer_closed(&e) => {
             return Err(Error::Unsupported(format!(
                 "对端未提供 0x03 续传判决（{what}）"
             )))
@@ -3847,15 +3850,7 @@ pub(crate) async fn cs_send_folder_sync<S: AsyncRead + AsyncWrite + Unpin>(
     let mut resp = [0u8; 18];
     match tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp)).await {
         Ok(Ok(())) => {}
-        Ok(Err(e))
-            if matches!(
-                e.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::BrokenPipe
-            ) =>
-        {
+        Ok(Err(e)) if peer_closed(&e) => {
             return Err(Error::Unsupported(
                 "对端不支持文件夹同步（0x04，旧对端或未启用）".into(),
             ))
