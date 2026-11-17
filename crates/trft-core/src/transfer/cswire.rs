@@ -3216,13 +3216,26 @@ pub fn derive_resume_session_guid(path: &Path, size: u64, addr: SocketAddr) -> [
 async fn read_resume_response<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut CsWire<S>,
     what: &str,
+    unsupported_on_close: bool,
 ) -> Result<(u64, u8)> {
     let mut resp = [0u8; 10];
     let r = tokio::time::timeout(LONG_READ_WINDOW, wire.read_exact(&mut resp)).await;
-    let eof = |e: &io::Error| e.kind() == io::ErrorKind::UnexpectedEof;
+    // 「对端不认识这帧」在 TCP 上有两种长相：优雅关闭（EOF）与 RST（对端一读到
+    // 类型字节就断开、入站缓冲里还压着未读的帧头——Linux/macOS 会回 RST）。
+    // 协商阶段两者都归 Unsupported，调用方才能降级 0x00；终态阶段只认 EOF，
+    // 免得把「传完却被重置」误判成旧对端而整文件重发。
+    let closed = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+        )
+    };
     match r {
         Ok(Ok(())) => {}
-        Ok(Err(e)) if eof(&e) => {
+        Ok(Err(e)) if unsupported_on_close && closed(&e) => {
             return Err(Error::Unsupported(format!(
                 "对端未提供 0x03 续传判决（{what}）"
             )))
@@ -3281,7 +3294,7 @@ pub(crate) async fn cs_send_file_resume_on<S: AsyncRead + AsyncWrite + Unpin>(
     header.extend_from_slice(&claimed);
     wire.write_all(&header).await?;
 
-    let (server_off, status) = read_resume_response(wire, "协商").await?;
+    let (server_off, status) = read_resume_response(wire, "协商", true).await?;
     match status {
         0 | 1 => {}
         2 => {
@@ -3335,7 +3348,7 @@ pub(crate) async fn cs_send_file_resume_on<S: AsyncRead + AsyncWrite + Unpin>(
     let inc: [u8; 32] = hasher.finalize().into();
     wire.write_all(&inc).await?;
 
-    let (_, fin) = read_resume_response(wire, "终态").await?;
+    let (_, fin) = read_resume_response(wire, "终态", false).await?;
     match fin {
         2 => {
             if let Some(r) = reporter {
