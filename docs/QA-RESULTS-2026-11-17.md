@@ -65,6 +65,15 @@
 | C12 | 队列增删 | ✅ | 设 `#send-path` 后点 `#btn-queue-add`，`#queue-list` 出现 `a11.bin ✕`；清空生效 | 第一次运行仍报「校验完成」（`scanned=1118/2002`）——GUI 聚合丢 `stopped`（**F4**）；修复后提示「校验已中止（仅扫描了部分文件）」、进度 1620/2002 |
 
 驱动方式：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` + CDP `Runtime.evaluate`（Node 内置 WebSocket）。
+## C# 2.14 互通（UIA 驱动，双向通过）
+
+| 方向 | 结果 | 证据 |
+|---|---|---|
+| trft（UDT）→ C# 2.14 服务端 | ✅ | C# 侧启动 UDT 18080、目录 `C:\Users\chen\interop\recv`；trft 发送 1 MiB，收到文件哈希 `f5664984…9d35` 与源一致 |
+| C# 2.14 客户端 → trft（UDT）接收端 | ✅ | C# 客户端选 UDT、127.0.0.1:18081、关加密/压缩，发送 1 MiB；trft 接收端最终名 `a11.bin`、哈希 `f5664984…9d35` 与源一致（发布完成有几秒延迟，首发列表会看到满长度 `.trft-part`） |
+
+驱动方式：`System.Windows.Automation`（UIA）按 AutomationId 设值/点按钮，无需前台焦点。
+
 ## 未完成（需人工/其它环境）
 
 | ID | 原因 |
