@@ -1616,6 +1616,12 @@ pub fn verify_start(app: tauri::AppHandle) -> Result<u64, String> {
                     agg.fresh += r.fresh;
                     agg.unreadable += r.unreadable;
                     agg.mismatches.extend(r.mismatches);
+                    // 真机 C9：聚合必须带上中止标记，否则前端永远显示「校验完成」
+                    //（只扫了一部分也报成功）；停止后不再进入下一个根。
+                    agg.stopped |= r.stopped;
+                    if r.stopped {
+                        break 'outer;
+                    }
                 }
                 Err(e) => {
                     let _ = app2.emit("trft://log", serde_json::json!({ "level": "err", "message": format!("校验任务失败: {e}") }));

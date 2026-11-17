@@ -744,6 +744,16 @@ permit_reader_holds_permit_until_dropped（已做去修复必红实测）。
 
 ---
 
+## 真机 F4：GUI 校验聚合丢 stopped（2026-11-17，轮 UI-5 续 11）
+
+CDP 驱动 GUI 冒烟（C9）发现：校验中途停止后仍提示「校验完成」，`scanned` 只有 1118/2002。
+根因：`commands::verify_start` 的聚合体只累加计数（`scanned/hit/...`），**没有把各根的
+`stopped` 合入**，前端 `r.stopped` 恒为 undefined —— 之前只改了 `scrub` 与前端，GUI 命令层
+漏了。修复：`agg.stopped |= r.stopped;`，且停止后 `break 'outer` 不再进入下一个根。
+真机复核：提示「校验已中止（仅扫描了部分文件）」、进度 1620/2002。
+
+---
+
 ## 真机 F3：0x04 发布前数据落盘（2026-11-17，轮 UI-5 续 10）
 
 B5（0x04 覆盖完成瞬间硬断电）暴露：接收端已回「同步完成」，重启后文件在最终名、

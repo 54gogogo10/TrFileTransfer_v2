@@ -428,6 +428,8 @@
 
 55. **真机 F2：发布改名落盘（轮 UI-5 续 9，2026-11-17）**：B3 断电暴露——数据 fsync 了但 `hard_link`/`rename` 的目录项未落盘，重启后文件仍是 `.trft-part` 而发送端已收「完成」。新增 `publish` 模块：Windows `MoveFileExW(WRITE_THROUGH)` 的 `move_noreplace`/`move_replace`，接入 `publish_part`/UDP/C# 方言/0x04 四处；判别 `publish::tests`；真机二次断电复核最终名与哈希一致。基线 297 → **299 项全绿**。
 
+56. **真机 F4：GUI 校验聚合丢 stopped（轮 UI-5 续 11，2026-11-17）**：CDP 驱动 GUI（C9）发现中途停止仍报「校验完成」——`verify_start` 聚合只累加计数、未合入 `stopped`；补 `agg.stopped |= r.stopped` 并在中止后退出根循环。真机复核提示「校验已中止」。同批记录 C 段 5 项（C1/C2/C7/C8/C9）CDP 冒烟结果。
+
 52. **GUI 共享启停竞态（轮 UI-5 续 6，2026-11-16）**：基线 294 → **295 项全绿**（clippy 无新增）。
    - HttpHandle 增 `gen: Arc<()>`；`http_start` 先占位再 bind（检查与插入同一临界区），bind 失败按 gen 收回；收尾凭 `Arc::ptr_eq` 判定（被 stop 取走则报「共享在启动过程中被停止」，不复活）；判别：http_start_placeholder_blocks_double_start_and_detects_stop。
 
