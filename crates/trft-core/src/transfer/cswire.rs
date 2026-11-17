@@ -1860,6 +1860,9 @@ async fn receive_payload<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
+    // 回执前落盘（与 0x02/0x03 及 v2 接收路径同纪律）：否则 ACK 只代表
+    // 「进了页缓存」——掉电后对端已收到成功的文件可能变空/截断。
+    f.sync_all()?;
     let mut got = [0u8; 32];
     wire.read_exact(&mut got).await?;
     let computed: [u8; 32] = hasher.finalize().into();
