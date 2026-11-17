@@ -13,9 +13,18 @@ pub const RUDP_HEADER_LEN: usize = 12;
 pub const RUDP_MAGIC: [u8; 2] = [b'T', b'U'];
 /// 默认单包载荷上限：1200B（+ UDP/IP 头 <1280B，规避 IPv4/IPv6 分片与隧道黑洞）。
 pub const RUDP_PAYLOAD_MAX: usize = 1200;
-/// MSS 协商上限（性能批 2026-11-14）：环回/内网大包——Windows 环回 UDP 数据报
-/// 上限 65507B，60000 留余量。非环回链路的提案仍为以太网友好的 1400B。
+/// MSS 协商上限（性能批 2026-11-14）：环回/内网大包——Windows/Linux 环回 UDP
+/// 数据报上限 65507B，60000 留余量。非环回链路的提案仍为以太网友好的 1400B。
 pub const RUDP_MSS_CEIL: usize = 60000;
+
+/// 环回提案的实际取值。**macOS 的 `net.inet.udp.maxdgram` 默认仅 9216B**，
+/// 超限 `sendto` 返回 EMSGSIZE（发送侧此前忽略该错误 → 数据包一个也发不出去，
+/// 重传耗尽后报「重传超限（链路过差）」；CI 的 macOS 任务据此长期红）。
+/// 保守取 8000（含 14B 包头仍 < 9216）。
+#[cfg(target_os = "macos")]
+pub const RUDP_MSS_LOOPBACK: usize = 8000;
+#[cfg(not(target_os = "macos"))]
+pub const RUDP_MSS_LOOPBACK: usize = RUDP_MSS_CEIL;
 /// 单个数据报缓冲上限（含头 + 长度字段；协商 mss 无论如何不超过它）。
 pub const RUDP_DATAGRAM_MAX: usize = RUDP_HEADER_LEN + 2 + RUDP_MSS_CEIL;
 

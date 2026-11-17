@@ -456,7 +456,12 @@ fn url_decode(s: &str) -> String {
 /// 路径穿越防线（规格 §5.1）：拒绝 `..`、绝对路径、盘符前缀与 NUL。
 fn resolve_under(base: &Path, rel: &str) -> Result<PathBuf, (StatusCode, &'static str)> {
     let p = PathBuf::from(rel);
+    // 反斜杠在 Unix 是合法文件名字符，但跨平台语义歧义：`..\..` 在 Windows 是
+    // 穿越、在 Unix 会被当成单个普通名字（CI 上因此判 404 而非 400）。安全判定
+    // 把 `\` 与 `/` 同视、只拦 `..` 段——含反斜杠的普通文件名不受影响。
+    let slash_probe = rel.replace('\\', "/");
     if rel.contains('\0')
+        || slash_probe.split('/').any(|c| c == "..")
         || p.components().any(|c| {
             matches!(
                 c,

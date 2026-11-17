@@ -66,6 +66,10 @@ pub(crate) struct GroupSession {
     file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     state: tokio::sync::Mutex<GroupState>,
     last_seen_ms: AtomicU64,
+    /// 创建序号（单调递增）：`last_seen_ms` 只有毫秒精度，同一毫秒内连开多组时
+    /// 「最旧」只能靠它裁决——否则逐出顺序取决于 HashMap 的随机迭代顺序
+    /// （CI 上表现为「victim 永不逐出」的假红/真抖动）。
+    seq: u64,
     /// 组装结论唤醒（finish 成功/失败时唤醒 0x0C 等待者）。
     notify: std::sync::Arc<tokio::sync::Notify>,
     /// 进度上报（会话创建时注册；None = 不上报）。
@@ -77,6 +81,8 @@ pub struct ChunkTracker {
     sessions: tokio::sync::Mutex<HashMap<[u8; 16], std::sync::Arc<GroupSession>>>,
     /// 进度事件出口（GUI 注入；Default None = 不上报）。
     pub progress: Option<crate::progress::ProgressHub>,
+    /// 会话创建序号分配器（逐出排序的同毫秒裁决键）。
+    seq: AtomicU64,
 }
 
 /// 逐出一个会话：删半成品（打开句柄可能删不掉——孤儿清扫兜底）+ 给进度卡补终态
@@ -186,16 +192,23 @@ impl ChunkTracker {
         }
         // 单来源配额：本来源已满则逐出本来源最旧、且**不在组装中**的组。
         // 绝不跨 peer 逐出（跨 peer 删他人半成品是远程 DoS 面）。
-        let mine: Vec<([u8; 16], u64)> = map
+        let mine: Vec<([u8; 16], u64, u64)> = map
             .iter()
             .filter(|(_, s)| s.peer == peer_ip)
-            .map(|(k, s)| (*k, s.last_seen_ms.load(Ordering::Relaxed)))
+            .map(|(k, s)| {
+                (
+                    *k,
+                    s.last_seen_ms.load(Ordering::Relaxed),
+                    s.seq,
+                )
+            })
             .collect();
         if mine.len() >= MAX_SESSIONS_PER_PEER {
             let mut order = mine;
-            order.sort_by_key(|(_, ts)| *ts);
+            // 同毫秒并列时用创建序号裁决（否则顺序随 HashMap 随机种子漂移）。
+            order.sort_by_key(|(_, ts, seq)| (*ts, *seq));
             let mut victim = None;
-            for (k, _) in order {
+            for (k, _, _) in order {
                 // 组装中的组不得删（发布与迟到写竞态）；try_lock 失败视同组装中。
                 let assembling = map
                     .get(&k)
@@ -243,7 +256,9 @@ impl ChunkTracker {
             }
             Err(e) => return Err(proto(format!("创建分块临时文件失败: {e}"))),
         };
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let s = std::sync::Arc::new(GroupSession {
+            seq,
             name: name.to_string(),
             total,
             peer: peer_ip.to_string(),

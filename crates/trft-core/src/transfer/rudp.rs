@@ -1049,7 +1049,8 @@ fn random_u32() -> u32 {
 /// 放大到 ≈123MB（轮 UI-5 P2）。独立成纯函数以便单测。
 fn clamp_peer_mss(mss: usize, peer_is_loopback: bool) -> usize {
     if peer_is_loopback {
-        mss
+        // macOS 上对端提案 60000 也不能照单全收：本端回程包同样受 maxdgram 限制。
+        mss.min(pw::RUDP_MSS_LOOPBACK)
     } else {
         mss.min(1400)
     }
@@ -1065,7 +1066,7 @@ pub async fn connect_rudp(addr: SocketAddr, src_port: Option<u16>) -> Result<Rud
     let conn_id = random_u32();
     let nonce = random_bytes(16);
     let propose: usize = if addr.ip().is_loopback() {
-        pw::RUDP_MSS_CEIL
+        pw::RUDP_MSS_LOOPBACK
     } else {
         RUDP_MSS_LAN
     };
@@ -1513,7 +1514,11 @@ mod tests {
     /// 块计（2048 块），不钳制则单连接内存上限 ≈123MB。
     #[test]
     fn peer_mss_clamped_for_non_loopback() {
-        assert_eq!(clamp_peer_mss(60_000, true), 60_000, "环回放行高带宽提案");
+        assert_eq!(
+            clamp_peer_mss(60_000, true),
+            pw::RUDP_MSS_LOOPBACK,
+            "环回提案随平台上限（macOS maxdgram 9216 → 8000）"
+        );
         assert_eq!(clamp_peer_mss(60_000, false), 1400, "非环回钳到 1400");
         assert_eq!(clamp_peer_mss(1200, false), 1200, "低于 1400 保持原值");
     }
@@ -1863,8 +1868,8 @@ mod tests {
             .expect("协商握手必须成功");
         assert_eq!(
             s.conn.send.lock().unwrap().mss,
-            pw::RUDP_MSS_CEIL,
-            "环回新服务端必须协商到最大 mss"
+            pw::RUDP_MSS_LOOPBACK,
+            "环回新服务端必须协商到平台环回上限"
         );
         drop(s);
         srv.abort();
