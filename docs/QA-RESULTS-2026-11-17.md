@@ -165,9 +165,12 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 | 宿主 **C# 2.14** → VM trft（0x09 加密 + 配对码 + deflate） | ✅ | 8 MiB / 0.8s，C# 日志 `Encrypted session established (AES-256)`，VM 落盘哈希一致 |
 | 宿主 trft `--chunks 4` → VM trft（0x02） | ✅ | 8 MiB / 0.2s，VM 日志先记探针 `0x02 头非法` 再收分块，落盘哈希一致 |
 | 宿主 trft `sync` → VM trft（0x04） | ✅ | 会话目录 `syncsrc.0da1f5a0/`，两文件哈希一致；**二次同步 0.06s**、无重复副本（逐文件跳过生效） |
-| VM → 宿主（反向） | ⚠️ 环境阻断 | 宿主未提权，入站 19611 无防火墙规则 → VM 侧 10s 连接超时；需管理员加规则：`netsh advfirewall firewall add rule name=trft-test dir=in action=allow program=<trft.exe> protocol=tcp localport=19611` |
+| **VM trft → 宿主 trft（反向 0x03）** | ✅ | 放行入站 19611 后 64 MiB 哈希一致 |
+| **VM trft `--chunks 4` → 宿主 trft（反向 0x02）** | ✅ | 64 MiB 哈希一致；宿主日志先记探针 `0x02 头非法` 再收分块 |
+| **VM trft `sync` → 宿主 trft（反向 0x04）** | ✅ | 会话目录 `syncsrc2.ace398b9/`，两文件哈希一致 |
+| VM trft `--code` → 宿主 **C# 接收端** | ⚠️ 规则范围所致 | 放行规则 `trft-test` 是**程序级**（`target\release\trft.exe` + 19611），C# 接收端不在规则内 → VM 侧 10s 连接超时；补一条程序规则即可（`program=<TrFileTransfer.exe>`） |
 
-**清理**：VM 上本轮创建的计划任务（trft-recv1/3/4/5、trft-send1）与新增的 exe/bat/日志/接收目录已删除；SMB 映射保留（`net use \\10.143.208.49\C$`，此前既有记忆映射）。VM 上更早会话遗留的 `trft-test` 负载（a2.bin 5GiB 等）未动。
+**清理**：VM 上本轮创建的计划任务（trft-recv1/3/4/5、trft-send1、trft-sendA–D）与新增的 exe/bat/日志/接收目录/同步源已删除；SMB 映射保留（`net use \\10.143.208.49\C$`，此前既有记忆映射）。VM 上更早会话遗留的 `trft-test` 负载（a2.bin 5GiB 等）未动。宿主侧临时目录（revA–D、big64）已清。
 
 ## 未完成（需人工/其它环境）
 
