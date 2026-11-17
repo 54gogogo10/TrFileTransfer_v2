@@ -264,6 +264,106 @@ async fn resume_survives_interrupted_transfer() {
     common::assert_no_leftovers(&out);
 }
 
+
+/// 判别（实机 C# GUI 暂停/继续抓到的假成功）：断连的 0x02 分块**不得**计入覆盖表。
+/// 旧实现「读满即登记」——暂停时四块都已读入内存，覆盖表被填满但组装器未发布；
+/// 对端 0x0B 查询得「0 缺口」→ 一块不补就报成功，磁盘上只剩 .trft-part。
+#[tokio::test]
+async fn aborted_chunk_is_not_counted_as_covered() {
+    use tokio::io::AsyncWriteExt;
+    use trft_core::hash::sha256;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let (l, addr) = ephemeral_listener().await;
+    let s1 = tokio::spawn(trft_core::transfer::receiver::serve_on(
+        l,
+        opts_resident(out.clone(), None),
+    ));
+    let name = "hole.bin";
+    let total: u64 = 4 * 1024 * 1024;
+    let mut gid = [0u8; 16];
+    OsRng.fill_bytes(&mut gid);
+    let first = vec![0xA1u8; 2 * 1024 * 1024];
+    let second = vec![0xB2u8; 2 * 1024 * 1024];
+
+    async fn conn(addr: std::net::SocketAddr) -> TcpStream {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[0x0Au8, 0x02]).await.unwrap();
+        let mut r = [0u8; 2];
+        s.read_exact(&mut r).await.unwrap();
+        assert_eq!(r, [0x1A, 0x03]);
+        s
+    }
+    async fn send_chunk(
+        s: &mut TcpStream,
+        total: u64,
+        off: u64,
+        data: &[u8],
+        name: &str,
+        gid: &[u8; 16],
+        with_tail: bool,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut hdr = vec![0x02u8];
+        hdr.extend_from_slice(&(total as i64).to_le_bytes());
+        hdr.extend_from_slice(&(off as i64).to_le_bytes());
+        hdr.extend_from_slice(&(data.len() as i64).to_le_bytes());
+        hdr.extend_from_slice(&(name.len() as i32).to_le_bytes());
+        hdr.extend_from_slice(name.as_bytes());
+        hdr.push(1);
+        hdr.extend_from_slice(gid);
+        s.write_all(&hdr).await.unwrap();
+        s.write_all(data).await.unwrap();
+        if with_tail {
+            s.write_all(&sha256(data)).await.unwrap();
+            let mut ack = [0u8; 1];
+            s.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack[0], 0x01, "完整分块必须被收下");
+        }
+    }
+
+    // 连接 A：整块数据已发出，但尾哈希前直接断（模拟暂停/取消）。
+    {
+        let mut s = conn(addr).await;
+        send_chunk(&mut s, total, 0, &first, name, &gid, false).await;
+        drop(s);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 连接 B：0x0B 覆盖查询——已读未验的块不得出现在覆盖表里。
+    {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut s = conn(addr).await;
+        s.write_all(&[0x0Bu8]).await.unwrap();
+        s.write_all(&gid).await.unwrap();
+        let mut head = [0u8; 5];
+        s.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], 0x1B);
+        let n = i32::from_le_bytes(head[1..5].try_into().unwrap());
+        assert_eq!(n, 0, "断连的块不得计入覆盖（实际 {n} 个区间）");
+    }
+
+    // 连接 C/D：补发两块（各自独立连接），第二块补满后发布。
+    {
+        let mut s = conn(addr).await;
+        send_chunk(&mut s, total, 0, &first, name, &gid, true).await;
+    }
+    {
+        let mut s = conn(addr).await;
+        send_chunk(&mut s, total, 2 * 1024 * 1024, &second, name, &gid, true).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = std::fs::read(out.join(name)).expect("补发后必须发布最终文件");
+    assert_eq!(got.len() as u64, total);
+    assert_eq!(&got[..first.len()], &first[..], "前半内容一致");
+    assert_eq!(&got[first.len()..], &second[..], "后半内容一致");
+    common::assert_no_leftovers(&out);
+    s1.abort();
+}
+
 #[tokio::test]
 async fn coverage_query_reports_written_ranges() {
     // 0x0B：手工发送部分块 → 新连接查询 → 合并区间精确反映已写盘范围（落盘即状态）。

@@ -1134,17 +1134,40 @@ impl CsChunkTracker {
         })
     }
 
-    /// 写入一个偏移段；返回是否已完整覆盖 [0, total)。
-    fn write_chunk(&mut self, off: u64, data: &[u8]) -> io::Result<bool> {
+    /// 写入一个偏移段的数据（**不登记覆盖**）。
+    ///
+    /// 覆盖登记推迟到尾哈希校验通过之后（commit_range）——实机 C# GUI
+    /// 暂停/继续暴露的假成功：一块 2MiB 已整块读入、但尾哈希前连接被取消，
+    /// 旧实现已把区间记入覆盖表；对端按 0x0B 查询得「0 缺口」→ 一块不补 →
+    /// 客户端报成功，而组装器永远停在未发布状态（.trft-part 残留）。
+    fn write_data(&mut self, off: u64, data: &[u8]) -> io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
         self.touched = Instant::now();
+        let end = off + data.len() as u64;
+        if self.is_covered(off, end) {
+            return Ok(()); // 已验过的区间：重复补发不重写盘
+        }
         self.file.seek(SeekFrom::Start(off))?;
-        self.file.write_all(data)?;
-        self.received += data.len() as u64;
-        Self::insert_range(&mut self.ranges, off, off + data.len() as u64 - 1);
+        self.file.write_all(data)
+    }
+
+    /// 区间 [start, end) 是否已被**已校验**覆盖表包含。
+    fn is_covered(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(a, b)| a <= start && end <= b + 1)
+    }
+
+    /// 尾哈希通过后登记覆盖；返回是否已完整覆盖 [0, total)。
+    fn commit_range(&mut self, off: u64, len: u64) -> bool {
+        self.touched = Instant::now();
+        if len > 0 {
+            Self::insert_range(&mut self.ranges, off, off + len - 1);
+        }
+        self.received = self.ranges.iter().map(|&(a, b)| b - a + 1).sum();
         // 完整 = 单一合并区间且恰覆盖 [0, total)（首尾判据会被中段洞骗过——
         // 轮 1 修复：ranges 已按升序不重叠维护，单区间即无洞）。
-        Ok(self.ranges.len() == 1 && self.ranges[0] == (0, self.total - 1))
+        self.ranges.len() == 1 && self.ranges[0] == (0, self.total - 1)
     }
 
     fn insert_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
@@ -1658,12 +1681,14 @@ async fn run_conn<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let mut id = [0u8; 16];
             wire.read_exact(&mut id).await?;
-            let key = format!("S|{}", guid_hex(&id));
+            let gid_hex = guid_hex(&id);
+            let key = format!("S|{gid_hex}");
             // 组归属校验（轮 6 P1，对齐 C# WireProtocol.cs:662-671 ChunkSessionPeers——
-            // 此前任何认证过的 peer 可查询他人 group 的已收区间）。
+            // 此前任何认证过的 peer 可查询他人 group 的已收区间）。归属表以**裸
+            // guidHex** 为键（handle_chunk 插入时同键），带 "S|" 前缀的是组装器键。
             {
                 let owners = state.group_peers.lock().expect("组归属锁");
-                match owners.get(&key) {
+                match owners.get(&gid_hex) {
                     Some((owner, _)) if *owner != peer.ip().to_string() => {
                         drop(owners);
                         outcome.rejected = true;
@@ -2110,7 +2135,6 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
     let mut hasher = sha2::Sha256::new();
     let mut remaining = chunk as u64;
     let mut write_off = offset as u64;
-    let mut complete = false;
     let mut buf = vec![0u8; CS_RECV_BUF];
     while remaining > 0 {
         let n = buf.len().min(remaining as usize);
@@ -2123,7 +2147,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             let mut t = state.trackers.lock().expect("tracker 锁");
             match t.get_mut(&tracker_key) {
                 Some(tr) => {
-                    complete = tr.write_chunk(write_off, &buf[..n])?;
+                    tr.write_data(write_off, &buf[..n])?;
                     if tr.ranges_count() > CS_MAX_CHUNK_RANGES {
                         return Err(Error::Rejected("分块覆盖区间数超限".into()));
                     }
@@ -2156,6 +2180,18 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
         }
         return Ok((false, false));
     }
+    // 尾哈希通过 → 才把这整块的区间记入覆盖表（断连的块不留覆盖）。
+    let complete = {
+        let mut t = state.trackers.lock().expect("tracker 锁");
+        match t.get_mut(&tracker_key) {
+            Some(tr) => tr.commit_range(offset as u64, chunk as u64),
+            None => {
+                return Err(Error::Rejected(
+                    "分块组装器已被回收（请整组重发）".into(),
+                ))
+            }
+        }
+    };
     if complete {
         let t = state
             .trackers
@@ -4376,17 +4412,21 @@ mod tests {
         let path = dir.path().join("t.bin");
         let mut tr = CsChunkTracker::create(path.clone(), 400).unwrap();
         let seg: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
-        // 乱序：第 3 段先到。
-        assert!(!tr.write_chunk(200, &seg).unwrap());
-        assert!(!tr.write_chunk(300, &seg).unwrap());
+        // 乱序：第 3 段先到。写数据与登记覆盖分两步（尾哈希通过才 commit）。
+        tr.write_data(200, &seg).unwrap();
+        assert!(!tr.commit_range(200, 100));
+        tr.write_data(300, &seg).unwrap();
+        assert!(!tr.commit_range(300, 100));
         // 此时 ranges=[(200,299),(300,399)] —— 首段缺失，不得判完整。
         assert!(
             !(tr.ranges_exclusive().first().map(|r| r.0) == Some(0)
                 && tr.ranges_exclusive().last().map(|r| r.1) == Some(400)),
             "有洞时不得满足 [0,total) 覆盖"
         );
-        assert!(!tr.write_chunk(0, &seg).unwrap());
-        assert!(tr.write_chunk(100, &seg).unwrap());
+        tr.write_data(0, &seg).unwrap();
+        assert!(!tr.commit_range(0, 100));
+        tr.write_data(100, &seg).unwrap();
+        assert!(tr.commit_range(100, 100));
         drop(tr);
         let got = std::fs::read(&path).unwrap();
         assert_eq!(got.len(), 400);
