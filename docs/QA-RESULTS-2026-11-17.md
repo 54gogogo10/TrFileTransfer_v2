@@ -178,5 +178,6 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 ## 清理
 
 - VM：`trft-recv`/`trft-kill`/`trft-hash` 等任务已删，接收进程已终止。
-- 宿主：`net use \\10.143.208.49\C$`、`C:\Users\chen\trft-remote\` 暂留。
+- 宿主 C 盘（2026-11-17 补清）：`C:\Users\chen\trft-remote\`（85 个文件 / **6.54 GB** 测试负载、脚本、截图）已删；`%TEMP%\trft-*` 11 项已删；`%APPDATA%\TrFileTransfer` 下测试残留——`stats.log` 测试行 49 条、hash 缓存测试条目（1.39 MB→89 KB、698 KB→4 KB）、`resume`/`server-resume` 测试会话 246 个、默认接收目录 `tcp\` 2006 个测试文件（18.9 MB）——全部清除；`devices.json` 清空、`client_port` 恢复 8080、配对码保持清空。应用日志（`logs\`）与真实历史保留。
+- 宿主网络：`net use \\10.143.208.49\C$` 仍为 Disconnected 记忆映射（未删，按需清理）。
 
