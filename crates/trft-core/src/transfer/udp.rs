@@ -594,6 +594,21 @@ struct Session {
     start: Instant,
     /// START 尾段携带的预期全文哈希（新发送端）；None = 旧发送端，仍等 END。
     start_hash: Option<[u8; 32]>,
+    /// 会话来源（异步收尾的事件要带 peer 记账；engine 测试路径为 None）。
+    peer: Option<IpAddr>,
+}
+
+/// 收尾任务：会话已从表里摘除，剩下纯文件操作（独立线程执行）。
+#[derive(Clone)]
+pub(crate) struct FinalizeJob {
+    pub(crate) session: u64,
+    pub(crate) part_path: PathBuf,
+    pub(crate) name: String,
+    pub(crate) dir: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) start: Instant,
+    pub(crate) expected: [u8; 32],
+    pub(crate) peer: Option<IpAddr>,
 }
 
 /// 目录解析器（PerDeviceFolder/AutoArchive；None = 一律 save_dir）。
@@ -609,6 +624,10 @@ pub struct UdpRecvEngine {
     next_seq: u64,
     /// 当前活跃会话声明总量（防磁盘放大）。
     declared_total: u64,
+    /// 异步收尾开关（serve 层开启）：哈希/发布移交独立线程，不占收包批。
+    async_finalize: bool,
+    /// 待移交的收尾任务（serve 层每批后 drain）。
+    finalize_jobs: Vec<FinalizeJob>,
 }
 
 impl UdpRecvEngine {
@@ -625,7 +644,19 @@ impl UdpRecvEngine {
             dir_for,
             next_seq: 0,
             declared_total: 0,
+            async_finalize: false,
+            finalize_jobs: Vec::new(),
         }
+    }
+
+    /// serve 层：开启异步收尾（引擎直连测试保持同步路径，事件即时可见）。
+    pub(crate) fn enable_async_finalize(&mut self) {
+        self.async_finalize = true;
+    }
+
+    /// 取走已排队的收尾任务（serve 层负责起线程执行）。
+    pub(crate) fn drain_finalize_jobs(&mut self) -> Vec<FinalizeJob> {
+        std::mem::take(&mut self.finalize_jobs)
     }
 
     /// 空闲会话回收：超 SESSION_TTL 无任何帧 → 逐出并删除半成品。
@@ -680,7 +711,7 @@ impl UdpRecvEngine {
         };
         let payload = &buf[UDP_HEADER_LEN..];
         match h.frame {
-            U_F_START => self.on_start(h.session, payload, dir),
+            U_F_START => self.on_start(h.session, payload, dir, remote),
             U_F_DATA => self.on_data(h.session, h.seq, payload),
             U_F_PARITY => self.on_parity(h.session, payload),
             U_F_END => self.on_end(h.session, payload),
@@ -688,7 +719,13 @@ impl UdpRecvEngine {
         }
     }
 
-    fn on_start(&mut self, session: u64, p: &[u8], dir: PathBuf) -> UdpEvent {
+    fn on_start(
+        &mut self,
+        session: u64,
+        p: &[u8],
+        dir: PathBuf,
+        peer: Option<IpAddr>,
+    ) -> UdpEvent {
         if p.len() < 2 {
             return UdpEvent::Ignored("START 过短");
         }
@@ -795,6 +832,7 @@ impl UdpRecvEngine {
                 dir,
                 start: Instant::now(),
                 start_hash,
+                peer,
             },
         );
         let chunk_len = self.sessions[&session].chunk_len;
@@ -1058,33 +1096,29 @@ impl UdpRecvEngine {
             }
             return UdpEvent::Ignored("收尾写失败");
         }
+        // 异步收尾：会话摘除 → 任务排队 → serve 层起独立线程哈希+发布，
+        // 收包批不必等整文件重哈希（多会话/大文件下不再互相阻塞）。
+        if self.async_finalize {
+            let s = self.sessions.remove(&session).unwrap();
+            self.declared_total -= s.padded;
+            self.finalize_jobs.push(FinalizeJob {
+                session,
+                peer: s.peer,
+                part_path: s.part_path,
+                name: s.name,
+                dir: s.dir,
+                size: s.size,
+                start: s.start,
+                expected: claimed,
+            });
+            return UdpEvent::Ignored("收尾已排队");
+        }
         let part_path = s.part_path.clone();
         let name = s.name.clone();
         let size = s.size;
         let dir = s.dir.clone();
         let start = s.start;
-        let ok = std::fs::File::open(&part_path)
-            .map(|mut f| {
-                let mut dig = FileDigester::new();
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut left = size;
-                loop {
-                    let want = buf.len().min(left as usize);
-                    if want == 0 {
-                        break;
-                    }
-                    match f.read(&mut buf[..want]) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            dig.update(&buf[..n]);
-                            left -= n as u64;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                left == 0 && dig.finalize() == claimed
-            })
-            .unwrap_or(false);
+        let ok = hash_file_matches(&part_path, size, &claimed);
         if let Some(s) = self.sessions.remove(&session) {
             self.declared_total -= s.padded;
         }
@@ -1112,6 +1146,10 @@ impl UdpRecvEngine {
     }
 
     fn mark_suppressed(&mut self, session: u64) {
+        // 幂等：同步收尾路径由引擎自己记账，异步路径由 serve 层补记。
+        if self.suppressed.contains_key(&session) {
+            return;
+        }
         self.suppressed.insert(session, Instant::now());
         self.suppress_order.push_back(session);
         while self.suppress_order.len() > SUPPRESS_CAP {
@@ -1138,6 +1176,53 @@ fn known_count(s: &Session, group: u64, total_shards: usize) -> usize {
             }
         })
         .count()
+}
+
+
+/// 异步收尾线程体：整文件哈希复核 → 原子发布（失败即删半成品）。
+pub(crate) fn run_finalize(job: FinalizeJob) -> UdpEvent {
+    if !hash_file_matches(&job.part_path, job.size, &job.expected) {
+        let _ = std::fs::remove_file(&job.part_path);
+        return UdpEvent::Ignored("SHA-256 不一致，已删除");
+    }
+    match publish_part_sync(&job.part_path, &job.dir, &job.name) {
+        Some(dest) => UdpEvent::Completed {
+            session: job.session,
+            path: dest,
+            size: job.size,
+            start: job.start,
+        },
+        None => {
+            let _ = std::fs::remove_file(&job.part_path);
+            UdpEvent::Ignored("发布失败")
+        }
+    }
+}
+
+/// 整文件哈希复核（最多读 size 字节；短读即失败——掉电截断不得算通过）。
+fn hash_file_matches(part: &Path, size: u64, expected: &[u8; 32]) -> bool {
+    std::fs::File::open(part)
+        .map(|mut f| {
+            let mut dig = FileDigester::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut left = size;
+            loop {
+                let want = buf.len().min(left as usize);
+                if want == 0 {
+                    break;
+                }
+                match f.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        dig.update(&buf[..n]);
+                        left -= n as u64;
+                    }
+                    Err(_) => break,
+                }
+            }
+            left == 0 && dig.finalize() == *expected
+        })
+        .unwrap_or(false)
 }
 
 /// 同步版原子发布：hard_link fail-if-exists + 冲突名循环重取。
@@ -1297,30 +1382,45 @@ pub async fn serve_udp_on(
     } else {
         None
     };
-    let mut engine = UdpRecvEngine::with_resolver(opts.save_dir, dir_for);
+    // clone：save_dir 留在 opts 里，sink 需要整份 &opts（部分 move 后不能取整引用）。
+    let mut engine = UdpRecvEngine::with_resolver(opts.save_dir.clone(), dir_for);
+    // 收尾（整文件重哈希 + 发布）移交独立线程：不再占住收包批。
+    engine.enable_async_finalize();
     let mut buf = vec![0u8; 2048];
-    // 进度映射表：session → (Reporter, chunk_len, size, 已计入字节, 开始时刻)。Reporter::add 自带
-    // 100ms 节流（规格 §3.1——此处的 UdpEvent::Progress 是逐包事件，不能直发）；
-    // 引擎的 done 计的是块数，此处按 chunk_len 换算字节并钳到 size（末块余数不满块）。
-    // 表上限 256：引擎会话表有 TTL 逐出，这里同步封顶防映射表无界增长。
-    let mut reports: HashMap<u64, (crate::progress::Reporter, u64, u64, u64, std::time::Instant)> =
-        HashMap::new();
-    let mut report_order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut sink = RecvSink {
+        opts: &opts,
+        events: &events,
+        reports: HashMap::new(),
+        report_order: std::collections::VecDeque::new(),
+    };
+    // 收尾线程 → 主循环的结果通道（Completed/Ignored 回到同一事件处理器）。
+    let (ftx, mut frx) = mpsc::unbounded_channel::<(IpAddr, UdpEvent)>();
+    let mut pending_finalize = 0usize;
     loop {
         // 惰性清扫（轮 3 P2-5）：引擎逐出（64 会话帽/TTL）不产生 Completed——
         // 对应 Reporter 悬空会让 GUI 进度卡永久 running。超龄（TTL+60s）即补失败终态。
-        let stale: Vec<u64> = reports
-            .iter()
-            .filter(|(_, (.., t))| t.elapsed() > SESSION_TTL + Duration::from_secs(60))
-            .map(|(k, _)| *k)
-            .collect();
-        for k in stale {
-            if let Some((r, ..)) = reports.remove(&k) {
-                r.fail();
-            }
-            report_order.retain(|s| s != &k);
+        sink.sweep_stale();
+        // 抽干已完成的异步收尾（不阻塞收包）。
+        while let Ok((peer_ip, ev)) = frx.try_recv() {
+            pending_finalize = pending_finalize.saturating_sub(1);
+            sink.handle(&mut engine, peer_ip, ev);
         }
-        let (n, peer) = match socket.recv_from(&mut buf).await {
+        let recv = if pending_finalize > 0 {
+            // 有收尾在飞：等待期间同时收结果，事件不必等下一个数据报。
+            tokio::select! {
+                r = socket.recv_from(&mut buf) => r,
+                done = frx.recv() => {
+                    if let Some((peer_ip, ev)) = done {
+                        pending_finalize = pending_finalize.saturating_sub(1);
+                        sink.handle(&mut engine, peer_ip, ev);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            socket.recv_from(&mut buf).await
+        };
+        let (n, peer) = match recv {
             Ok(v) => v,
             // 缓冲小于数据报 → MSGSIZE——一个超长垃圾包不得杀死整个接收器
             // （轮 4 P1：LAN kill switch，已实测复现）。合法帧上限 1525B，
@@ -1378,85 +1478,141 @@ pub async fn serve_udp_on(
         };
         engine = eng;
         for (peer_ip, ev) in evs {
-            let peer_str = peer_ip.to_string();
-            match &ev {
-                UdpEvent::Started {
-                    session,
-                    name,
-                    size,
-                    chunk_len,
-                } => {
-                    if let Some(hub) = &opts.progress {
-                        if reports.len() >= 256 {
-                            if let Some(old) = report_order.pop_front() {
-                                if let Some((r, ..)) = reports.remove(&old) {
-                                    r.fail();
-                                }
+            sink.handle(&mut engine, peer_ip, ev);
+        }
+        // 起异步收尾线程：整文件哈希 + 发布不再占住收包批。
+        for job in engine.drain_finalize_jobs() {
+            let peer_ip = job
+                .peer
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            let tx = ftx.clone();
+            let fallback = job.clone();
+            match std::thread::Builder::new()
+                .name("trft-udp-finalize".into())
+                .spawn(move || {
+                    let ev = run_finalize(job);
+                    let _ = tx.send((peer_ip, ev));
+                }) {
+                Ok(_) => pending_finalize += 1,
+                Err(e) => {
+                    // 线程起不来：退化为同步收尾，文件仍会发布（不静默丢）。
+                    eprintln!("[警告] UDP 收尾线程启动失败，改为同步收尾: {e}");
+                    let ev = run_finalize(fallback);
+                    sink.handle(&mut engine, peer_ip, ev);
+                }
+            }
+        }
+    }
+}
+
+/// 接收事件处理器：进度映射、用户日志、统计与事件转发（同步/异步收尾共用）。
+struct RecvSink<'a> {
+    opts: &'a UdpRecvOptions,
+    events: &'a Option<mpsc::UnboundedSender<UdpEvent>>,
+    /// session → (Reporter, chunk_len, size, 已计入字节, 开始时刻)。
+    /// Reporter::add 自带 100ms 节流（规格 §3.1）；表上限 256。
+    reports: HashMap<u64, (crate::progress::Reporter, u64, u64, u64, std::time::Instant)>,
+    report_order: std::collections::VecDeque<u64>,
+}
+
+impl RecvSink<'_> {
+    /// 引擎逐出（64 会话帽/TTL）不产生 Completed——对应 Reporter 悬空会让
+    /// GUI 进度卡永久 running；超龄（TTL+60s）即补失败终态。
+    fn sweep_stale(&mut self) {
+        let stale: Vec<u64> = self
+            .reports
+            .iter()
+            .filter(|(_, (.., t))| t.elapsed() > SESSION_TTL + Duration::from_secs(60))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale {
+            if let Some((r, ..)) = self.reports.remove(&k) {
+                r.fail();
+            }
+            self.report_order.retain(|s| s != &k);
+        }
+    }
+
+    fn handle(&mut self, engine: &mut UdpRecvEngine, peer_ip: IpAddr, ev: UdpEvent) {
+        let peer_str = peer_ip.to_string();
+        match &ev {
+            UdpEvent::Started {
+                session,
+                name,
+                size,
+                chunk_len,
+            } => {
+                if let Some(hub) = &self.opts.progress {
+                    if self.reports.len() >= 256 {
+                        if let Some(old) = self.report_order.pop_front() {
+                            if let Some((r, ..)) = self.reports.remove(&old) {
+                                r.fail();
                             }
                         }
-                        let r = hub.register("recv", name.clone(), *size);
-                        r.set_peer(&peer_str);
-                        report_order.push_back(*session);
-                        reports.insert(
-                            *session,
-                            (r, *chunk_len as u64, *size, 0, std::time::Instant::now()),
-                        );
                     }
+                    let r = hub.register("recv", name.clone(), *size);
+                    r.set_peer(&peer_str);
+                    self.report_order.push_back(*session);
+                    self.reports.insert(
+                        *session,
+                        (r, *chunk_len as u64, *size, 0, std::time::Instant::now()),
+                    );
                 }
-                UdpEvent::Progress { session, done, .. } => {
-                    if let Some((r, chunk_len, size, last, _)) = reports.get_mut(session) {
-                        let bytes = (*done * *chunk_len).min(*size);
-                        if bytes > *last {
-                            r.add(bytes - *last);
-                            *last = bytes;
-                        }
-                    }
-                }
-                UdpEvent::Completed {
-                    session,
-                    path,
-                    size,
-                    start,
-                } => {
-                    let removed = reports.remove(session);
-                    if let Some((r, _chunk_len, size, last, _)) = &removed {
-                        // START 哈希路径在「收齐」同一帧即发布，最后一个 Progress
-                        // 被 Completed 合并——补足末块字节，终态必须等于文件大小。
-                        if *size > *last {
-                            r.add(*size - *last);
-                        }
-                        r.finish();
-                    }
-                    report_order.retain(|s| s != session);
-                    // 用户可见日志只报文件名，不暴露会话 ID（线协议内部标识）。
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    eprintln!("[接收-UDP] 收到 {name} → {}", path.display());
-                    // 落盘即状态（规格 §4.2）：发布成功即记账；size/start 直接取自事件
-                    // （轮 1：不再依赖 progress hub 注入——CLI 无 hub 也记全）。
-                    if let Some(stats) = &opts.stats {
-                        stats.record(
-                            crate::stats::Direction::Recv,
-                            &peer_str,
-                            *size,
-                            1,
-                            start.elapsed().as_secs(),
-                            "UDP 接收",
-                            &path.display().to_string(),
-                        );
-                    }
-                    if let Some(tx) = &events {
-                        let _ = tx.send(ev.clone());
-                    }
-                }
-                UdpEvent::Ignored(_) => {}
             }
-            if matches!(ev, UdpEvent::Started { .. } | UdpEvent::Progress { .. }) {
-                if let Some(tx) = &events {
-                    let _ = tx.send(ev);
+            UdpEvent::Progress { session, done, .. } => {
+                if let Some((r, chunk_len, size, last, _)) = self.reports.get_mut(session) {
+                    let bytes = (*done * *chunk_len).min(*size);
+                    if bytes > *last {
+                        r.add(bytes - *last);
+                        *last = bytes;
+                    }
                 }
+            }
+            UdpEvent::Completed {
+                session,
+                path,
+                size,
+                start,
+            } => {
+                // 异步路径由这里补记投递抑制（同步路径引擎内已记，幂等）。
+                engine.mark_suppressed(*session);
+                let removed = self.reports.remove(session);
+                if let Some((r, _chunk_len, size, last, _)) = &removed {
+                    // START 哈希路径在「收齐」同一帧即发布，最后一个 Progress
+                    // 被 Completed 合并——补足末块字节，终态必须等于文件大小。
+                    if *size > *last {
+                        r.add(*size - *last);
+                    }
+                    r.finish();
+                }
+                self.report_order.retain(|s| s != session);
+                // 用户可见日志只报文件名，不暴露会话 ID（线协议内部标识）。
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                eprintln!("[接收-UDP] 收到 {name} → {}", path.display());
+                // 落盘即状态（规格 §4.2）：发布成功即记账。
+                if let Some(stats) = &self.opts.stats {
+                    stats.record(
+                        crate::stats::Direction::Recv,
+                        &peer_str,
+                        *size,
+                        1,
+                        start.elapsed().as_secs(),
+                        "UDP 接收",
+                        &path.display().to_string(),
+                    );
+                }
+                if let Some(tx) = self.events {
+                    let _ = tx.send(ev.clone());
+                }
+            }
+            UdpEvent::Ignored(_) => {}
+        }
+        if matches!(ev, UdpEvent::Started { .. } | UdpEvent::Progress { .. }) {
+            if let Some(tx) = self.events {
+                let _ = tx.send(ev);
             }
         }
     }
@@ -1995,5 +2151,33 @@ mod tests {
         }
         assert!(completed, "交织后 3 连丢应能由 FEC 补齐");
         assert_eq!(std::fs::read(out.join("burst.bin")).unwrap(), data);
+    }
+
+    /// 异步收尾契约：收包路径只排队（不哈希/不发布），独立执行后才发布。
+    #[tokio::test]
+    async fn async_finalize_defers_hash_and_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, data) = make_file(dir.path(), "af.bin", 2400).await;
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        eng.enable_async_finalize();
+        let (frames, _, hash) = plan.build_pass(&src).await.unwrap();
+        for f in plan.start_frames(&hash) {
+            eng.handle(&f);
+        }
+        let mut queued = false;
+        for d in &frames {
+            if matches!(eng.handle(d), UdpEvent::Ignored("收尾已排队")) {
+                queued = true;
+            }
+        }
+        assert!(queued, "异步模式不得在收包路径内发布");
+        assert!(!out.join("af.bin").exists(), "哈希尚未执行，不得已发布");
+        let jobs = eng.drain_finalize_jobs();
+        assert_eq!(jobs.len(), 1);
+        let ev = run_finalize(jobs.into_iter().next().unwrap());
+        assert!(matches!(ev, UdpEvent::Completed { .. }), "{ev:?}");
+        assert_eq!(std::fs::read(out.join("af.bin")).unwrap(), data);
     }
 }
