@@ -436,7 +436,7 @@
 53. **Web 下载并发名额绑 body（轮 UI-5 续 7，2026-11-16）**：基线 295 → **296 项全绿**（clippy 无新增）。
    - 中间件把 permit 放进请求扩展（`PermitSlot`），下载处理器取出外包 `PermitReader`（持有 `OwnedSemaphorePermit` 的 `AsyncRead`）构造流式 body——名额随 body 销毁才归还；旧实现 permit 随中间件返回即释放，慢速下载可无限并发绕过 32 上限；判别：permit_reader_holds_permit_until_dropped。
 
-57. **TCP 槽位互通改造：TCP 应用层并入 C# 方言（2026-11-17）**：TCP 槽位改走 `transfer::cswire`（与 UDT 同一应用层），兑现「trft ↔ C# 2.14 TCP 双向互通」；v2 帧只保留 QUIC/RUDP。基线 299 维持全绿（本轮以迁移既有断言为主，未新增用例）。
+57. **TCP 槽位互通改造：TCP 应用层并入 C# 方言（2026-11-17）**：TCP 槽位改走 `transfer::cswire`（与 UDT 同一应用层），兑现「trft ↔ C# 2.14 TCP 双向互通」；v2 帧只保留 QUIC/RUDP。基线 299 → **300 项全绿**（迁移既有断言 + 新增分块探针判别 1 项）。
    - **分步**：① 服务端入口泛化到 `S: AsyncRead + AsyncWrite`、拆出 `cs_handshake`（665f99e，无行为变化）；② 收发两端接入 TCP + 判决 ACK 分叉 + 测试迁移（本次）。
    - **判决 ACK 分叉（C# 同款）**：TCP 的结尾 1 字节判决写/读**装饰器流之内**；UDT 仍在裸流带外。`CsWire::new_tcp` 承载该差异；服务端 `handle_conn_cs(..., ack_on_wire)` 由 serve 层传入。
    - **客户端补全**：新增 0x03 续传客户端（会话 GUID 由 (路径, 大小, 目标) 确定性派生，跨进程可续；`st=3` 全哈希不符显式失败）、0x02 并行分块客户端（组会话 + 逐块判决）、0x01/0x06/0x04 的 `_on`/`_tcp` 拆分；`sender/folder/resume/chunked` 的 TCP 分支全部改道 cswire，v2 路径在 `connect_stack` 对 TCP 显式短路（fail-closed）。

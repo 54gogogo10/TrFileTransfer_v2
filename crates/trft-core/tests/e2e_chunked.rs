@@ -72,6 +72,73 @@ async fn chunked_full_stack_pairing_compress() {
 /// 回归（GUI 实机测试发现）：`--count 1` 与 0x02 并行分块组合。
 /// 修复前接收端把首条连接的 INCOMPLETE（0x02）判决也计入 --count，收到第一个
 /// 分片就退出 → 发送端被 RST、落盘只剩 .trft-part（CLI 与 GUI 均实测复现）。
+
+/// 判别（实机 C# 服务端教训）：对端对 0x02 不发判决时，客户端必须在**发出任何
+/// 真分块之前**回退——否则对端已建组装器占住最终名，回退会落出 name_1 重复文件。
+/// 探针 = 非法头（chunk=0）：对端拒绝且不建组装器。
+#[tokio::test]
+async fn chunked_peer_without_verdict_probes_before_sending_chunks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (src, _) = random_file(dir.path(), "probe.bin", 256 * 1024);
+    let (listener, addr) = ephemeral_listener().await;
+    // 记录第一个 0x02 头的 chunk 字段：必须是 0（探针），不得是真载荷。
+    let first_chunk = Arc::new(std::sync::Mutex::new(None::<i64>));
+    let frames = Arc::new(AtomicUsize::new(0));
+    let fc2 = first_chunk.clone();
+    let fr2 = frames.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            // 客户端 compress=false → 首帧必是 0x0A 能力探询。
+            let mut b = [0u8; 2];
+            if s.read_exact(&mut b).await.is_err() {
+                continue;
+            }
+            if b[0] != 0x0A {
+                continue;
+            }
+            // 承认 bit0/bit1（与 C# 服务端同），但**也不发 0x02 判决**。
+            if s.write_all(&[0x1A, 0x03]).await.is_err() {
+                continue;
+            }
+            let mut hdr = [0u8; 29];
+            if s.read_exact(&mut hdr).await.is_err() {
+                continue;
+            }
+            if hdr[0] == 0x02 {
+                let chunk = i64::from_le_bytes(hdr[17..25].try_into().unwrap());
+                *fc2.lock().unwrap() = Some(chunk);
+                fr2.fetch_add(1, Ordering::SeqCst);
+            }
+            // 不发判决，直接断连（C# 服务端同款表现）。
+            drop(s);
+        }
+    });
+
+    let o = SendOptions {
+        compress: false,
+        ..Default::default()
+    };
+    let r = send_file_chunked(addr, &src, &o, 4).await;
+    assert!(
+        matches!(r, Err(Error::Unsupported(_))),
+        "无判决对端必须 Unsupported（调用方回退整文件续传），实际 {r:?}"
+    );
+    assert_eq!(
+        *first_chunk.lock().unwrap(),
+        Some(0),
+        "第一个 0x02 必须是非法头探针（chunk=0），不得先发真分块"
+    );
+    assert_eq!(frames.load(Ordering::SeqCst), 1, "只允许一次探针交互");
+    server.abort();
+}
+
 #[tokio::test]
 async fn chunked_with_count_one_receives_full_file() {
     let dir = tempfile::tempdir().unwrap();

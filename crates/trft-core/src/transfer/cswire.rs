@@ -3397,9 +3397,20 @@ pub(crate) async fn cs_send_chunk_on<S: AsyncRead + AsyncWrite + Unpin>(
             0x00 => Err(Error::Rejected("分块被对端拒绝（哈希或会话）".into())),
             other => Err(proto(format!("分块判决字节异常: 0x{other:02X}"))),
         },
-        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => Err(Error::Unsupported(
-            "对端不提供 0x02 分块判决（旧对端），需回退整文件发送".into(),
-        )),
+        // EOF / 连接被重置都表示「对端处理后直接关、不发判决」（C# 服务端表现；
+        // 关闭时可能有未读字节，Windows 上呈现为 RST 而非 FIN）。
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            Err(Error::Unsupported(
+                "对端不提供 0x02 分块判决（旧对端），需回退整文件发送".into(),
+            ))
+        }
         Ok(Err(e)) => Err(Error::Io(e)),
         Err(_) => Err(proto("分块判决超时（30s）")),
     }
@@ -3513,7 +3524,14 @@ pub async fn send_file_chunked_cs_tcp(
         let mut ack = [0u8; 1];
         match tokio::time::timeout(ACK_TIMEOUT, wire.read_exact(&mut ack)).await {
             Ok(Ok(())) => { /* 有判决（本仓库服务端） */ }
-            Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
                 return Err(Error::Unsupported(
                     "对端不提供 0x02 分块判决（C# 服务端不发），改用整文件续传".into(),
                 ))
