@@ -1428,6 +1428,7 @@ pub(crate) async fn handle_conn_cs<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // 分块 0x02 的客户端不用该路径，等待反而会挡住后续块连接（串行 accept）。
     if handled > 0
         && !outcome.is_chunked
+        && !outcome.has_own_final_response
         && opts
             .max_count
             .is_some_and(|m| served.load(std::sync::atomic::Ordering::Relaxed) + handled >= m)
