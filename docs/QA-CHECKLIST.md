@@ -122,7 +122,7 @@ TCP 槽位补充：0x09 加密仅在两侧设置同一配对码时启用（无�
 ### A15 限量接收的终态 ACK（本轮改动）
 1. Rust `trft recv --count 1`（TCP 与 UDT 各一次，明文/带配对码各一次），C# 2.14 发送单文件。
 2. 预期：C# 侧 rc=0、无「Connection closed before the receiver acknowledged」；Rust 收满后退出。
-3. 关联改动：判决字节写出后 linger（读 EOF/200ms）再关闭；0x03/0x04 无流内 ACK。
+3. 关联改动：count 达标且非分块时，判决字节写出后读尽残余并等 FIN（5s 兜底，对齐 v2 `handle_conn`）；分块 0x02/0x03/0x04 不等待。
 
 ## B. NTFS 掉电 fsync
 

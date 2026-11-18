@@ -1408,7 +1408,7 @@ pub(crate) async fn handle_conn_cs<S: AsyncRead + AsyncWrite + Unpin + Send>(
     ack_on_wire: bool,
 ) -> Result<()> {
     let _permit = conn_precheck(peer, opts).await?;
-    let (r, outcome) = conn_cs_inner(stream, peer, opts, &state, ack_on_wire).await;
+    let (r, outcome, mut stream) = conn_cs_inner(stream, peer, opts, &state, ack_on_wire).await;
     // 限量模式计数口径与 v2 帧同：只计**真实完成**的连接——被拒/失败/0x02 的
     // 中间块（INCOMPLETE）都不得消耗名额（否则 --count 1 的分块发送收首块即退）。
     let handled = if r.is_ok()
@@ -1419,6 +1419,30 @@ pub(crate) async fn handle_conn_cs<S: AsyncRead + AsyncWrite + Unpin + Send>(
     } else {
         0
     };
+    // 收尾等待（与 v2 handle_conn 同纪律）：本连接即最后一单（--count 达标）时
+    // 进程即将退出，直接 close 会在 Windows 上以 RST 掐断对端读取终态字节，
+    // C# 报 "Connection closed before the receiver acknowledged"（文件与哈希都对，
+    // 纯对端误报）。读尽残余并等其 FIN，5s 兜底；只等达标的那一次——并发分块的
+    // 其它连接若也等，会与串行 accept 互锁。
+    // 仅 0x00/0x01/0x06（对端走 ConfirmCompletionAsync 读流内终态）需要等待；
+    // 分块 0x02 的客户端不用该路径，等待反而会挡住后续块连接（串行 accept）。
+    if handled > 0
+        && !outcome.is_chunked
+        && opts
+            .max_count
+            .is_some_and(|m| served.load(std::sync::atomic::Ordering::Relaxed) + handled >= m)
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut b = [0u8; 256];
+            loop {
+                match stream.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+    }
     conn_settle(&r, handled, peer, opts, &served).await;
     r
 }
@@ -1429,7 +1453,7 @@ async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
     opts: &RecvOptions,
     state: &Arc<CsServerState>,
     ack_on_wire: bool,
-) -> (Result<()>, CsOutcome) {
+) -> (Result<()>, CsOutcome, S) {
     let mut wire = if ack_on_wire {
         CsWire::new_tcp(stream)
     } else {
@@ -1477,26 +1501,9 @@ async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         } else {
             let _ = wire.raw_write(&[b]).await;
         }
-        // 收尾等待（linger close）：判决字节写出后不能立刻关 socket/退进程——
-        // 对端可能仍在读；Windows 在接收缓冲有未读数据时 close 会发 RST，已排队
-        // 但未送达的判决字节随之丢弃，C# 便报
-        // "Connection closed before the receiver acknowledged"
-        // （--count 1 收满即退会放大这个窗口）。读到 EOF 或 200ms 超时再关，
-        // 让对端读完判决并主动关闭；0x03/0x04 无流内 ACK，不走这段。
-        use tokio::io::AsyncReadExt;
-        let mut sink = [0u8; 4096];
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            loop {
-                match wire.raw.read(&mut sink).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
-                }
-            }
-        })
-        .await;
     }
     let _ = wire.shutdown().await;
-    (res, outcome)
+    (res, outcome, wire.raw)
 }
 
 #[allow(clippy::too_many_arguments)]
