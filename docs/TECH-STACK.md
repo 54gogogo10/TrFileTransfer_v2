@@ -467,6 +467,11 @@
 60. **终态 ACK 收尾等待（linger close，2026-11-18）**：对端报告「C#→Rust 且 `--count 1` 时 C# 读不到 ACK」（文件与哈希正确；接收端常驻时 rc=0）。本机按 C# 2.14 CLI/GUI 全矩阵复测**未能复现**（TCP 明文/0x09 加密/压缩、8 MB 与 200 MB、UDT、GUI 0x02 并发分块，C# 侧 rc 全 0）；按建议补**收尾等待**（与 v2 `handle_conn` 的 `count_reached` 排水同纪律——cswire 此前缺这一段）：本连接使 `--count` 达标且**非分块**时，判决字节写出后读尽对端残余并等其 FIN（5s 兜底）再返回，避免 Windows 上直接 close 以 RST 掐断对端读取终态；分块 0x02 的客户端不读流内终态，等待反而会挡住后续块连接（串行 accept），故排除。0x03/0x04 无流内 ACK，同样不走。全量 308 项全绿。
     - 判据（若对端版本仍报错）：按 v2 既有口径「完整送达（逐字节哈希一致）即 PASS + 误报标注」，不阻塞放行。
 
+61. **0.3.0 发布构建（2026-11-18）**：版本号 0.2.0 → **0.3.0**（`Cargo.toml` workspace + 内部依赖、`tauri.conf.json`、`build.bat`、README 同步；`cargo build` 刷新 `Cargo.lock`）。
+    - 内容：TCP 槽位并入 C# 方言（§7.56）、0x02 覆盖表修复（§7.58）、单向 UDP 可靠性（§7.59）、cswire count 排水（§7.60）。
+    - 产物（`release\`）：`TrFileTransfer-0.3.0.exe`（CLI）/ `TrFileTransfer-GUI-0.3.0.exe` / `TrFileTransfer-server-0.3.0.exe` + 各自 `.sha256` 边车；`TrFileTransfer-GUI-0.3.0-portable.zip`（401 MB，含固定版 WebView2）。
+    - 自检：三 exe `--version` / 文件版本信息均为 0.3.0；sha256 边车逐字节校验通过。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

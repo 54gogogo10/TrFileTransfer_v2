@@ -5297,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "trft-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "tempfile",
@@ -5307,7 +5307,7 @@ dependencies = [
 
 [[package]]
 name = "trft-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "cipher",
@@ -5343,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "trft-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "if-addrs",
@@ -5364,7 +5364,7 @@ dependencies = [
 
 [[package]]
 name = "trft-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",

@@ -1,18 +1,18 @@
 @echo off
 rem TrFileTransfer v2 release build (Windows).
 rem Artifacts:
-rem   release\TrFileTransfer-0.1.0.exe            -- CLI
-rem   release\TrFileTransfer-GUI-0.1.0.exe        -- desktop GUI (single-file main edition, Evergreen WebView2)
-rem   release\TrFileTransfer-server-0.1.0.exe     -- web admin plane
+rem   release\TrFileTransfer-0.3.0.exe            -- CLI
+rem   release\TrFileTransfer-GUI-0.3.0.exe        -- desktop GUI (single-file main edition, Evergreen WebView2)
+rem   release\TrFileTransfer-server-0.3.0.exe     -- web admin plane
 rem   release\*.sha256                            -- sidecars required by the updater (lowercase hash + " *name")
-rem   release\TrFileTransfer-GUI-0.1.0-portable.zip -- offline portable edition (GUI exe + fixed-version WebView2
+rem   release\TrFileTransfer-GUI-0.3.0-portable.zip -- offline portable edition (GUI exe + fixed-version WebView2
 rem       runtime; packaged only when build\WebView2FixedRuntime\ is ready, see build\fetch-webview2-fixed.ps1)
 rem Version single source: "version" in crates\trft-gui\tauri.conf.json (keep Cargo.toml in sync).
 rem NOTE: this file must stay CRLF + ANSI(GBK) for cmd; edit via an encoding-aware editor.
 
 setlocal
 cd /d "%~dp0"
-set VERSION=0.2.0
+set VERSION=0.3.0
 
 echo [1/3] cargo build --release --workspace
 cargo build --release --workspace
