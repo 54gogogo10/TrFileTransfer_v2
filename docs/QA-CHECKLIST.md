@@ -119,6 +119,11 @@ TCP 槽位补充：0x09 加密仅在两侧设置同一配对码时启用（无�
    记录实际并发数（这是策略边界，不是缺陷）。
 4. 关联改动：0x02 单来源 8 组、全局 64 组满则拒绝。
 
+### A15 限量接收的终态 ACK（本轮改动）
+1. Rust `trft recv --count 1`（TCP 与 UDT 各一次，明文/带配对码各一次），C# 2.14 发送单文件。
+2. 预期：C# 侧 rc=0、无「Connection closed before the receiver acknowledged」；Rust 收满后退出。
+3. 关联改动：判决字节写出后 linger（读 EOF/200ms）再关闭；0x03/0x04 无流内 ACK。
+
 ## B. NTFS 掉电 fsync
 
 目标：**回执成功 = 数据已落盘**。不得出现「对端报完成、重启后文件短/零尾/哈希不符」。

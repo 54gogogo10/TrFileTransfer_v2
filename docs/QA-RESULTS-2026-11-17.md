@@ -182,6 +182,20 @@ Rust GUI 用 CDP；落盘一律 SHA-256 复核。
 
 **清理**：两轮 VM（旧 10.143.208.49、新 192.168.50.50）上创建的计划任务（trft-recv*、trft-send*、trft-udp/usend/tsend/ping 等）与新增的 exe/bat/日志/接收目录/同步源均已删除；SMB 映射保留（net use 到 192.168.50.50 的 C$ 共享）。VM 上更早会话遗留的 trft-test 负载（a2.bin 5GiB 等）未动。宿主侧临时目录（revA–D、rudp*、big64、udp8*）已清。
 
+### C#→Rust 终态 ACK（`--count 1`）复核（2026-11-18）
+
+对端报告：C#→Rust、Rust 接收端 `--count 1` 时 C# 读不到 ACK（文件与哈希正确；接收端常驻时 rc=0）。本机按 C# 2.14 CLI/GUI 复测矩阵（VM 10.143.208.49 作接收端）：
+
+| 场景 | 结果 |
+|---|---|
+| TCP 明文 8 MiB `--count 1` | ✅ rc=0 |
+| TCP 0x09 加密 + 压缩 8 MiB `--count 1` | ✅ rc=0 |
+| TCP 0x09 加密 + 压缩 200 MiB `--count 1` | ✅ rc=0（3.8s） |
+| UDT 8 MiB `--count 1` | ✅ rc=0 |
+| C# GUI 并发分块 0x02 → `--count 1` | ✅ 文件落地，GUI 回「就绪」 |
+
+未能复现；已按建议补「收尾等待」（linger close：判决字节写出后读到 EOF 或 200 ms 再关闭；0x03/0x04 无流内 ACK 不走）。若对端版本仍复现，按 v2 既有判据「完整送达即 PASS + 误报标注」记录，并请附 C# 版本与完整命令行。
+
 ## 未完成（需人工/其它环境）
 
 | ID | 原因 |

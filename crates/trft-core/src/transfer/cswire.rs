@@ -1477,6 +1477,23 @@ async fn conn_cs_inner<S: AsyncRead + AsyncWrite + Unpin + Send>(
         } else {
             let _ = wire.raw_write(&[b]).await;
         }
+        // 收尾等待（linger close）：判决字节写出后不能立刻关 socket/退进程——
+        // 对端可能仍在读；Windows 在接收缓冲有未读数据时 close 会发 RST，已排队
+        // 但未送达的判决字节随之丢弃，C# 便报
+        // "Connection closed before the receiver acknowledged"
+        // （--count 1 收满即退会放大这个窗口）。读到 EOF 或 200ms 超时再关，
+        // 让对端读完判决并主动关闭；0x03/0x04 无流内 ACK，不走这段。
+        use tokio::io::AsyncReadExt;
+        let mut sink = [0u8; 4096];
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                match wire.raw.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
     }
     let _ = wire.shutdown().await;
     (res, outcome)
