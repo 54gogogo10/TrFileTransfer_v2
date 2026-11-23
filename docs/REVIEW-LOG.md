@@ -550,9 +550,9 @@ RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 
    判别：interrupted_encrypted_handshake_counts_toward_lockout（e2e_recv_options）。
 5. **P1 UDT 轻量 ACK 无超前校验**：seq_off 可返回 ≈0x3FFFFF00（10 亿次 pop_front），
 
-**补记 4（同日）**：第 9 轮全项目审查（5 路并行、67 个源文件）**44 项发现当日全部修复**（6×P1、20×P2、18×P3），修复记录见 [CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md) §八。
-要点：RUDP 瞬态错误统一（10054/EMSGSIZE）、UDT 握手流窗钳制、0x03 完成判定比对哈希、
-0x04 读失败不再删档、分块 TTL 逐出保护组装中会话、Web 上传 fsync+写透、C# 方言发布改 WRITE_THROUGH、
-0x04 清单内存/溢出防线、缓存族名接收侧拒收、UDP 会话按来源分桶、QUIC 首帧超时、
-接收器 panic 监督（GUI 外壳 + JoinSet 留痕）、v2 0x04 包含性校验与按根会话锁、配对失败计数去重。
-全量 `cargo test --workspace` 317 → **361 项全绿**；clippy 0 error（53 条风格 warning）。
+**补记 5（同日）**：暗色主题下原生控件未跟随（校验页 `datetime-local` / `number` 白底、勾选框浅底）。
+根因：`styles.css` 只给 `input[type="text"]` 上了皮肤，且从未声明 `color-scheme`——WebView2 按浅色绘制原生日期/数字控件。
+修复：`:root`/`html[data-theme="dark"]` 分别声明 `color-scheme: light|dark`；输入皮肤选择器改为
+`input:not([type="checkbox"]):not([type="radio"])`（含 text/number/datetime-local），非法态同步改为 `input.invalid`。
+实机复核：暗色 `#verify-once-at` / `#verify-period-value` 计算样式为 `#1b2432` 底 + `#e8eef6` 字、`color-scheme: dark`；
+亮色回切为 `#f2f5f9` 底 + `#101d30` 字。截图 `target/gui-verify-dark.png`。
