@@ -59,16 +59,35 @@ const WINDOWS_RESERVED: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// 危险 Unicode 格式字符（Cf）：RLO 等可视觉反转扩展名，诱导误开文件。
+/// 危险 Unicode 格式字符（Cf）：RLO/isolate 等可视觉反转扩展名，诱导误开文件。
+/// 轮 9 P3-2：旧黑名单只列了 0x200B–0x200F/0x202A–0x202E/0x2060–0x2064，
+/// 漏掉 U+2066–U+2069（bidi isolate）、U+061C（ALM）等——按 Unicode
+/// General_Category=Cf 的完整码位表判定，新增 Unicode 版本补区间即可。
 fn has_format_char(s: &str) -> bool {
     s.chars().any(|c| {
         let u = c as u32;
         matches!(u,
-            0x200B..=0x200F   // ZWSP/ZWNJ/ZWJ/LRM/RLM
+            0x00AD            // SOFT HYPHEN
+            | 0x0600..=0x0605 // Arabic number sign 等
+            | 0x061C          // ALM（阿拉伯字母标记）
+            | 0x06DD          // Arabic end of ayah
+            | 0x070F          // Syriac abbreviation mark
+            | 0x0890..=0x0891 // Arabic pound/piastre sign
+            | 0x08E2          // Arabic disputed end of ayah
+            | 0x180E          // Mongolian vowel separator
+            | 0x200B..=0x200F // ZWSP/ZWNJ/ZWJ/LRM/RLM
             | 0x202A..=0x202E // LRE/RLE/PDF/LRO/RLO
-            | 0x2060..=0x2064 // WJ 等
-            | 0xFEFF          // BOM
-            | 0xFFF9..=0xFFFB // interlinear
+            | 0x2060..=0x2064 // WJ/函数应用/不可见运算符
+            | 0x2066..=0x206F // LRI/RLI/FSI/PDI + 废弃格式符（轮 9 P3-2 补齐）
+            | 0xFEFF          // BOM/ZWNBSP
+            | 0xFFF9..=0xFFFB // interlinear annotation
+            | 0x110BD         // Kaithi number sign
+            | 0x110CD         // Kaithi number sign above
+            | 0x13430..=0x1343F // Egyptian hieroglyph format controls
+            | 0x1BCA0..=0x1BCA3 // Shorthand format controls
+            | 0x1D173..=0x1D17A // Musical symbol format controls
+            | 0xE0001         // LANGUAGE TAG
+            | 0xE0020..=0xE007F // TAG 字符（可藏任意扩展名）
         )
     })
 }
@@ -109,6 +128,12 @@ pub fn sanitize_name(raw: &str) -> Result<String> {
         return Err(proto(format!("文件名含非法序列: {raw}")));
     }
     check_segment(name, "文件名")?;
+    // 轮 9 P2-5：内部元数据/半成品族名不得作为落盘名——对端可伪造
+    // `.trft-hash-cache-server.txt` 投毒续点缓存，`.trft-part` 则会被扫描/清单
+    // 当内部残件整类跳过。普通点文件（.gitignore 等）不在该族内，照常放行。
+    if crate::hashcache::is_transient_name(name) {
+        return Err(proto(format!("文件名属于内部元数据族: {raw}")));
+    }
     Ok(name.to_string())
 }
 
@@ -132,6 +157,11 @@ pub fn sanitize_rel(rel: &str) -> Result<std::path::PathBuf> {
             return Err(proto("路径段超过 255 字节"));
         }
         check_segment(seg, "相对路径段")?;
+        // 与 sanitize_name 同口径（轮 9 P2-5）：缓存族/半成品名在目录段同样拦，
+        // 否则对端可用子目录预置投毒缓存或半成品残件。
+        if crate::hashcache::is_transient_name(seg) {
+            return Err(proto(format!("相对路径段属于内部元数据族: {rel}")));
+        }
         out.push(seg);
     }
     Ok(out)
@@ -175,6 +205,57 @@ mod tests {
         assert!(sanitize_name("..").is_err());
         assert!(sanitize_name("../x").is_err());
         assert!(sanitize_name("a\\..\\b").is_err());
+    }
+
+    /// 轮 9 P3-2 判别：完整 Cf 表——bidi isolate（U+2066–2069）与 ALM（U+061C）
+    /// 等旧黑名单漏网字符同样必须拒绝；普通点文件不受影响。
+    #[test]
+    fn rejects_full_cf_table_but_accepts_plain_dotfiles() {
+        for evil in [
+            "a\u{2067}txt.exe",
+            "a\u{2066}txt.exe",
+            "a\u{2068}txt.exe",
+            "a\u{2069}txt.exe",
+            "a\u{061C}txt.exe",
+            "a\u{00AD}txt.exe",
+            "a\u{180E}txt.exe",
+            "a\u{1D173}txt.exe",
+            "a\u{E0041}txt.exe",
+        ] {
+            assert!(sanitize_name(evil).is_err(), "Cf 字符必须拒绝: {evil:?}");
+        }
+        // 普通点文件（P2-5 要求「不要拦普通点文件」）。
+        assert_eq!(sanitize_name(".gitignore").unwrap(), ".gitignore");
+        assert_eq!(sanitize_name(".env.local").unwrap(), ".env.local");
+    }
+
+    /// 轮 9 P2-5 判别：缓存族/半成品名不得作为落盘名（防对端投毒续点缓存或
+    /// 把伪造半成品留在保存目录）；普通点文件与含 "trft" 的普通名不受影响。
+    #[test]
+    fn rejects_cache_family_and_transient_landing_names() {
+        for evil in [
+            ".trft-hash-cache.txt",
+            ".trft-hash-cache.bak",
+            ".trft-hash-cache-server.txt",
+            ".trft-hash-cache-server.bak",
+            ".TRFT-HASH-CACHE-SERVER.TXT",
+            "movie.bin.1234abcd.trft-part",
+            "big.bin.0123456789abcdef.trft-resume",
+            "big.bin.0123456789abcdef.trft-resume.meta",
+        ] {
+            assert!(sanitize_name(evil).is_err(), "缓存族/半成品名必须拒绝: {evil}");
+            assert!(
+                sanitize_rel(&format!("docs/{evil}")).is_err(),
+                "文件夹相对路径中的同类段同样必须拒绝: {evil}"
+            );
+        }
+        assert_eq!(sanitize_name(".gitignore").unwrap(), ".gitignore");
+        assert_eq!(sanitize_name("notes.trft-part.txt").unwrap(), "notes.trft-part.txt");
+        assert_eq!(sanitize_name("我的缓存.txt").unwrap(), "我的缓存.txt");
+        assert_eq!(
+            sanitize_rel("docs/.gitignore").unwrap(),
+            std::path::PathBuf::from("docs").join(".gitignore")
+        );
     }
 
     #[test]

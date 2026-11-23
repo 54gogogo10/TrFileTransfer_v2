@@ -230,6 +230,33 @@ pub(crate) fn unique_part(dir: &Path, name: &str) -> PathBuf {
     ))
 }
 
+/// 落盘包含性校验（P2-17，从 `cswire` 提升为公共助手）：v2 0x01/0x04 会复用既有
+/// 根目录/子目录（0x04 同步语义、0x01 Skip 语义），而 save_dir 内预置的
+/// junction/符号链接会把对端可控的相对路径写到保存目录之外（Windows 上 junction
+/// 不需要管理员权限；0x00/0x02/0x03 用随机半成品名或原子建目录，天然不吃这条路径）。
+/// 用 canonicalize 解析目标最近的存在祖先，必须落在 canonical(save_dir) 前缀内。
+/// 调用纪律：建目录前后各验一次（见调用点）。
+pub(crate) fn ensure_contained(save_dir: &Path, target: &Path) -> Result<()> {
+    let Ok(base) = std::fs::canonicalize(save_dir) else {
+        return Ok(()); // save_dir 尚不存在：由调用方创建（用户选择的根）
+    };
+    // target 可能尚不存在：向上取最近的存在祖先再 canonicalize（会解析链接）。
+    let mut probe = target.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) if p.starts_with(save_dir) => probe = p.to_path_buf(),
+            _ => return Ok(()),
+        }
+    }
+    let real = std::fs::canonicalize(&probe).map_err(Error::Io)?;
+    if !real.starts_with(&base) {
+        return Err(Error::Rejected(
+            "落盘路径解析到保存目录之外（疑似符号链接/junction）".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct RecvOptions {
     pub save_dir: PathBuf,
@@ -258,6 +285,10 @@ pub struct RecvOptions {
     pub chunk_sessions: Arc<ChunkTracker>,
     /// 0x03 会话锁（对端 IP + 文件名 → 锁，防跨连接并发写坏半成品）。
     pub resume_locks: Arc<Mutex<HashMap<(IpAddr, String), Arc<Mutex<()>>>>>,
+    /// 0x04 同步会话锁（根目录名 → 锁）：并发同步同一根目录必须串行，否则两个
+    /// 会话会同时判「服务端缺这些文件」并互相覆盖，且摘要按对方 (size,mtime)
+    /// 键回填可投毒（P2-18）。
+    pub folder_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// 配对失败锁定状态（serve 级共享）。
     pub gate: Arc<Mutex<PairingGate>>,
     /// 常驻模式并发连接闸。
@@ -305,6 +336,7 @@ impl Default for RecvOptions {
             hash_cache_days: crate::hashcache::DEFAULT_TTL_DAYS,
             chunk_sessions: Arc::new(ChunkTracker::default()),
             resume_locks: Arc::new(Mutex::new(HashMap::new())),
+            folder_locks: Arc::new(Mutex::new(HashMap::new())),
             gate: Arc::new(Mutex::new(PairingGate::default())),
             permits: Arc::new(Semaphore::new(64)),
             progress: None,
@@ -461,23 +493,32 @@ pub async fn serve(addr: SocketAddr, opts: RecvOptions) -> Result<()> {
 }
 
 /// TCP/QUIC 侧孤儿半成品清扫（与 UDP cleanup_orphans 同策略：7 天）。
-/// PerDeviceFolder/AutoArchive 落地在子目录——递归扫描（深度封顶防符号链接环）。
+/// PerDeviceFolder/AutoArchive 落地在子目录——显式栈遍历（P3-12：旧实现深度
+/// 封顶 6，更深的崩溃残件永不清扫）；不跟随符号链接（防环），纵深上限 64 仅作
+/// 病态树兜底。
 pub fn cleanup_part_orphans(dir: &Path) {
-    fn walk(dir: &Path, depth: u32) {
-        if depth > 6 {
-            return;
+    /// 纵深上限（病态深树兜底；正常 PerDeviceFolder/AutoArchive 只有 2–3 层）。
+    const MAX_DEPTH: usize = 64;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let now = std::time::SystemTime::now();
+    while let Some((d, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
         };
-        let now = std::time::SystemTime::now();
         for e in rd.flatten() {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().to_string();
-            if p.is_dir() {
-                walk(&p, depth + 1);
+            // file_type 是 lstat 语义：指向目录的链接按链接处理，不进栈（防环）。
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push((e.path(), depth + 1));
                 continue;
             }
+            if ft.is_symlink() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
             if !name.ends_with(".trft-part") {
                 continue;
             }
@@ -491,12 +532,11 @@ pub fn cleanup_part_orphans(dir: &Path) {
                     })
                     .unwrap_or(false)
                 {
-                    let _ = std::fs::remove_file(&p);
+                    let _ = std::fs::remove_file(e.path());
                 }
             }
         }
     }
-    walk(dir, 0);
 }
 
 /// accepted socket 调优：TCP_NODELAY（服务端小写——状态/能力/盐——在 Nagle +
@@ -964,7 +1004,10 @@ where
                 // 中途判决，多连接并行时每条连接各发一次 0x0C——旧实现把首个
                 // INCOMPLETE 也计入 --count，`recv --count 1` 会在收到第一个分片后
                 // 退出，发送端被 RST、落盘只剩 .trft-part（实测复现）。
-                if chunked::recv_chunk_end(&mut s, opts).await? == STATUS_OK {
+                // P3-13：0x01 同样按 gid 去重——同一已完成组被多条并行连接各发一次
+                // 0x0C 时只计一次成功。
+                let (_st, first_ok) = chunked::recv_chunk_end(&mut s, opts).await?;
+                if first_ok {
                     *handled += 1;
                 }
             }
@@ -1247,6 +1290,27 @@ pub(crate) async fn resolve_root(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}_dupe"))
 }
 
+/// 测试用目录链接：Windows 用 junction（不需要管理员权限），Unix 用 symlink。
+/// 返回是否创建成功——环境不支持时调用方按「跳过」处理（不把环境限制当失败）。
+#[cfg(test)]
+pub(crate) fn test_dir_link(link: &Path, target: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && link.is_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,5 +1486,57 @@ mod tests {
             let _g = PartGuard(p.clone());
         }
         assert!(!p.exists(), "守卫 drop 必须清理半成品");
+    }
+
+    /// P2-17 判别：save_dir 内预置 junction/符号链接指向树外时，目标路径必须判
+    /// 不包含（v2 0x01/0x04 复用既有目录的落盘防线）。
+    #[test]
+    fn ensure_contained_blocks_junction_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("save");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(ensure_contained(&save, &save.join("ok.bin")).is_ok());
+        let link = save.join("link");
+        if !test_dir_link(&link, &outside) {
+            eprintln!("跳过：当前环境无法创建目录链接（junction/symlink）");
+            return;
+        }
+        assert!(
+            ensure_contained(&save, &link.join("evil.bin")).is_err(),
+            "指向树外的 junction 下的路径必须拒绝（P2-17）"
+        );
+        // 目标尚不存在：按最近存在祖先（junction）判定，同样必须拒绝。
+        assert!(
+            ensure_contained(&save, &link.join("newdir").join("evil.bin")).is_err(),
+            "不存在的中间目录同样要沿祖先解析"
+        );
+    }
+
+    /// P3-12 判别：深层目录（>6 层）的 7 天孤儿半成品必须清扫——旧实现深度封顶
+    /// 6，更深处的崩溃残件永不清扫。
+    #[test]
+    fn cleanup_part_orphans_reaches_deep_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().join("device");
+        for i in 0..9 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let victim = deep.join("x.bin.1234.trft-part");
+        std::fs::write(&victim, b"partial").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&victim)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let fresh = deep.join("fresh.bin.1234.trft-part");
+        std::fs::write(&fresh, b"partial").unwrap();
+        cleanup_part_orphans(dir.path());
+        assert!(!victim.exists(), "深层 7 天孤儿必须清扫（P3-12）");
+        assert!(fresh.exists(), "未过期半成品不得删除");
     }
 }

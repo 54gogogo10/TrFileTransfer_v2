@@ -39,6 +39,9 @@ pub const CS_MAX_NAME: usize = 4096;
 pub const CS_MAX_TEXT: usize = 1_048_576;
 /// 目录文件数上限（C# MaxFolderFileCount）。
 pub const CS_MAX_FOLDER_FILES: usize = 1_000_000;
+/// 0x04 清单路径字节总预算（第 9 轮审查 P2-4）：合法 1e6 文件 × 平均 50B
+/// 远低于此值；超过即视为恶意清单，避免整表驻留把连接打成 4GiB。
+pub const CS_MANIFEST_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// 单文件声明上限（C# MaxTransferSize = 1 PiB）。
 pub const CS_MAX_TRANSFER: u64 = 1 << 50;
 /// 接收体缓冲（轮 7：256KB → 4MB 对齐 C# WireProtocol bufferSize——压缩比率
@@ -110,7 +113,20 @@ pub fn cs_safe_name(raw: &str, fallback: &str) -> String {
     if is_reserved_name(&name) {
         return format!("_{name}");
     }
-    name
+    avoid_cache_name(&name)
+}
+
+/// 第 9 轮审查 P2-5：落盘名与摘要缓存族撞名时加前缀。
+///
+/// 缓存/半成品文件只按名字识别（.trft-hash-cache*.txt、.trft-part、
+/// .trft-resume）；对端若能把同名文件写进保存目录，重启后 0x04 续点会
+/// 采信伪造摘要。加前缀既保留数据，又不占用缓存名。
+fn avoid_cache_name(name: &str) -> String {
+    if crate::hashcache::is_cache_artifact(name) || crate::hashcache::is_transient_name(name) {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    }
 }
 
 /// C# SanitizeRelativePath：'/' 归一、去 '..'/'.'、':' 替换、保留名加前缀。
@@ -128,7 +144,7 @@ pub fn cs_sanitize_rel(path: &str) -> String {
         } else if is_reserved_name(&seg) {
             seg = format!("_{seg}");
         }
-        parts.push(seg);
+        parts.push(avoid_cache_name(&seg));
     }
     if parts.is_empty() {
         return "_".into();
@@ -188,11 +204,11 @@ fn cs_publish(temp: &Path, save_path: &Path) -> io::Result<PathBuf> {
         } else {
             dir.join(format!("{stem}_{i}{ext}"))
         };
-        match std::fs::hard_link(temp, &cand) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(temp);
-                return Ok(cand);
-            }
+        // 第 9 轮审查 P2-1：与 v2 发布同纪律——MoveFileExW(WRITE_THROUGH) 一步
+        // 换名并落盘目录项。hard_link + remove_file 两步都不保证目录项写透，
+        // 掉电后会「数据在、名字丢」，残件 7 天后被孤儿清扫删掉。
+        match crate::publish::move_noreplace(temp, &cand) {
+            Ok(()) => return Ok(cand),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
                 // 卷不支持硬链接：create_new 拷贝回退（fail-if-exists 语义不变）。
@@ -244,24 +260,8 @@ fn cs_publish_replace(temp: &Path, dest: &Path) -> io::Result<()> {
 /// 建目录，天然不吃这条路径）。用 canonicalize 解析目标最近的存在祖先，必须落在
 /// canonical(save_dir) 前缀内。
 fn ensure_contained(save_dir: &Path, target: &Path) -> Result<()> {
-    let Ok(base) = std::fs::canonicalize(save_dir) else {
-        return Ok(()); // save_dir 尚不存在：由调用方创建（用户选择的根）
-    };
-    // target 可能尚不存在：向上取最近的存在祖先再 canonicalize（会解析链接）。
-    let mut probe = target.to_path_buf();
-    while !probe.exists() {
-        match probe.parent() {
-            Some(p) if p.starts_with(save_dir) => probe = p.to_path_buf(),
-            _ => return Ok(()),
-        }
-    }
-    let real = std::fs::canonicalize(&probe).map_err(Error::Io)?;
-    if !real.starts_with(&base) {
-        return Err(Error::Rejected(
-            "落盘路径解析到保存目录之外（疑似符号链接/junction）".into(),
-        ));
-    }
-    Ok(())
+    // 第 9 轮审查 P2-17：实现已提升到 receiver，v2 0x01/0x04 与本处共用一份。
+    crate::transfer::receiver::ensure_contained(save_dir, target)
 }
 
 fn random_hex(n: usize) -> String {
@@ -984,7 +984,8 @@ pub async fn cs_server_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
     wire.raw_write(&resp).await?;
 
     if !code_ok {
-        opts.gate.lock().await.fail(&peer.ip());
+        // 第 9 轮审查 P3-6：不在握手层记失败——handle_conn_cs 的 conn_settle 会
+        // 对 AuthRejected 记一次；两处都记会让锁定阈值从 10 次降到 5 次。
         return Err(Error::AuthRejected("配对码校验失败".into()));
     }
     let mut confirm_c = [0u8; 32];
@@ -993,7 +994,7 @@ pub async fn cs_server_ecdh<S: AsyncRead + AsyncWrite + Unpin>(
     if !ct_eq(&expect_c, &confirm_c) {
         // 代码对但证明对不上 = 对端持有不同会话密钥（中间人/异常客户端）——
         // 记账方向必须与「配对失败」一致；旧实现误记为 success 会清零锁定计数。
-        opts.gate.lock().await.fail(&peer.ip());
+        // 计数交给 conn_settle（P3-6：两处都记会让阈值减半）。
         return Err(Error::AuthRejected("客户端证明校验失败".into()));
     }
     opts.gate.lock().await.success(&peer.ip());
@@ -1052,7 +1053,7 @@ pub async fn cs_server_pairing<S: AsyncRead + AsyncWrite + Unpin>(
     };
     wire.raw_write(&[R_PAIRING, status]).await?;
     if status == 1 {
-        opts.gate.lock().await.fail(&peer.ip());
+        // 计数交给 conn_settle（P3-6），此处只回状态并报认证失败。
         return Err(Error::AuthRejected("配对码校验失败".into()));
     }
     opts.gate.lock().await.success(&peer.ip());
@@ -1228,6 +1229,9 @@ pub struct CsResumeState {
     /// status 2「已完整」**：体收满但尾哈希前断连时 received == total 而未验证，
     /// 下一连接必须整组重传（轮 UI-5 P1：此前 Done 分支零校验 = 未验证即成功）。
     pub verified: bool,
+    /// 验证完成时客户端携带的整文件哈希（无则 None）。0x03 的「已完整」重问
+    /// 必须与它比对——只核长度的旧实现会把「同尺寸改内容」判成功（轮 9 P1-3）。
+    pub verified_hash: Option<[u8; 32]>,
     /// 是否仍持有声明量（declare 记账）。完成即释放——否则已验证会话在 TTL
     /// 窗口内持续占用 64 GiB 封顶额度，大批量同步会被误拒（轮 UI-5 自查）。
     pub declared_held: bool,
@@ -1378,16 +1382,15 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// 0x04 接收侧哈希核对：进程缓存优先，miss 才读盘并回填（轮 9 P1-5——
 /// 重复同步此前整盘重读，差量同步核心收益被接收端吃掉；C# HaveIdenticalAsync
 /// 经 FileHashes 免读盘同款）。
-fn sync_hash_of(
-    state: &Arc<CsServerState>,
-    p: &Path,
-    size: u64,
-) -> [u8; 32] {
+///
+/// 读盘失败返回 None 且**不写缓存/journal**：旧实现 unwrap_or_default() 把
+/// 「读不到」当成「内容不符」并登记零哈希（轮 9 审查 P1-4）。
+async fn sync_hash_of(state: &Arc<CsServerState>, p: &Path, size: u64) -> Option<[u8; 32]> {
     let key_path = fnv1a(p.to_string_lossy().as_bytes());
     let mtime = mtime_nanos(p);
     let key = (key_path, size, mtime);
     if let Some(h) = state.sync_hashes.lock().expect("同步缓存锁").get(&key) {
-        return *h;
+        return Some(*h);
     }
     let path_str = p.to_string_lossy().to_string();
     // 进程内未命中 → 查落盘 journal（服务端重启后的首轮：上一轮写完的完整版本
@@ -1404,9 +1407,14 @@ fn sync_hash_of(
             cache.clear();
         }
         cache.insert(key, h);
-        return h;
+        return Some(h);
     }
-    let h = crate::hash::sha256_file(p).unwrap_or_default();
+    // 整文件哈希可能很大（0x04 冷文件），放阻塞池——否则占住 tokio worker。
+    let p_owned = p.to_path_buf();
+    let h = tokio::task::spawn_blocking(move || crate::hash::sha256_file(&p_owned))
+        .await
+        .ok()?
+        .ok()?;
     let mut cache = state.sync_hashes.lock().expect("同步缓存锁");
     // 条目封顶（轮 UI-2 P3-1——对齐 hashcache DEGRADED_MAP_CAP：百万文件级
     // 目录反复同步此前无界累积；满即清空重建，miss 只多一次读盘）。
@@ -1419,7 +1427,7 @@ fn sync_hash_of(
     if let Some(j) = state.sync_journal.lock().expect("同步 journal 锁").as_mut() {
         j.insert(&path_str, size, mtime, h);
     }
-    h
+    Some(h)
 }
 
 /// 记录某路径当前 (size, mtime) 的完整摘要（C# `FileHashes.Store` 同义：写完/校验完
@@ -1872,7 +1880,13 @@ pub async fn serve_tcp_on(listener: tokio::net::TcpListener, opts: RecvOptions) 
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         tune_tcp(&stream);
-                        while set.try_join_next().is_some() {}
+                        // 第 9 轮审查 P2-20：连接任务 panic 此前被静默吞掉——
+                        // 接收器看似在跑，实际可能每次连接都失败。至少记到 stderr。
+                        while let Some(res) = set.try_join_next() {
+                            if let Err(e) = res {
+                                eprintln!("[连接任务异常] {e}");
+                            }
+                        }
                         let o = opts.clone();
                         let counter = served.clone();
                         let st = state.clone();
@@ -2018,9 +2032,15 @@ async fn handle_single_file<S: AsyncRead + AsyncWrite + Unpin>(
         let dup = std::fs::metadata(&base)
             .map(|m| m.len() == size as u64)
             .unwrap_or(false)
-            && crate::hash::sha256_file(&base)
-                .map(|x| ct_eq(&x, &hash))
-                .unwrap_or(false);
+            && match tokio::task::spawn_blocking({
+                let b = base.clone();
+                move || crate::hash::sha256_file(&b)
+            })
+            .await
+            {
+                Ok(Ok(x)) => ct_eq(&x, &hash),
+                _ => false,
+            };
         if dup {
             let _ = std::fs::remove_file(&save_path);
             if let Some(r) = &reporter {
@@ -2111,9 +2131,15 @@ async fn handle_folder<S: AsyncRead + AsyncWrite + Unpin>(
             let dup = std::fs::metadata(&dest)
                 .map(|m| m.len() == *size)
                 .unwrap_or(false)
-                && crate::hash::sha256_file(&dest)
-                    .map(|h| ct_eq(&h, hash))
-                    .unwrap_or(false);
+                && match tokio::task::spawn_blocking({
+                    let d = dest.clone();
+                    move || crate::hash::sha256_file(&d)
+                })
+                .await
+                {
+                    Ok(Ok(h)) => ct_eq(&h, hash),
+                    _ => false,
+                };
             if dup {
                 let _ = std::fs::remove_file(&src);
                 continue;
@@ -2318,6 +2344,12 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             .expect("tracker 锁")
             .remove(&tracker_key);
         if let Some(tr) = t {
+            // 第 9 轮审查 P2-2：发布前把页缓存落盘。0x02 此前只保证目录项
+            // （hard_link）与发布写透，掉电后可能「名字在、尾部为零」。
+            if let Err(e) = tr.file.sync_all() {
+                let _ = std::fs::remove_file(&tr.save_path);
+                return Err(Error::Io(e));
+            }
             cs_release_declared(state, tr.total);
             if let Some(g) = &group_key {
                 state.group_peers.lock().expect("组归属锁").remove(g);
@@ -2431,13 +2463,21 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                 st.verified,
                 st.peer_ip.clone(),
                 st.save_path.clone(),
+                st.name.clone(),
+                st.verified_hash,
             )
         });
         match existing {
-            Some((_, _, _, eip, _)) if eip != ip => {
+            Some((_, _, _, eip, _, _, _)) if eip != ip => {
                 return Err(Error::Rejected("续传会话属于其他设备".into()));
             }
-            Some((etotal, received, _, _, path))
+            // 第 9 轮审查 P2-3：sid 由 (路径,大小,目标) 确定性派生、不含随机量，
+            // 同 NAT 下另一台设备可能撞上同一 sid——文件名不同即拒绝续写他人会话
+            // （C# HandleResumableCore 同样比对 FileName）。
+            Some((_, _, _, _, _, ename, _)) if ename != name => {
+                return Err(Error::Rejected("续传会话属于其他文件".into()));
+            }
+            Some((etotal, received, _, _, path, _, _))
                 if etotal == total as u64 && received < total as u64 =>
             {
                 // 磁盘事实优先（轮 UI-5 P1）：内存记账与实文件长度分叉时（外部
@@ -2451,11 +2491,12 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                 if let Some(st) = rs.get_mut(&key) {
                     st.received = from;
                     st.verified = false;
+                    st.verified_hash = None;
                     st.touched = Instant::now(); // 活跃刷新（TTL 清扫依据）
                 }
                 Session::Resume(path, from)
             }
-            Some((etotal, _, true, _, path)) if etotal == total as u64 => {
+            Some((etotal, _, true, _, path, _, vhash)) if etotal == total as u64 => {
                 // 已验证完成：再核一次磁盘长度（外部篡改/丢失即拒绝，不报成功）。
                 let ok = std::fs::metadata(&path)
                     .map(|m| m.len() == total as u64)
@@ -2469,7 +2510,39 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                     state.resume_gates.lock().expect("resume 门锁").remove(&key);
                     return Err(Error::Rejected("续传残件长度不符，需整组重发".into()));
                 }
-                Session::Done(path)
+                // 第 9 轮审查 P1-3：只核长度的旧实现会让「同尺寸改内容后重发」
+                // 被判为已完整（零传输、接收端保留旧内容）。客户端带整文件哈希
+                // 时必须与验证完成时记录的一致。
+                let hash_ok = match (full_hash.as_ref(), vhash.as_ref()) {
+                    (Some(c), Some(v)) => ct_eq(c, v),
+                    _ => true,
+                };
+                if hash_ok {
+                    Session::Done(path)
+                } else {
+                    // 内容已变：作废旧会话（保留磁盘旧档），按新传处理。
+                    if let Some(mut old) = rs.remove(&key) {
+                        release_resume_declared(state, &mut old);
+                    }
+                    state.resume_gates.lock().expect("resume 门锁").remove(&key);
+                    let save_path = cs_unique_save_path(save_dir, &name);
+                    cs_declare(state, total as u64)?;
+                    rs.insert(
+                        key.clone(),
+                        CsResumeState {
+                            save_path: save_path.clone(),
+                            total: total as u64,
+                            received: 0,
+                            name: name.clone(),
+                            peer_ip: ip.clone(),
+                            touched: Instant::now(),
+                            verified: false,
+                            verified_hash: None,
+                            declared_held: true,
+                        },
+                    );
+                    Session::New(save_path)
+                }
             }
             _ => {
                 // 旧会话（参数不同 / 体收满但未验证）一律作废：**先删残件再取唯一
@@ -2499,6 +2572,7 @@ async fn handle_resume<S: AsyncRead + AsyncWrite + Unpin>(
                         peer_ip: ip.clone(),
                         touched: Instant::now(),
                         verified: false,
+                        verified_hash: None,
                         declared_held: true,
                     },
                 );
@@ -2671,6 +2745,9 @@ async fn receive_resume_body<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(st) = rs.get_mut(key) {
             st.received = total;
             st.verified = true;
+            // 记下客户端声明的整文件哈希：下次同 sid 重问时据此判「已完整」
+            // 是否仍成立（P1-3）。无哈希（verifyFlag=0）时退回只核长度。
+            st.verified_hash = full_hash;
             st.touched = Instant::now();
             // 完成即释放声明量（幂等；TTL 清扫不会再扣一次）——已验证会话在
             // TTL 窗口内不得继续占用 64 GiB 封顶额度（自查：否则大批量同步
@@ -2730,6 +2807,9 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
     // 合法清单逐项增长即可，提示只影响首次扩容次数。
     let mut manifest: Vec<ManifestEntry> = Vec::with_capacity((file_count as usize).min(1024));
     let mut manifest_total = 0u64;
+    // 第 9 轮审查 P2-4：清单整表驻留且 total 无检查累加——1e6 × 4KB 路径可占
+    // ~4GiB，16384 条 1PiB 还能让 u64 回绕、架空总长校验。加累计预算 + checked。
+    let mut manifest_bytes: usize = 0;
     for _ in 0..file_count {
         let mut fh = [0u8; 10];
         wire.read_exact(&mut fh).await?;
@@ -2746,7 +2826,14 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
         wire.read_exact(&mut pb).await?;
         let mut h = [0u8; 32];
         wire.read_exact(&mut h).await?;
-        manifest_total += size as u64;
+        manifest_bytes = match manifest_bytes.checked_add(pb.len()) {
+            Some(n) if n <= CS_MANIFEST_MAX_BYTES => n,
+            _ => return Ok((false, 0, 0)),
+        };
+        manifest_total = match manifest_total.checked_add(size as u64) {
+            Some(n) if n <= CS_MAX_TRANSFER => n,
+            _ => return Ok((false, 0, 0)),
+        };
         manifest.push(ManifestEntry {
             rel: cs_sanitize_rel(&String::from_utf8_lossy(&pb)),
             size: size as u64,
@@ -2781,9 +2868,10 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
             if len == e.size {
-                let actual = sync_hash_of(state, &p, e.size);
-                if ct_eq(&actual, &e.hash) {
-                    continue;
+                if let Some(actual) = sync_hash_of(state, &p, e.size).await {
+                    if ct_eq(&actual, &e.hash) {
+                        continue;
+                    }
                 }
                 resume_index = i as i32;
                 resume_offset = 0;
@@ -2852,7 +2940,9 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
             let identical = !opts.strict_verify
                 && p.exists()
                 && std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) == e.size
-                && ct_eq(&sync_hash_of(state, &p, e.size), &e.hash);
+                && sync_hash_of(state, &p, e.size)
+                    .await
+                    .map_or(false, |h| ct_eq(&h, &e.hash));
             answers.push(if identical { 0u8 } else { 1u8 });
         }
         wire.write_all(&answers).await?;
@@ -2947,13 +3037,21 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
                     r.add(n as u64);
                 }
             }
+            // 第 9 轮审查 P2-2：追加数据先落盘——随后的整文件哈希是从页缓存
+            // 算出来的，断电后会出现「已回成功但文件短尾」。与 start==0 同纪律。
+            f.sync_all()?;
             let mut got = [0u8; 32];
             wire.read_exact(&mut got).await?;
             let computed: [u8; 32] = hasher.finalize().into();
             if !ct_eq(&got, &computed) {
                 return Ok((false, 0, files));
             }
-            let actual = crate::hash::sha256_file(&save_path).unwrap_or_default();
+            // 第 9 轮审查 P1-4：读失败 = 保留文件并报错。旧实现 unwrap_or_default()
+            // 会把「读不到」当「内容不符」，直接删掉用户既有文件。
+            let p_owned = save_path.clone();
+            let actual = tokio::task::spawn_blocking(move || crate::hash::sha256_file(&p_owned))
+                .await
+                .map_err(|e| Error::Io(io::Error::other(e.to_string())))??;
             if !ct_eq(&actual, &e.hash) {
                 let _ = std::fs::remove_file(&save_path);
                 return Ok((false, 0, files));
@@ -4385,6 +4483,7 @@ mod tests {
                         peer_ip: "1.1.1.1".into(),
                         touched: Instant::now() - Duration::from_secs(i as u64),
                         verified: false,
+                        verified_hash: None,
                         declared_held: false,
                     },
                 );
@@ -4417,6 +4516,7 @@ mod tests {
             peer_ip: "127.0.0.1".into(),
             touched: Instant::now(),
             verified: true,
+            verified_hash: None,
             declared_held: true,
         };
         release_resume_declared(&state, &mut st);

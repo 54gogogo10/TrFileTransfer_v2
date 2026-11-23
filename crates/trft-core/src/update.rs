@@ -257,19 +257,93 @@ fn host_header_of(url: &Url) -> String {
     }
 }
 
-/// 相对重定向 → 绝对 URL（轮 UI-5 续 P2）：必须保留**端口**——旧实现只拼
-/// scheme+host，非默认端口的更新源（如 https://host:8443）相对重定向会掉到
-/// 443/80 打空；IPv6 方括号由 host_header_of 还原。
+/// 去掉绝对路径中的 `.`/`..` 段（RFC 3986 §5.2.4 remove_dot_segments 的等价实现）：
+/// `..` 不得越过根；尾部斜杠保留。
+fn normalize_dot_segments(path: &str) -> String {
+    let trailing_slash = path.ends_with('/');
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if trailing_slash && !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
+/// 相对重定向 → 绝对 URL（RFC 3986 §5.2 引用解析；轮 9 P3-1）。
+/// - `/` 开头 = 相对 origin 根，必须用 scheme+authority（含端口；IPv6 经
+///   host_header_of 还原方括号）；
+/// - 否则基于**当前 path 的父目录**拼接，并消除 `.`/`..`——旧实现直接接在
+///   authority 后：`Location: file.exe` → `https://hostfile.exe`，
+///   `.evil.com/x` → `https://host.evil.com/x`；
+/// - `//host/…` 为 scheme-relative；`?` 只换查询；片段不参与请求；
+/// - 绝对 URL 原样返回（`parse_url` 再执行 https/回环策略）。
 fn resolve_redirect(url: &Url, loc: &str) -> String {
+    let scheme = if url.https { "https" } else { "http" };
+    let authority = format!("{scheme}://{}", host_header_of(url));
+    // RFC 3986 §5.2.2：先剥离片段（HTTP 请求行不含 `#fragment`）。
+    let loc = loc.trim();
+    let loc = loc.split_once('#').map(|(p, _)| p).unwrap_or(loc);
+    if loc.is_empty() {
+        return format!("{authority}{}", url.path);
+    }
     if loc.contains("://") {
         return loc.to_string();
     }
-    format!(
-        "{}://{}{}",
-        if url.https { "https" } else { "http" },
-        host_header_of(url),
-        loc
-    )
+    if let Some(rest) = loc.strip_prefix("//") {
+        return format!("{scheme}://{rest}");
+    }
+    let (loc_path, loc_query) = match loc.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (loc, None),
+    };
+    let with_query = |path: &str| match loc_query {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    };
+    if loc.starts_with('/') {
+        return format!("{authority}{}", with_query(&normalize_dot_segments(loc_path)));
+    }
+    if loc.starts_with('?') {
+        // 纯查询替换：旧查询丢弃，路径不变。
+        let base = url
+            .path
+            .split_once('?')
+            .map(|(p, _)| p)
+            .unwrap_or(&url.path);
+        return format!("{authority}{base}?{}", loc_query.unwrap_or(""));
+    }
+    let base = url
+        .path
+        .split_once('?')
+        .map(|(p, _)| p)
+        .unwrap_or(&url.path);
+    let parent = base.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let joined = format!("{parent}/{loc_path}");
+    format!("{authority}{}", with_query(&normalize_dot_segments(&joined)))
+}
+
+/// 解析下一跳并拒绝**跨 host** 重定向（轮 9 P3-1）：清单有 ed25519 验签，
+/// 但重定向可被中间设备改写，把连接引向第三方主机属误连。
+fn next_redirect(url: &Url, loc: &str) -> Result<Url> {
+    let next = resolve_redirect(url, loc);
+    let parsed = parse_url(&next)?;
+    if !parsed.host.eq_ignore_ascii_case(&url.host) {
+        return Err(proto(format!(
+            "重定向跨主机被拒绝: {} → {}",
+            url.host, parsed.host
+        )));
+    }
+    Ok(parsed)
 }
 
 async fn request_and_head(url: &Url) -> Result<(BoxIo, Head)> {
@@ -343,8 +417,7 @@ async fn http_get(raw_url: &str, max_bytes: usize) -> Result<Vec<u8>> {
             let Some(loc) = head.location else {
                 return Err(proto(format!("重定向缺少 Location（{}）", head.status)));
             };
-            let next = resolve_redirect(&url, &loc);
-            url = parse_url(&next)?;
+            url = next_redirect(&url, &loc)?;
             continue; // Connection: close，旧连接自然收尾
         }
         if head.status != 200 {
@@ -738,6 +811,82 @@ mod tests {
             resolve_redirect(&u, "https://cdn.example.com/x"),
             "https://cdn.example.com/x",
             "绝对 Location 原样"
+        );
+    }
+
+    /// 轮 9 P3-1 判别：相对 Location 必须按 RFC 3986 §5.2 解析——/ 开头用
+    /// origin 根，否则基于当前 path 父目录；旧实现直接拼 authority，产生
+    /// `https://hostfile.exe`、`https://host.evil.com/x` 这类错拼。
+    #[test]
+    fn relative_redirect_resolves_against_current_path() {
+        let u = parse_url("https://example.com/dir/sub/manifest.txt").unwrap();
+        assert_eq!(
+            resolve_redirect(&u, "pkg.exe"),
+            "https://example.com/dir/sub/pkg.exe",
+            "相对路径基于当前 path 父目录"
+        );
+        assert_eq!(
+            resolve_redirect(&u, "../pkg.exe"),
+            "https://example.com/dir/pkg.exe",
+            "上跳目录按 RFC 消除 .."
+        );
+        assert_eq!(
+            resolve_redirect(&u, "./pkg.exe"),
+            "https://example.com/dir/sub/pkg.exe"
+        );
+        assert_eq!(
+            resolve_redirect(&u, "/root/pkg"),
+            "https://example.com/root/pkg",
+            "/ 开头相对 origin 根"
+        );
+        assert_eq!(
+            resolve_redirect(&u, "//example.com/x"),
+            "https://example.com/x",
+            "scheme-relative 保留 scheme"
+        );
+        assert_eq!(
+            resolve_redirect(&u, "?v=2"),
+            "https://example.com/dir/sub/manifest.txt?v=2"
+        );
+        assert_eq!(
+            resolve_redirect(&u, "#frag"),
+            "https://example.com/dir/sub/manifest.txt",
+            "片段不参与请求"
+        );
+        // 旧实现的确切错拼：直接拼在 authority 后。
+        assert_ne!(
+            resolve_redirect(&u, "file.exe"),
+            "https://example.comfile.exe"
+        );
+        assert_eq!(
+            next_redirect(&u, "file.exe").unwrap().path,
+            "/dir/sub/file.exe"
+        );
+    }
+
+    /// 轮 9 P3-1 判别：跨 host 重定向（绝对或 scheme-relative）必须拒绝；
+    /// `.evil.com/x` 是**相对引用**，只能解析到当前 host 的路径下。
+    #[test]
+    fn cross_host_redirect_is_rejected() {
+        let u = parse_url("https://example.com/dir/manifest").unwrap();
+        let rel = next_redirect(&u, ".evil.com/x").unwrap();
+        assert_eq!(rel.host, "example.com", "相对引用不得被当成主机");
+        assert_eq!(rel.path, "/dir/.evil.com/x");
+        assert!(
+            next_redirect(&u, "https://evil.com/x").is_err(),
+            "跨 host 绝对重定向必须拒绝"
+        );
+        assert!(
+            next_redirect(&u, "//evil.com/x").is_err(),
+            "scheme-relative 跨 host 同样拒绝"
+        );
+        assert!(
+            next_redirect(&u, "https://example.com/other").is_ok(),
+            "同 host 重定向允许"
+        );
+        assert!(
+            next_redirect(&u, "https://EXAMPLE.com/other").is_ok(),
+            "host 比较大小写不敏感"
         );
     }
     use super::*;

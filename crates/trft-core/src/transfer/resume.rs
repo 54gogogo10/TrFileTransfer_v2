@@ -23,7 +23,7 @@ use crate::protocol::io::{
 };
 use crate::transfer::folder::collect_files;
 use crate::transfer::receiver::{
-    publish_part, record_recv, space_ok, unique_part, PartGuard, RecvOptions,
+    ensure_contained, publish_part, record_recv, space_ok, unique_part, PartGuard, RecvOptions,
 };
 use crate::transfer::sender::{connect_stack, SendOptions, StackPlan};
 use crate::transfer::CHUNK;
@@ -104,20 +104,29 @@ fn remove_resume_files(part: &Path) {
 }
 
 /// 规格 §6.1：服务器续传孤儿清理（7 天未返回）。
-/// PerDeviceFolder/AutoArchive 落地在子目录——递归扫描（深度封顶防环）。
+/// PerDeviceFolder/AutoArchive 落地在子目录——显式栈遍历（与
+/// `cleanup_part_orphans` 同口径：旧实现深度封顶 6 会漏掉更深的残件）；不跟随
+/// 符号链接（防环），纵深上限 64 仅作病态树兜底。
 pub fn cleanup_resume_orphans(dir: &Path) {
-    fn walk(dir: &Path, depth: u32) {
-        if depth > 6 {
-            return;
+    /// 纵深上限（正常 PerDeviceFolder/AutoArchive 只有 2–3 层）。
+    const MAX_DEPTH: usize = 64;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let now = std::time::SystemTime::now();
+    while let Some((d, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            continue;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
         };
-        let now = std::time::SystemTime::now();
         for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, depth + 1);
+            // file_type 是 lstat 语义：指向目录的链接按链接处理，不进栈（防环）。
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push((e.path(), depth + 1));
+                continue;
+            }
+            if ft.is_symlink() {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
@@ -134,12 +143,11 @@ pub fn cleanup_resume_orphans(dir: &Path) {
                     })
                     .unwrap_or(false)
                 {
-                    let _ = std::fs::remove_file(&p);
+                    let _ = std::fs::remove_file(e.path());
                 }
             }
         }
     }
-    walk(dir, 0);
 }
 
 /// 每会话锁（对端 IP + 文件名 → 锁）：防跨连接并发写坏同一半成品（规格 §3.1）。
@@ -154,6 +162,22 @@ pub(crate) async fn session_lock(
         map.retain(|_, v| Arc::strong_count(v) > 1);
     }
     map.entry((*ip, name.to_string())).or_default().clone()
+}
+
+/// 0x04 同步会话锁（根目录名 → 锁）：同一根目录的并发同步必须串行——否则两个
+/// 会话会同时按各自的位图判定「服务端缺这些文件」并互相覆盖，且摘要按对方
+/// (size,mtime) 键回填可投毒（P2-18）。键只看根名（不含 IP）：不同发送端同步同名
+/// 根目录同样会撞同一落盘目录。
+pub(crate) async fn folder_session_lock(
+    opts: &RecvOptions,
+    root_name: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = opts.folder_locks.lock().await;
+    if map.len() > 1024 {
+        // 与 0x03 会话锁同纪律：Arc 随会话消亡，这里只防洪水中无界增长。
+        map.retain(|_, v| Arc::strong_count(v) > 1);
+    }
+    map.entry(root_name.to_string()).or_default().clone()
 }
 
 /// 目标文件哈希：先查摘要缓存（免费），未命中现算（判错方向不对称：宁可多算）。
@@ -210,6 +234,31 @@ pub(crate) async fn fill_cache_at(opts: &RecvOptions, dest: &Path, size: u64, ha
         .await
         .map(|m| mtime_of(&m))
         .unwrap_or(0);
+    cache.lock().await.insert(&rel, size, mtime, hash);
+}
+
+/// 发布后按「发布前 mtime」复核再回填（P2-18）：rename 保留文件 mtime，若发布后
+/// dest 的 (size, mtime) 与半成品一致，说明落盘仍是本次校验过的内容；不一致
+/// （并发发布者/外部改写抢先换了文件）则不回填——否则会把旧哈希按新 mtime 写进
+/// 缓存，下一次 0x04 同步据此误判「服务端已有」（缓存投毒面）。
+pub(crate) async fn fill_cache_at_verified(
+    opts: &RecvOptions,
+    dest: &Path,
+    size: u64,
+    mtime: u64,
+    hash: [u8; 32],
+) {
+    let Some(cache) = &opts.hash_cache else {
+        return;
+    };
+    let now = tokio::fs::metadata(dest)
+        .await
+        .ok()
+        .map(|m| (m.len(), mtime_of(&m)));
+    if now != Some((size, mtime)) {
+        return; // 发布后目标已变：宁可下次重算，不得投毒
+    }
+    let rel = cache_key(opts, dest);
     cache.lock().await.insert(&rel, size, mtime, hash);
 }
 
@@ -286,8 +335,12 @@ where
     }
 
     // 会话绑定（对端 IP + 文件名）+ per-session 锁。
+    // P3-9：锁等待设 30s 上限——持锁方可能跨最长 5 分钟的网络读，无上限时同名
+    // 连接会占满并发许可静默等待。
     let lock = session_lock(opts, &peer.ip(), &name).await;
-    let _g = lock.lock().await;
+    let _g = tokio::time::timeout(std::time::Duration::from_secs(30), lock.lock())
+        .await
+        .map_err(|_| proto("续传会话正忙（等待会话锁超时 30s）"))?;
 
     tokio::fs::create_dir_all(&dir).await?;
     let part = resume_part_path(&dir, &name, &peer.ip());
@@ -340,28 +393,33 @@ where
     reply_nego(s, STATUS_OK, offset).await?;
 
     // 追加流式接收（offset..size）。
-    if offset < size {
+    {
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
             .open(&part)
             .await?;
-        f.seek(SeekFrom::Start(offset)).await?;
-        let mut lim = TokenBucket::new(opts.recv_limit_bps);
-        let mut remaining = size - offset;
-        let mut buf = vec![0u8; CHUNK];
-        while remaining > 0 {
-            let want = CHUNK.min(remaining.min(usize::MAX as u64) as usize);
-            read_exact_long(s, &mut buf[..want]).await?;
-            lim.acquire(want as u64).await;
-            f.write_all(&buf[..want]).await?;
-            if let Some(r) = &report {
-                r.add(want as u64);
+        if offset < size {
+            f.seek(SeekFrom::Start(offset)).await?;
+            let mut lim = TokenBucket::new(opts.recv_limit_bps);
+            let mut remaining = size - offset;
+            let mut buf = vec![0u8; CHUNK];
+            while remaining > 0 {
+                let want = CHUNK.min(remaining.min(usize::MAX as u64) as usize);
+                read_exact_long(s, &mut buf[..want]).await?;
+                lim.acquire(want as u64).await;
+                f.write_all(&buf[..want]).await?;
+                if let Some(r) = &report {
+                    r.add(want as u64);
+                }
+                remaining -= want as u64;
             }
-            remaining -= want as u64;
         }
         // 发布前落盘（轮 UI-5 续 P2）：0x03 此前不 fsync——整文件哈希是从
         // 页缓存算出的，掉电后最终名可能是短文件/零尾而服务端已报成功。
         // 与 0x00/0x01/0x04 同纪律（其结果在回执前已 sync_all）。
+        // P2-19：sync_all 移出 `offset < size`——offset == size（上次已收满但
+        // 未发布/未确认）时 part 可能仍在页缓存，跳过落盘直接发布会在掉电后留
+        // 截断的最终名。
         f.sync_all().await?;
     }
     // 载荷后哈希（防源文件传输中变异：两侧各自独立比对）。
@@ -422,13 +480,28 @@ where
             "清单文件数 {count} 超过上限 {MAX_MANIFEST_FILES}"
         )));
     }
+    // P2-18：同一根目录的并发同步必须串行——根目录会复用（同步语义），两个会话
+    // 同时按各自位图判定会互相覆盖，且摘要按对方 (size,mtime) 回填可投毒。
+    // 锁等待上限 30s（同 0x03 会话锁纪律，防占满并发许可无限等待）。
+    let lock = folder_session_lock(opts, &root_name).await;
+    let _g = tokio::time::timeout(std::time::Duration::from_secs(30), lock.lock())
+        .await
+        .map_err(|_| proto("同一文件夹同步会话正忙（等待会话锁超时 30s）"))?;
+
     // 同步语义：根目录固定（跨次同步同一目录），不追加冲突名；
     // 根相对的解析目录在会话建立时固定（PerDeviceFolder/AutoArchive，规格 §3.3）。
     let started = std::time::Instant::now();
     let resolved = crate::transfer::receiver::resolve_save_dir(opts, peer.ip());
+    // P2-17：0x04 复用既有目录——save_dir 内预置的 junction/符号链接可把对端
+    // 可控相对路径写出保存目录。建目录前后各验一次（后验封 canonicalize 与建目录
+    // 之间的替换窗口）。
+    ensure_contained(&opts.save_dir, &resolved)?;
     tokio::fs::create_dir_all(&resolved).await?;
+    ensure_contained(&opts.save_dir, &resolved)?;
     let base = resolved.join(&root_name);
+    ensure_contained(&opts.save_dir, &base)?;
     tokio::fs::create_dir_all(&base).await?;
+    ensure_contained(&opts.save_dir, &base)?;
 
     // 流式过清单：逐项核对跳过位（位图内存有界：≤ 100,000/8 = 12.5KB）。
     let mut bitmap = vec![0u8; count.div_ceil(8)];
@@ -486,7 +559,10 @@ where
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        // P2-17：子目录同样可能是指向树外的链接——建目录前后各验一次。
+        ensure_contained(&opts.save_dir, &parent)?;
         tokio::fs::create_dir_all(&parent).await?;
+        ensure_contained(&opts.save_dir, &parent)?;
         if !space_ok(&parent, size) {
             return Err(Error::Rejected(format!(
                 "{rel_raw}: 磁盘可用空间不足（需要 ≥ {size} 字节 + 64MB 余量）"
@@ -506,9 +582,15 @@ where
         let (part, hash) =
             recv_file_payload(s, &parent, &file_name, size, opts, report.as_ref()).await?;
         let _guard = PartGuard(part.clone());
+        // P2-18：记录半成品 mtime（rename 保留），发布后复核 dest 仍是本次校验过的
+        // 内容才回填缓存——否则并发发布者抢先换文件时，旧哈希会按新 mtime 入缓存。
+        let part_mtime = tokio::fs::metadata(&part)
+            .await
+            .map(|m| mtime_of(&m))
+            .unwrap_or(0);
         // 同步语义：内容不同 → 校验后 rename 覆盖（增量备份更新）。
         publish_replace(&part, &dest).await?;
-        fill_cache_at(opts, &dest, size, hash).await;
+        fill_cache_at_verified(opts, &dest, size, part_mtime, hash).await;
         outcome.finish();
         recv_bytes += size;
     }
@@ -1140,5 +1222,167 @@ mod tests {
             Some(expect),
             "现算后必须回填缓存"
         );
+    }
+
+    /// P2-18 判别：0x04 会话锁必须按根目录名复用同一把锁（跨 peer 串行化）。
+    #[tokio::test]
+    async fn folder_session_lock_is_same_object_per_root() {
+        let opts = RecvOptions::default();
+        let a = folder_session_lock(&opts, "lib").await;
+        let b = folder_session_lock(&opts, "lib").await;
+        let c = folder_session_lock(&opts, "other").await;
+        assert!(Arc::ptr_eq(&a, &b), "同名根目录必须共用一把锁");
+        assert!(!Arc::ptr_eq(&a, &c), "不同根目录不得互相阻塞");
+    }
+
+    /// P2-18 判别：发布后按「发布前 mtime」复核——目标已被并发改写（mtime/size
+    /// 不符）时不得把旧哈希按新键回填缓存（否则下次同步误判「服务端已有」）。
+    #[tokio::test]
+    async fn verified_cache_fill_skips_changed_dest() {
+        use crate::hashcache::HashCache;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.bin");
+        std::fs::write(&dest, b"hello world").unwrap();
+        let mtime = mtime_of(&std::fs::metadata(&dest).unwrap());
+        let opts = RecvOptions {
+            // 缓存键 = dest 相对 save_dir（与生产路径同口径）。
+            save_dir: dir.path().to_path_buf(),
+            hash_cache: Some(Arc::new(tokio::sync::Mutex::new(HashCache::load(
+                &dir.path().join("nonexistent-cache.txt"),
+                7,
+            )))),
+            ..Default::default()
+        };
+        let h = sha256_file(&dest).unwrap();
+        // 发布前 mtime 与 dest 一致（rename 保留 mtime）→ 回填。
+        fill_cache_at_verified(&opts, &dest, 11, mtime, h).await;
+        assert_eq!(
+            opts.hash_cache
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .get("x.bin", 11, mtime),
+            Some(h),
+            "mtime 一致必须回填"
+        );
+        // 发布后目标已被换（mtime 不符）→ 不得回填。
+        let stale = mtime.wrapping_add(1);
+        fill_cache_at_verified(&opts, &dest, 11, stale, [9u8; 32]).await;
+        assert_eq!(
+            opts.hash_cache
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .get("x.bin", 11, stale),
+            None,
+            "发布后目标已变时不得回填（缓存投毒面）"
+        );
+    }
+
+    /// 驱动一次 0x04 会话：写完整清单 + 单个载荷（不读位图——server→client
+    /// 缓冲足够容纳 1 字节位图），返回服务端结果。
+    async fn drive_resume_folder(
+        opts: &RecvOptions,
+        root_name: &str,
+        rel: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let o = opts.clone();
+        let peer: SocketAddr = "203.0.113.44:1".parse().unwrap();
+        let task = tokio::spawn(async move { recv_resume_folder(&mut server, peer, &o).await });
+        write_u64(&mut client, 0).await?; // sessionId
+        write_str_u16(&mut client, root_name).await?;
+        write_u32(&mut client, 1).await?;
+        write_str_u16(&mut client, rel).await?;
+        write_u64(&mut client, payload.len() as u64).await?;
+        write_u8(&mut client, 0).await?; // 无哈希 → 必发
+        // 载荷段（服务端先回位图再读载荷，小帧不会填满双向缓冲）。
+        write_str_u16(&mut client, rel).await?;
+        write_u64(&mut client, payload.len() as u64).await?;
+        write_all(&mut client, payload).await?;
+        write_all(&mut client, &crate::hash::sha256(payload)).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// P2-17 判别（0x04）：复用既有根目录前必须验包含性——根目录是指向树外的
+    /// junction 时，落盘必须拒绝，不得写出 save_dir。
+    #[tokio::test]
+    async fn resume_folder_refuses_junction_root_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("save");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let base = save.join("lib");
+        if !crate::transfer::receiver::test_dir_link(&base, &outside) {
+            eprintln!("跳过：当前环境无法创建目录链接（junction/symlink）");
+            return;
+        }
+        let opts = RecvOptions {
+            save_dir: save,
+            ..Default::default()
+        };
+        let r = drive_resume_folder(&opts, "lib", "evil.bin", b"pwn").await;
+        assert!(r.is_err(), "指向树外的根目录 junction 必须拒绝（P2-17）");
+        assert!(
+            !outside.join("evil.bin").exists(),
+            "对端相对路径不得写到保存目录之外"
+        );
+    }
+
+    /// P2-17 判别（0x04，续）：子目录 junction 同样必须拒绝（每个 parent 建目录
+    /// 前后各验一次）。
+    #[tokio::test]
+    async fn resume_folder_refuses_junction_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("save");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(save.join("lib")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        if !crate::transfer::receiver::test_dir_link(&save.join("lib").join("link"), &outside) {
+            eprintln!("跳过：当前环境无法创建目录链接（junction/symlink）");
+            return;
+        }
+        let opts = RecvOptions {
+            save_dir: save,
+            ..Default::default()
+        };
+        let r = drive_resume_folder(&opts, "lib", "link/evil.bin", b"pwn").await;
+        assert!(r.is_err(), "指向树外的子目录 junction 必须拒绝（P2-17）");
+        assert!(
+            !outside.join("evil.bin").exists(),
+            "对端相对路径不得经 junction 写出保存目录"
+        );
+    }
+
+    /// P3-12（同型）：续传孤儿清扫同样必须覆盖 >6 层目录（原实现深度封顶 6）。
+    #[test]
+    fn resume_orphan_cleanup_reaches_deep_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().join("device");
+        for i in 0..9 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let victim = deep.join("x.bin.0123456789abcdef.trft-resume");
+        std::fs::write(&victim, b"partial").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&victim)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let fresh = deep.join("fresh.bin.0123456789abcdef.trft-resume");
+        std::fs::write(&fresh, b"partial").unwrap();
+        cleanup_resume_orphans(dir.path());
+        assert!(!victim.exists(), "深层 7 天残留必须清扫（P3-12）");
+        assert!(fresh.exists(), "未过期半成品不得删除");
     }
 }

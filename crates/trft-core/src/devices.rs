@@ -36,6 +36,8 @@ pub struct DeviceInfo {
     /// "tcp" | "quic" | "udt"（拆分前存量 "udt" 于 load 时迁移为 "quic"）
     pub proto: String,
     pub needs_pairing: bool,
+    /// 最近一次记录时间（Unix **毫秒**；旧版 devices.json 存秒——仅用于排序与
+    /// 淘汰，旧值天然更旧，无需迁移）。
     pub last_seen: u64,
     /// 记录来源（旧 devices.json 无此字段 → 反序列化为 Discovery，保守方向）。
     #[serde(default)]
@@ -63,10 +65,24 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Unix 毫秒。设备 `last_seen` 用毫秒（轮 9 P3-5：秒级精度下同秒新增的第 11 台
+/// 在 stable sort 截断中与旧记录并列、排最后被当场丢弃）。
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 记录/更新一台设备（按 IP 去重、保留已知名、未知名回退 IP、超限按 last_seen 淘汰）。
 /// 来源只升不降：Discovery 不得覆盖已有的 Transfer/User（轮 2 防污染）。
-pub fn upsert(list: &mut Vec<DeviceInfo>, mut d: DeviceInfo) {
-    d.last_seen = now_secs();
+pub fn upsert(list: &mut Vec<DeviceInfo>, d: DeviceInfo) {
+    upsert_at(list, d, now_millis());
+}
+
+/// `upsert` 的时间注入版（测试用固定时刻钉住「同毫秒 tie」的淘汰次序）。
+fn upsert_at(list: &mut Vec<DeviceInfo>, mut d: DeviceInfo, now_ms: u64) {
+    d.last_seen = now_ms;
     if let Some(old) = list.iter_mut().find(|x| x.ip == d.ip) {
         // 只有「真实名字」（非空且非 IP 回退）才覆盖记忆名——匿名重记录
         // （如仅发送成功记忆）不得清空已知名（修复自 GUI 版的清名缺陷）。
@@ -84,8 +100,16 @@ pub fn upsert(list: &mut Vec<DeviceInfo>, mut d: DeviceInfo) {
         if d.name.is_empty() {
             d.name = d.ip.clone(); // 未知名回退 IP（规格 §3.3）
         }
+        // 轮 9 P3-5：**先剔除最旧再 push**。旧实现先 push 后按 last_seen 稳定排序
+        // 截断——同秒（现为同毫秒）新增条目在 tie 中排最后，会被当场丢弃。
+        if list.len() >= DEVICE_CAP {
+            if let Some((idx, _)) = list.iter().enumerate().min_by_key(|(_, x)| x.last_seen) {
+                list.remove(idx);
+            }
+        }
         list.push(d);
     }
+    // 兜底：磁盘载入的超限旧表在下次记录时收敛（正常路径已在 push 前剔除）。
     if list.len() > DEVICE_CAP {
         list.sort_by_key(|x| std::cmp::Reverse(x.last_seen));
         list.truncate(DEVICE_CAP);
@@ -267,10 +291,47 @@ mod tests {
             d.last_seen = i as u64;
             list.push(d);
         }
-        upsert(&mut list, dev("new", "10.9.9.9")); // now_secs 实际时间戳，必然最新
+        upsert(&mut list, dev("new", "10.9.9.9")); // now_millis 实际时间戳，必然最新
         assert_eq!(list.len(), DEVICE_CAP);
         assert!(list.iter().any(|d| d.ip == "10.9.9.9"), "新设备必须进入");
         assert!(list.iter().all(|d| d.ip != "10.0.0.0"), "最旧设备被淘汰");
+    }
+
+    /// 轮 9 P3-5 判别：last_seen 必须是毫秒时间戳（秒级精度下同秒 tie 不可分辨）。
+    #[test]
+    fn upsert_stamps_last_seen_in_milliseconds() {
+        let mut list = Vec::new();
+        let before = now_millis();
+        upsert(&mut list, dev("pc", "10.0.0.1"));
+        let seen = list[0].last_seen;
+        assert!(seen >= before && seen <= now_millis(), "必须落在当前毫秒");
+        assert!(
+            seen > 1_500_000_000_000,
+            "毫秒时间戳（秒级约 1.7e9）: {seen}"
+        );
+    }
+
+    /// 轮 9 P3-5 判别：同毫秒新增的第 11 台不得被当场丢弃——旧实现先 push
+    /// 后按 last_seen 稳定排序截断，tie 中新条目排最后被截掉。
+    #[test]
+    fn same_millisecond_new_device_is_not_dropped() {
+        let now = 1_700_000_000_000u64;
+        let mut list = Vec::new();
+        for i in 0..DEVICE_CAP {
+            let mut d = dev(&format!("old{i}"), &format!("10.0.0.{i}"));
+            d.last_seen = now; // 与新增条目同毫秒（tie）
+            list.push(d);
+        }
+        upsert_at(&mut list, dev("new", "10.9.9.9"), now);
+        assert_eq!(list.len(), DEVICE_CAP);
+        assert!(
+            list.iter().any(|d| d.ip == "10.9.9.9"),
+            "同毫秒新增的第 11 台必须保留"
+        );
+        assert!(
+            list.iter().all(|d| d.ip != "10.0.0.0"),
+            "tie 中最早插入的旧条目被淘汰"
+        );
     }
 
     #[test]

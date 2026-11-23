@@ -27,6 +27,19 @@ use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+/// 瞬态 UDP 接收错误判定（轮 9 P1-1：RUDP/UDT/单向 UDP 三处接收器共用）。
+/// 跨平台错误码：10040=WSAEMSGSIZE(Windows) / 90=EMSGSIZE(Linux) /
+/// 40=EMSGSIZE(macOS·FreeBSD) / 97=EMSGSIZE(Solaris) —— 收缓冲小于数据报，
+/// 只影响当前这一个杂包；10054=WSAECONNRESET(Windows) —— 向已关端口发过包后
+/// 收到 ICMP port-unreachable，下一次 recv 被"毒化"报连接重置，同属瞬态。
+/// 这些错误继续收包，其余底层错误仍上交（否则一个垃圾包即可杀死整个接收器）。
+pub(crate) fn is_transient_udp_err(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(10040) | Some(90) | Some(40) | Some(97) | Some(10054)
+    )
+}
+
 /// 定位写（性能批 2026-11-15：此前 seek+write_all 两个系统调用/包——定位写一个；
 /// Windows `FileExt::seek_write` / Unix `FileExt::write_at`，短写循环补齐 all 语义）。
 fn file_write_at(f: &mut std::fs::File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
@@ -91,7 +104,10 @@ pub const BURST_GAP: Duration = Duration::from_millis(40);
 /// 单向 UDP 保存目录下的半成品后缀。
 pub const PART_SUFFIX: &str = ".trft-udppart";
 
-const SESSION_CAP: usize = 64; // 规格 §6.1：UDP 接收会话表 64 会话（最旧逐出）
+const SESSION_CAP: usize = 64; // 规格 §6.1：UDP 接收会话表 64 会话
+/// 单来源会话配额（轮 9 P2-7：对齐 chunked.rs 的 8/来源）。超限只逐出本来源
+/// 最旧会话；绝不全局最旧逐出——否则任意主机 64 个 START 即可删他人半成品。
+const MAX_SESSIONS_PER_PEER: usize = 8;
 const SUPPRESS_CAP: usize = 256; // 已投递抑制窗口 256 会话
 const SUPPRESS_TTL: Duration = Duration::from_secs(600); // 10 分钟
 /// 覆盖位图预算：≈128MB / 64 会话 → 每会话 2MB 位图（规格 §6.1）。
@@ -761,19 +777,31 @@ impl UdpRecvEngine {
             }
             return UdpEvent::Ignored("会话已存在");
         }
-        if self.sessions.len() >= SESSION_CAP {
-            // 最旧逐出（规格 §6.1）：按插入序，确定性；半成品一并删除。
-            let oldest = self
-                .sessions
+        // 单来源配额（轮 9 P2-7）：本来源已满只逐出**本来源**最旧会话（last_seen
+        // 为主序、seq_no 裁决同刻并列——HashMap 迭代序随机，须确定性）；绝不跨
+        // peer 逐出（跨 peer 删他人 .part 是远程 DoS 面）。
+        let mine: Vec<(u64, Instant, u64)> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.peer == peer)
+            .map(|(k, s)| (*k, s.last_seen, s.seq_no))
+            .collect();
+        if mine.len() >= MAX_SESSIONS_PER_PEER {
+            if let Some(k) = mine
                 .iter()
-                .min_by_key(|(_, v)| (v.last_seen, v.seq_no))
-                .map(|(k, _)| *k);
-            if let Some(k) = oldest {
+                .min_by_key(|(_, ts, seq)| (*ts, *seq))
+                .map(|(k, ..)| *k)
+            {
                 if let Some(s) = self.sessions.remove(&k) {
                     self.declared_total -= s.padded;
                     let _ = std::fs::remove_file(&s.part_path);
                 }
             }
+        }
+        if self.sessions.len() >= SESSION_CAP {
+            // 全局满：拒绝新来源（fail-closed，对端下一轮重试），**不得**再按
+            // 全局最旧逐出（与 chunked.rs 同口径）。
+            return UdpEvent::Ignored("会话表已满，请稍后重试");
         }
         let padded = chunk_count * chunk_len as u64;
         // 磁盘预检（规格 §3.1：可用 ≥ 声明 + 64MB；探测失败放行）。
@@ -1101,6 +1129,11 @@ impl UdpRecvEngine {
         if self.async_finalize {
             let s = self.sessions.remove(&session).unwrap();
             self.declared_total -= s.padded;
+            // 入队前立即置投递抑制（轮 9 P2-8）：会话已摘表，若等收尾线程回
+            // Completed 再补记，第 2 轮 START/DATA 会重建会话并并发写同一 .part
+            // （收尾线程正在哈希/发布）——收尾结果不可信。抑制幂等，Completed
+            // 路径再记一次无副作用。
+            self.mark_suppressed(session);
             self.finalize_jobs.push(FinalizeJob {
                 session,
                 peer: s.peer,
@@ -1384,7 +1417,7 @@ pub async fn serve_udp_on(
     };
     // clone：save_dir 留在 opts 里，sink 需要整份 &opts（部分 move 后不能取整引用）。
     let mut engine = UdpRecvEngine::with_resolver(opts.save_dir.clone(), dir_for);
-    // 收尾（整文件重哈希 + 发布）移交独立线程：不再占住收包批。
+    // 收尾（整文件重哈希 + 发布）移交阻塞池：固定并发，不再占住收包批。
     engine.enable_async_finalize();
     let mut buf = vec![0u8; 2048];
     let mut sink = RecvSink {
@@ -1424,17 +1457,8 @@ pub async fn serve_udp_on(
             Ok(v) => v,
             // 缓冲小于数据报 → MSGSIZE——一个超长垃圾包不得杀死整个接收器
             // （轮 4 P1：LAN kill switch，已实测复现）。合法帧上限 1525B，
-            // 超长包必为垃圾 → 丢弃续收。跨平台错误码（轮 4 F6：此前仅匹配
-            // Windows 10040，Linux EMSGSIZE=90 仍会杀死接收器）：
-            // 10040=WSAEMSGSIZE(Windows) / 90=EMSGSIZE(Linux) / 40=EMSGSIZE(macOS·FreeBSD) / 97=EMSGSIZE(Solaris)。
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(10040) | Some(90) | Some(40) | Some(97)
-                ) =>
-            {
-                continue;
-            }
+            // 超长包必为垃圾 → 丢弃续收（跨平台错误码见 is_transient_udp_err）。
+            Err(e) if is_transient_udp_err(&e) => continue,
             Err(e) => return Err(crate::error::Error::Io(e)),
         };
         // 批量抽干 + 每批一次 blocking 池往返（性能批 2026-11-15：此前每包一次
@@ -1480,27 +1504,24 @@ pub async fn serve_udp_on(
         for (peer_ip, ev) in evs {
             sink.handle(&mut engine, peer_ip, ev);
         }
-        // 起异步收尾线程：整文件哈希 + 发布不再占住收包批。
+        // 收尾交给 tokio 阻塞池（轮 9 P2-8：固定并发，不再每 job 起一个 OS
+        // 线程——空文件 START 可高频刷线程）。
         for job in engine.drain_finalize_jobs() {
             let peer_ip = job
                 .peer
                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-            let tx = ftx.clone();
-            let fallback = job.clone();
-            match std::thread::Builder::new()
-                .name("trft-udp-finalize".into())
-                .spawn(move || {
-                    let ev = run_finalize(job);
-                    let _ = tx.send((peer_ip, ev));
-                }) {
-                Ok(_) => pending_finalize += 1,
-                Err(e) => {
-                    // 线程起不来：退化为同步收尾，文件仍会发布（不静默丢）。
-                    eprintln!("[警告] UDP 收尾线程启动失败，改为同步收尾: {e}");
-                    let ev = run_finalize(fallback);
-                    sink.handle(&mut engine, peer_ip, ev);
-                }
+            // 空文件收尾只有几次系统调用（哈希空串 + 发布）：同步做完，不占阻塞池。
+            if job.size == 0 {
+                let ev = run_finalize(job);
+                sink.handle(&mut engine, peer_ip, ev);
+                continue;
             }
+            let tx = ftx.clone();
+            pending_finalize += 1;
+            tokio::task::spawn_blocking(move || {
+                let ev = run_finalize(job);
+                let _ = tx.send((peer_ip, ev));
+            });
         }
     }
 }
@@ -1660,6 +1681,130 @@ mod tests {
         (p, data)
     }
 
+    /// 建一个 10B 源文件并返回其发送计划（会话逐出测试只关心 START）。
+    async fn plan_for(dir: &Path, name: &str) -> UdpPlan {
+        let (src, _) = make_file(dir, name, 10).await;
+        build_plan(&src, &UdpSendOptions::default()).await.unwrap()
+    }
+
+    /// P1-1 判别：跨平台 EMSGSIZE（10040/90/40/97）与 Windows ICMP 毒化
+    /// （10054）必须全部判为瞬态；普通错误仍须上报（否则一个垃圾包/一次
+    /// ICMP port-unreachable 就能杀死整个接收器）。
+    #[test]
+    fn transient_udp_errors_are_classified() {
+        for code in [10040, 90, 40, 97, 10054] {
+            assert!(
+                is_transient_udp_err(&std::io::Error::from_raw_os_error(code)),
+                "错误码 {code} 应视为瞬态继续收包"
+            );
+        }
+        for code in [13, 10061] {
+            assert!(
+                !is_transient_udp_err(&std::io::Error::from_raw_os_error(code)),
+                "错误码 {code} 必须上报"
+            );
+        }
+    }
+
+    /// P2-7 判别：会话逐出只在本来源内进行——他来源的进行中会话（含 .part）
+    /// 不得因本来源超配额被删。修复前按全局最旧逐出，本测试必红。
+    #[tokio::test]
+    async fn session_eviction_is_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        let peer_a: IpAddr = "10.9.0.1".parse().unwrap();
+        let peer_b: IpAddr = "10.9.0.2".parse().unwrap();
+        let b = plan_for(dir.path(), "peer-b.bin").await;
+        let b_part = out.join(format!("{:016x}_{}{}", b.session, b.name, PART_SUFFIX));
+        assert!(matches!(
+            eng.handle_from(&b.start_frames(&[0u8; 32])[0], Some(peer_b)),
+            UdpEvent::Started { .. }
+        ));
+        assert!(b_part.exists(), "B 会话半成品应已创建");
+        let mut a_parts = Vec::new();
+        for i in 0..=MAX_SESSIONS_PER_PEER {
+            let p = plan_for(dir.path(), &format!("peer-a-{i}.bin")).await;
+            let part = out.join(format!("{:016x}_{}{}", p.session, p.name, PART_SUFFIX));
+            assert!(
+                matches!(
+                    eng.handle_from(&p.start_frames(&[0u8; 32])[0], Some(peer_a)),
+                    UdpEvent::Started { .. }
+                ),
+                "第 {i} 个 A 会话应建立"
+            );
+            a_parts.push(part);
+        }
+        // A 超配额：只逐出 A 最旧的会话；B 的会话与半成品必须完好。
+        assert!(!a_parts[0].exists(), "本来源最旧会话应被逐出（删除 .part）");
+        assert!(a_parts.last().unwrap().exists(), "新会话必须保留");
+        assert!(b_part.exists(), "跨来源的进行中会话绝不能被逐出");
+        assert_eq!(eng.session_count(), 1 + MAX_SESSIONS_PER_PEER);
+    }
+
+    /// P2-7 判别：全局 64 会话满后拒绝新来源（fail-closed），不得再按全局
+    /// 最旧逐出——否则新来源一个 START 即可删掉既有进行中会话。
+    #[tokio::test]
+    async fn global_session_cap_rejects_new_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        let mut first_part = None;
+        for i in 0..SESSION_CAP {
+            let peer: IpAddr = format!("10.10.0.{}", i + 1).parse().unwrap();
+            let p = plan_for(dir.path(), &format!("global-{i}.bin")).await;
+            let part = out.join(format!("{:016x}_{}{}", p.session, p.name, PART_SUFFIX));
+            assert!(matches!(
+                eng.handle_from(&p.start_frames(&[0u8; 32])[0], Some(peer)),
+                UdpEvent::Started { .. }
+            ));
+            if first_part.is_none() {
+                first_part = Some(part);
+            }
+        }
+        assert_eq!(eng.session_count(), SESSION_CAP);
+        let newcomer: IpAddr = "10.11.0.1".parse().unwrap();
+        let p = plan_for(dir.path(), "newcomer.bin").await;
+        let ev = eng.handle_from(&p.start_frames(&[0u8; 32])[0], Some(newcomer));
+        assert!(
+            matches!(ev, UdpEvent::Ignored(m) if m.contains("会话表已满")),
+            "全局满必须拒绝新来源，实际: {ev:?}"
+        );
+        assert_eq!(eng.session_count(), SESSION_CAP, "拒绝时不得逐出任何会话");
+        assert!(
+            first_part.unwrap().exists(),
+            "既有会话半成品不得被全局逐出删除"
+        );
+    }
+
+    /// P2-8 判别：异步收尾入队时立即置投递抑制——下一轮 START 必须在引擎入口
+    /// 被丢弃，不得重建会话并并发写同一 .part（收尾线程正在哈希/发布）。
+    #[tokio::test]
+    async fn async_finalize_suppresses_before_job_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, data) = make_file(dir.path(), "af2.bin", 2400).await;
+        let plan = build_plan(&src, &UdpSendOptions::default()).await.unwrap();
+        let out = dir.path().join("out");
+        let mut eng = UdpRecvEngine::new(out.clone());
+        eng.enable_async_finalize();
+        let hash = crate::hash::sha256(&data);
+        for f in plan.start_frames(&hash) {
+            eng.handle(&f);
+        }
+        let (frames, _, _) = plan.build_pass(&src).await.unwrap();
+        for d in &frames {
+            eng.handle(d);
+        }
+        assert_eq!(eng.drain_finalize_jobs().len(), 1, "收尾应已排队");
+        // 收尾线程尚未跑（job 已取走）——此时第 2 轮 START 必须被抑制。
+        let ev = eng.handle(&plan.start_frames(&hash)[0]);
+        assert!(
+            matches!(ev, UdpEvent::Ignored(m) if m.contains("已投递抑制")),
+            "实际: {ev:?}"
+        );
+        assert_eq!(eng.session_count(), 0, "不得重建会话");
+    }
+
     #[tokio::test]
     async fn complete_transfer_without_loss() {
         let dir = tempfile::tempdir().unwrap();
@@ -1784,8 +1929,10 @@ mod tests {
         assert_eq!(std::fs::read(out.join("c.bin")).unwrap(), data);
     }
 
+    /// 轮 9 P2-7 改造判别：同一来源超单来源配额时只逐出**本来源**最旧会话
+    /// （旧实现等全局 64 才按全局最旧逐出；引擎直连测试无 peer = 同一来源）。
     #[tokio::test]
-    async fn session_table_evicts_oldest() {
+    async fn session_table_evicts_oldest_per_source() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1803,7 +1950,8 @@ mod tests {
         .unwrap();
         let data0 = plan0.build_pass(&p0).await.unwrap().0;
         eng.handle(&plan0.start_frames(&[0u8; 32])[0]);
-        for i in 1..=64 {
+        let mut last_data = Vec::new();
+        for i in 1..=MAX_SESSIONS_PER_PEER {
             let (src, _) = make_file(dir.path(), &format!("s{i}.bin"), 10).await;
             let plan = build_plan(
                 &src,
@@ -1815,11 +1963,17 @@ mod tests {
             .await
             .unwrap();
             eng.handle(&plan.start_frames(&[0u8; 32])[0]);
+            last_data = plan.build_pass(&src).await.unwrap().0;
         }
-        assert_eq!(eng.session_count(), 64);
-        // 第 0 个会话应已被逐出。
+        assert_eq!(eng.session_count(), MAX_SESSIONS_PER_PEER);
+        // 第 0 个会话（本来源最旧）应已被逐出；最新会话必须还在。
         let ev = eng.handle(&data0[0]);
-        assert!(matches!(ev, UdpEvent::Ignored("无此会话")));
+        assert!(matches!(ev, UdpEvent::Ignored("无此会话")), "实际: {ev:?}");
+        let ev = eng.handle(&last_data[0]);
+        assert!(
+            !matches!(ev, UdpEvent::Ignored("无此会话")),
+            "最新会话不得被逐出，实际: {ev:?}"
+        );
     }
 
     #[tokio::test]

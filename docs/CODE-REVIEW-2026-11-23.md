@@ -7,7 +7,7 @@
 | 静态检查 | `cargo clippy --workspace --all-targets`：0 error、50 warning（全部为 clamp/多余 return/同型 cast 类风格项） |
 | 回归基线 | `cargo test --workspace` 317 passed（审查期间未改代码） |
 | 结论 | 子审查原始 47 条，去重合并后 **6×P1、20×P2、18×P3**；无 P0（无内存不安全、无远程代码执行、无已验证的静默数据损坏在默认配置下可被单包触发） |
-| 状态 | 本文件为发现清单；修复排期见文末 |
+| 状态 | **同日全部修复**（6×P1、20×P2、18×P3），修复记录与判别测试见 §八 |
 
 ## 一、P1（建议立即修复）
 
@@ -162,3 +162,67 @@ match tokio::fs::hard_link(&part, &cand).await { Ok(()) => { ... } }
 - 5 个子审查各自独立上下文，按「数据丢失 → 对端输入导致的 panic/越界/无界分配 → 并发 → 路径安全 → 认证授权 → 资源上限」六维逐文件通读，要求每条给出代码原文与触发场景。
 - 主审对全部 P1 与 P2-1…P2-7、P2-9、P2-14…P2-17、P2-20 逐条回读源码复核；未亲自复核的条目已在上表「复核」列标注「子审查」。
 - 静态检查与测试基线未改动代码，保证结论对应提交 `b540977`（`main` HEAD）。
+
+## 八、修复记录（2026-11-23，同日完成）
+
+全量回归：`cargo test --workspace` **361 passed / 0 failed**（审查基线 317，新增 44 条判别/回归测试）；
+`cargo clippy --workspace --all-targets` 0 error（53 warning，均为风格项）。
+
+### P1（6/6）
+
+| 条目 | 修复 | 判别测试 |
+|---|---|---|
+| P1-1 | 抽 `transfer::udp::is_transient_udp_err`（10040/90/40/97 + 10054），RUDP/UDT/UDP 三处共用 | `udp.rs::transient_udp_errors_are_classified` |
+| P1-2 | `SendState::new` 统一 `clamp(2, UDT_FLIGHT_FLAG)`，握手两路传原值 | `udt.rs::handshake_flow_window_is_clamped` |
+| P1-3 | `CsResumeState.verified_hash`；Done 分支比对客户端整文件哈希，不符则作废按新传（保留旧档） | `e2e_interop.rs::resume_done_must_match_hash_not_only_size` |
+| P1-4 | 0x04 复核改用 `spawn_blocking + ??`（读失败报错保留文件）；`sync_hash_of` 改 `Option` 且失败不写缓存/journal | 现有 0x04 e2e + 新增 resume 用例 |
+| P1-5 | chunked TTL 逐出跳过 `assembling`（try_lock 失败视同组装中） | `chunked.rs::ttl_eviction_skips_assembling_group` |
+| P1-6 | Web 上传 `flush + sync_all` 后发布，发布改 `publish::move_noreplace` | `web.rs::upload_long_filename_uses_short_part_name`（走新发布路径） |
+
+### P2（20/20）
+
+| 条目 | 修复 |
+|---|---|
+| P2-1 | `cs_publish` 改 `publish::move_noreplace`（WRITE_THROUGH），保留冲突重名与拷贝回退 |
+| P2-2 | 0x02 完成与 0x04 追加发布前 `sync_all` |
+| P2-3 | 0x03 会话表比对文件名（`CsResumeState.name` 不再存而不用） |
+| P2-4 | 清单路径累计 ≤16MiB + `manifest_total` checked 加法 |
+| P2-5 | `is_cache_artifact` 按前缀覆盖 journal 的 `.bak`；接收落盘名（v2 `sanitize_name`/`sanitize_rel`、C# `cs_safe_name`/`cs_sanitize_rel`）拒绝缓存族与半成品名 |
+| P2-6 | `stats.log` 重写按字节从尾累计 + 5s 节流 + 减半重试 |
+| P2-7 | UDP 会话按来源分桶（每源 8），全局满拒绝新来源 |
+| P2-8 | 异步收尾入队前 `mark_suppressed`；收尾改 `spawn_blocking`，空文件同步快速路径 |
+| P2-9 | QUIC 建流后首字节读 30s 超时 |
+| P2-10 | RUDP/UDT 在建连接状态前 `try_acquire` 并发许可，许可由连接任务持有（内层传 1 许可副本） |
+| P2-11 | UDT 周期 NAK 按单包上限分批（364 字/包） |
+| P2-12 | UDT `poll_write` 改「先注册通知 → 二次查窗 → Pending」 |
+| P2-13 | `/login` body 读取套超时（`TimedBody` 提取器，408） |
+| P2-14 | `parse_hex32` 校验 64 hex；锁外解析，非法/缺失即重生成并保存 |
+| P2-15 | `prepare_save_dir`：创建失败/非目录 → 回滚占位并报错，成功后才写回配置 |
+| P2-16 | serve 循环分类瞬态 accept 错误并退避重试 |
+| P2-17 | `ensure_contained` 提升到 receiver，v2 0x01/0x04 的 base 与每个 parent 前后各校验 |
+| P2-18 | 0x04 按根名会话锁（30s 等待上限）；发布后按发布前 mtime 复核再回填缓存 |
+| P2-19 | 0x03 打开句柄与 `sync_all` 移出 `if offset < size` |
+| P2-20 | 连接任务 JoinSet 结果打印 panic；GUI 接收器改监督外壳（panic 时 emit 并走收尾） |
+
+### P3（18/18）
+
+| 条目 | 修复 |
+|---|---|
+| P3-1 | 更新器按 RFC 3986 解析相对重定向 + 拒绝跨 host |
+| P3-2 | `has_format_char` 改为完整 Cf 码位表（含 U+2066–2069、U+061C、Tag 字符） |
+| P3-3 | 发现应答加每源 5 次/秒 + 全局 200 次/秒令牌桶 |
+| P3-4 | monitor 非 Windows 就绪探测改只读打开 |
+| P3-5 | 设备 `last_seen` 改毫秒；截断先剔除最旧再 push |
+| P3-6 | 删除握手层 `gate.fail`，失败只由 `conn_settle` 记一次（阈值恢复 10 次） |
+| P3-7 | 0x04 续点/跳过与 0x04 复核的整文件哈希全部移入 `spawn_blocking` |
+| P3-8 | `ranges_of` 先 clone Arc 释放会话表锁再取状态锁 |
+| P3-9 | 0x03 会话锁加 30s 获取超时 |
+| P3-10 | 0x01 Rename 模式新根加 `NewRootGuard`，失败回滚整根（Skip 不动） |
+| P3-11 | `collect_files` 在 walk 内达上限即报错 |
+| P3-12 | 孤儿清扫改显式栈 + 深度 64（receiver 与 resume 两处） |
+| P3-13 | 0x0C 按 gid 只计一次成功（`counted` 原子标志） |
+| P3-14 | 队列子任务用 `QueueChildGuard` 记账，直发不再残留 |
+| P3-15 | `trft-server` 非法 `--bind` → exit 2，运行错误 → exit 1 |
+| P3-16 | CLI：`sync --pin` 守卫、UDP 拒绝 `--noencrypt`、端口 range(1..=65535) |
+| P3-17 | 上传半成品名改固定短名 `.up{8hex}.part` |
+| P3-18 | 未改（评估保留）：journal 每文件一次 flush 是「写完即落盘」的代价；大目录 0x04 可后续做批量提交 |

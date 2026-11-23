@@ -54,7 +54,7 @@ enum Cmd {
     Send {
         #[arg(long)]
         ip: String,
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: u16,
         #[arg(long, conflicts_with_all = ["text", "folder"])]
         file: Option<PathBuf>,
@@ -103,7 +103,7 @@ enum Cmd {
     },
     /// 无人值守接收
     Recv {
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: u16,
         #[arg(long)]
         out: Option<PathBuf>,
@@ -124,7 +124,7 @@ enum Cmd {
         folder: PathBuf,
         #[arg(long)]
         ip: String,
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
         port: u16,
         #[arg(long, value_enum, default_value = "tcp")]
         proto: Proto,
@@ -201,6 +201,33 @@ fn parse_pin(pin: &Option<String>) -> Result<Option<[u8; 32]>, String> {
             Ok(Some(out))
         }
     }
+}
+
+/// `--pin` 仅对 QUIC 生效（P3-16：sync 此前静默忽略，与 send 口径统一到一处）。
+fn check_quic_pin(proto: Proto, pin: &Option<String>) -> Result<(), String> {
+    if proto != Proto::Quic && pin.is_some() {
+        return Err("--pin 仅用于 --proto quic".into());
+    }
+    Ok(())
+}
+
+/// 单向 UDP 接收的参数互斥口径（P3-16：`--noencrypt` 此前被静默吞掉——
+/// 该协议恒为明文，与 send 分支一致必须显式报错）。
+fn check_udp_recv(
+    code: &Option<String>,
+    count: Option<u64>,
+    noencrypt: bool,
+) -> Result<(), String> {
+    if code.is_some() {
+        return Err("单向 UDP 无握手通道，不支持配对码/加密（规格 §3.1）".into());
+    }
+    if count.is_some() {
+        return Err("--count 不适用于 --proto udp（落盘即状态，无回传计数）".into());
+    }
+    if noencrypt {
+        return Err("--noencrypt 不适用于 --proto udp（恒为明文）".into());
+    }
+    Ok(())
 }
 
 fn transport_of(p: Proto) -> Transport {
@@ -326,8 +353,8 @@ async fn run() -> i32 {
             if let Err(e) = validate_code(&code) {
                 return usage_fail(&e);
             }
-            if proto != Proto::Quic && quic_pin.is_some() {
-                return usage_fail("--pin 仅用于 --proto quic");
+            if let Err(e) = check_quic_pin(proto, &quic_pin) {
+                return usage_fail(&e);
             }
             if let Some(n) = chunks {
                 if !(1..=8).contains(&n) {
@@ -461,13 +488,8 @@ async fn run() -> i32 {
             let addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
             match proto {
                 Proto::Udp => {
-                    if code.is_some() {
-                        return usage_fail("单向 UDP 无握手通道，不支持配对码/加密（规格 §3.1）");
-                    }
-                    if count.is_some() {
-                        return usage_fail(
-                            "--count 不适用于 --proto udp（落盘即状态，无回传计数）",
-                        );
+                    if let Err(e) = check_udp_recv(&code, count, noencrypt) {
+                        return usage_fail(&e);
                     }
                     eprintln!(
                         "单向 UDP 接收中: 0.0.0.0:{port} → {}（Ctrl+C 退出）",
@@ -557,6 +579,10 @@ async fn run() -> i32 {
         } => {
             if proto == Proto::Udp {
                 return usage_fail("单向 UDP 不支持文件夹传输（仅单文件，规格 §3.6）");
+            }
+            // P3-16：sync 的 --pin 此前对非 QUIC 静默无效——与 send 共用同一守卫。
+            if let Err(e) = check_quic_pin(proto, &quic_pin) {
+                return usage_fail(&e);
             }
             if let Err(e) = validate_code(&code) {
                 return usage_fail(&e);
@@ -709,5 +735,41 @@ async fn run() -> i32 {
                 Err(e) => fail(&format!("更新失败: {e}")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_zero_is_rejected_on_every_subcommand() {
+        assert!(Cli::try_parse_from(["trft", "send", "--ip", "127.0.0.1", "--port", "0"]).is_err());
+        assert!(Cli::try_parse_from(["trft", "recv", "--port", "0"]).is_err());
+        assert!(Cli::try_parse_from([
+            "trft", "sync", "--folder", ".", "--ip", "127.0.0.1", "--port", "0"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "trft", "send", "--ip", "127.0.0.1", "--port", "65535"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn pin_requires_quic_proto() {
+        assert!(check_quic_pin(Proto::Tcp, &Some("aa".into())).is_err());
+        assert!(check_quic_pin(Proto::Rudp, &Some("aa".into())).is_err());
+        assert!(check_quic_pin(Proto::Udp, &Some("aa".into())).is_err());
+        assert!(check_quic_pin(Proto::Quic, &Some("aa".into())).is_ok());
+        assert!(check_quic_pin(Proto::Quic, &None).is_ok());
+    }
+
+    #[test]
+    fn udp_recv_rejects_inapplicable_flags() {
+        assert!(check_udp_recv(&Some("1234".into()), None, false).is_err());
+        assert!(check_udp_recv(&None, Some(1), false).is_err());
+        assert!(check_udp_recv(&None, None, true).is_err());
+        assert!(check_udp_recv(&None, None, false).is_ok());
     }
 }

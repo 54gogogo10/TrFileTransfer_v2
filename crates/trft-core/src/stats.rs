@@ -1,5 +1,6 @@
-//! 传输统计（规格 §3.3/§8.1）：stats.log 追加式落盘、>2MB 重写保留末 5000 行
-//! （与摘要缓存同纪律）、今日/7 天/累计聚合 + 按设备明细、CSV 导出（UTF-8 BOM）。
+//! 传输统计（规格 §3.3/§8.1）：stats.log 追加式落盘、>2MB 重写按**字节**
+//! 保留尾部（≤ 2MB、至多末 5000 行、至少 1 行；与摘要缓存同纪律）、
+//! 今日/7 天/累计聚合 + 按设备明细、CSV 导出（UTF-8 BOM）。
 //!
 //! 记录点：core 完成/失败路径接线（TECH-STACK §7.10）——仅记**成功完成的传输**
 //! （失败可见于运行日志/进度终态，不重复入账）；GUI 与 CLI 共享同一 stats.log。
@@ -7,10 +8,16 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-/// 重写阈值与保留行数（规格 §8.1：>2MB 重写留 5000）。
+/// 重写阈值（规格 §8.1：>2MB 重写）。
 pub const REWRITE_THRESHOLD: u64 = 2 * 1024 * 1024;
+/// 保留行数上限（规格 §8.1：末 5000 行；字节预算先到则更少）。
 pub const REWRITE_KEEP: usize = 5000;
+/// 重写尝试节流（轮 9 P2-6）：长行等病态输入下，避免每条统计都全量读+写。
+const REWRITE_THROTTLE: Duration = Duration::from_secs(5);
 
 pub fn stats_path() -> PathBuf {
     crate::config::app_data_dir().join("stats.log")
@@ -59,16 +66,32 @@ pub struct StatRecord {
 #[derive(Debug, Clone)]
 pub struct StatsLog {
     path: PathBuf,
+    /// 上次重写尝试的 Unix 毫秒（0 = 从未）。节流状态随 Clone 共享——
+    /// 同一进程内多个 StatsLog 实例（GUI/CLI/e2e 共享同一文件）不会各写各的重写。
+    last_rewrite_ms: Arc<AtomicU64>,
+    /// 节流窗口（生产恒为 REWRITE_THROTTLE；测试注入 0 关闭节流）。
+    rewrite_throttle: Duration,
 }
 
 impl StatsLog {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            last_rewrite_ms: Arc::new(AtomicU64::new(0)),
+            rewrite_throttle: REWRITE_THROTTLE,
+        }
     }
 
     /// 默认路径实例（`%AppData%\TrFileTransfer\stats.log`）。
     pub fn default_log() -> Self {
         Self::new(stats_path())
+    }
+
+    /// 测试钩子：注入节流窗口（生产恒为 5s）。
+    #[cfg(test)]
+    fn with_rewrite_throttle(mut self, throttle: Duration) -> Self {
+        self.rewrite_throttle = throttle;
+        self
     }
 
     pub fn record(
@@ -103,9 +126,25 @@ impl StatsLog {
         self.maybe_rewrite();
     }
 
-    /// 阈值重写：>2MB 保留末 5000 行（原子换入；并发重写串行化无害，
-    /// 最坏「丢一行并发期新增统计」——统计口径非账务，可接受，轮 3 P3 修正注释）。
+    /// 阈值重写：按**字节**从尾部累计保留（≤ REWRITE_THRESHOLD、至多
+    /// REWRITE_KEEP 行、至少 1 行）——旧实现只按 5000 行截断，长行场景重写后
+    /// 仍 >2MB，每条统计都触发一次全量读+写（含 `.bak`）永续放大（轮 9 P2-6）。
     fn maybe_rewrite(&self) {
+        // 5 秒节流：常规路径每 5 秒最多一次 metadata 检查；重写失败/单行超阈值
+        // 等病态输入也不会退化成「每条记录全量读+写」。
+        let now_ms = crate::devices::now_millis();
+        let last = self.last_rewrite_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < self.rewrite_throttle.as_millis() as u64 {
+            return;
+        }
+        // CAS 抢占本次尝试权：并发记录只有一个线程做 IO，其余直接返回。
+        if self
+            .last_rewrite_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let Ok(md) = std::fs::metadata(&self.path) else {
             return;
         };
@@ -115,12 +154,12 @@ impl StatsLog {
         let Ok(text) = std::fs::read_to_string(&self.path) else {
             return;
         };
-        let keep: Vec<&str> = text.lines().collect::<Vec<_>>();
-        let start = keep.len().saturating_sub(REWRITE_KEEP);
-        let mut out = String::new();
-        for l in &keep[start..] {
-            out.push_str(l);
-            out.push('\n');
+        let mut out = keep_tail_by_bytes(&text, REWRITE_THRESHOLD);
+        // 「重写后仍超阈值」只可能出现在末行本身 > 阈值（至少保留 1 行）——
+        // 减半预算重试一次（行无法再切分，结果不变），随后接受并写回，
+        // 避免在「同样的输入」上无限重试。
+        if (out.len() as u64) > REWRITE_THRESHOLD {
+            out = keep_tail_by_bytes(&text, REWRITE_THRESHOLD / 2);
         }
         let _ = crate::config::atomic_write(&self.path, out.as_bytes());
     }
@@ -129,6 +168,30 @@ impl StatsLog {
     pub fn load(&self) -> Vec<StatRecord> {
         parse_stats_file(&self.path)
     }
+}
+
+/// 从尾部按字节累计保留内容：预算 ≤ `budget`，至少保留 1 行，且至多
+/// `REWRITE_KEEP` 行；返回以 '\n' 结尾的正文。纯函数以便单测（轮 9 P2-6）。
+fn keep_tail_by_bytes(text: &str, budget: u64) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut total: u64 = 0;
+    let mut start = lines.len();
+    for (i, line) in lines.iter().enumerate().rev() {
+        let len = line.len() as u64 + 1; // 含换行
+        // 至少 1 行：还没收任何行时无条件收下（末行本身可能超预算）。
+        let too_many_lines = lines.len() - i > REWRITE_KEEP;
+        if start != lines.len() && (total + len > budget || too_many_lines) {
+            break;
+        }
+        total += len;
+        start = i;
+    }
+    let mut out = String::with_capacity(total as usize);
+    for line in &lines[start..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// 行解析：现格式（Unix 秒）；**C# 旧 8 字段行照读**（时间列 = "yyyy-MM-dd HH:mm:ss"
@@ -424,12 +487,13 @@ mod tests {
     fn append_load_and_rewrite_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("stats.log");
-        let log = StatsLog::new(p.clone());
+        // 测试关闭 5s 节流：本用例要在同一次运行内连续验证「追加后可重写」。
+        let log = StatsLog::new(p.clone()).with_rewrite_throttle(Duration::ZERO);
         for i in 0..100 {
             log.record(Direction::Recv, "10.0.0.1", i, 1, 1, "直接发送", "f.bin");
         }
         assert_eq!(log.load().len(), 100);
-        // 压到阈值之上（6000 × ≈420B ≈ 2.5MB > 2MB）→ 重写保留末 5000。
+        // 压到阈值之上（6000 × ≈420B ≈ 2.5MB > 2MB）→ 按字节收敛到阈值内。
         let big_line = format!("1|S|1.1.1.1|1|1|1|{}|y\n", "x".repeat(400));
         let big: String = big_line.repeat(6000);
         std::fs::write(&p, big).unwrap();
@@ -438,6 +502,63 @@ mod tests {
         let n = after.lines().count();
         assert!(n <= REWRITE_KEEP + 1, "重写后必须收敛（实际 {n} 行）");
         assert_eq!(log.load().last().unwrap().bytes, 5, "最新一条必须保留");
+    }
+
+    /// 轮 9 P2-6 判别：长行场景按字节从尾累计——旧实现只按 5000 行截断，
+    /// 2000 行 × 2KB ≈ 4MB 会原样保留，重写后仍 >2MB（永续放大）。
+    #[test]
+    fn rewrite_keeps_long_line_file_within_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stats.log");
+        let log = StatsLog::new(p.clone()).with_rewrite_throttle(Duration::ZERO);
+        let long_line = format!("1|S|1.1.1.1|1|1|1|{}|y\n", "x".repeat(2000));
+        std::fs::write(&p, long_line.repeat(2000)).unwrap();
+        log.record(Direction::Recv, "10.0.0.1", 5, 1, 1, "直接发送", "f.bin");
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.len() as u64 <= REWRITE_THRESHOLD,
+            "长行场景重写后必须按字节收敛到阈值内（实际 {} 字节）",
+            after.len()
+        );
+        assert!(after.lines().count() < 2000, "长行场景必须丢弃部分旧行");
+        assert_eq!(log.load().last().unwrap().bytes, 5, "最新一条必须保留");
+    }
+
+    /// 轮 9 P2-6 判别：节流——重写尝试 5 秒内至多一次，病态长行输入下
+    /// 不得退化成「每条统计都全量读+写」。
+    #[test]
+    fn rewrite_is_throttled_within_five_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stats.log");
+        let log = StatsLog::new(p.clone());
+        let big_line = format!("1|S|1.1.1.1|1|1|1|{}|y\n", "x".repeat(400));
+        let big = big_line.repeat(6000);
+        std::fs::write(&p, &big).unwrap();
+        log.record(Direction::Recv, "10.0.0.1", 1, 1, 1, "直接发送", "a.bin");
+        assert!(
+            std::fs::metadata(&p).unwrap().len() <= REWRITE_THRESHOLD,
+            "首次记录应触发收敛"
+        );
+        // 再次压满后立即记录：节流窗口内不得再次重写。
+        std::fs::write(&p, &big).unwrap();
+        log.record(Direction::Recv, "10.0.0.1", 2, 1, 1, "直接发送", "b.bin");
+        assert!(
+            std::fs::metadata(&p).unwrap().len() > REWRITE_THRESHOLD,
+            "5s 节流窗口内不得再次全量重写"
+        );
+    }
+
+    /// 尾部按字节累计的纯函数口径：≤ 预算、至少 1 行、至多 5000 行。
+    #[test]
+    fn keep_tail_by_bytes_keeps_budget_and_last_line() {
+        assert_eq!(keep_tail_by_bytes("a\nb\nc\n", 4), "b\nc\n");
+        assert_eq!(keep_tail_by_bytes("a\nb\nc\n", 1), "c\n", "至少保留 1 行");
+        let many: String = (0..REWRITE_KEEP + 10).map(|i| format!("{i}\n")).collect();
+        assert_eq!(
+            keep_tail_by_bytes(&many, u64::MAX).lines().count(),
+            REWRITE_KEEP,
+            "行数上限仍为 5000"
+        );
     }
 
     #[test]

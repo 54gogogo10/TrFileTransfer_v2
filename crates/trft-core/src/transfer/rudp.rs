@@ -1353,9 +1353,15 @@ async fn demux_one(
             }
             HsRoute::Proceed => {}
         }
-        // 并发闸不在此获取：复用 `handle_conn`（TCP 入口）——0x09 加密分支与
-        // conn_precheck（IP 过滤 + 30s 闸上限）都在其内，与 TCP 语义完全一致
-        // （QUIC 入口跳过 0x09——其机密性由 TLS 承担，RUDP 无 TLS 不得复用）。
+        // 并发闸前移到建连接状态之前（轮 9 P2-10）：连接表上限 256 远大于 64
+        // 个许可，若先建状态再交给 handle_conn 等闸，等闸期间的无界入包通道 +
+        // 重排缓存可被打满（≈1.2GB）。满闸即丢弃本次 HS（不建任何状态，客户端
+        // 250ms 重发会自然重试，与等闸 30s 超时同语义）——这里用 try_acquire
+        // 而非 conn_permit：demux 是单循环，阻塞等闸会拖死所有已建连接。
+        let permit = match ctx.opts.permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Ok(false),
+        };
         // 建连接并登记（短锁域，无 await；共享出口直连——省一跳 forward 任务）。
         let (internal, stream, in_tx, _out_rx, driver) =
             build_conn(h.conn, src, mss, Some(ctx.out_tx.clone()));
@@ -1375,7 +1381,11 @@ async fn demux_one(
         if let Ok(ack) = pw::encode(pw::U_P_HS_ACK, h.conn, 0, &ack_payload) {
             let _ = ctx.socket.send_to(&ack, src).await;
         }
-        let o2 = opts.clone();
+        // 真实许可已在上方取得并移交监督任务；handle_conn 内部 conn_precheck
+        // 还会再取一次闸——传入仅 1 个许可的副本让它立即通过（等效"许可已持有"，
+        // 每连接仍只占一个真实许可）。receiver.rs 正被并行修改，不改其签名。
+        let mut o2 = opts.clone();
+        o2.permits = Arc::new(Semaphore::new(1));
         let served2 = ctx.served.clone();
         let conns2 = ctx.conns.clone();
         let ended2 = ctx.ended.clone();
@@ -1384,6 +1394,7 @@ async fn demux_one(
         // 监督任务：帧循环（0x05 配对/0x09 加密/0x0A 能力/0x08 压缩/
         // 分块/续传全继承 TCP）→ 驱动退出后摘表；限量模式收满即发停止信号。
         finished.spawn(async move {
+            let _permit = permit; // 持闸至连接结束（P2-10）
             let _ = handle_conn(stream, src, &o2, served2.clone()).await;
             let _ = driver.await;
             conns2.lock().expect("连接表锁").remove(&h.conn);
@@ -1473,8 +1484,9 @@ pub async fn serve_rudp_on(
             r = socket.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(e) => {
-                    // EMSGSIZE（Windows 10040）等杂包不致接收器退出（与 serve_udp 同口径）。
-                    if e.raw_os_error() == Some(10040) {
+                    // 杂包/ICMP 毒化不致接收器退出（轮 9 P1-1：此前只吞 Windows
+                    // 10040——10054 与跨平台 EMSGSIZE 都会整服务退出）。
+                    if crate::transfer::udp::is_transient_udp_err(&e) {
                         continue;
                     }
                     return Err(Error::Io(e));

@@ -535,3 +535,47 @@ async fn coverage_query_reports_written_ranges() {
     );
     s1.abort();
 }
+
+/// 第 9 轮审查 P1-3 判别：0x03「已完整」必须比对整文件哈希，不能只核长度。
+/// 同尺寸改内容后重发若被判 status 2，接收端会静默保留旧内容（零传输假成功）。
+#[tokio::test]
+async fn resume_done_must_match_hash_not_only_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let src = dir.path().join("same.bin");
+    std::fs::write(&src, vec![b'A'; 64 * 1024]).unwrap();
+
+    let (l, addr) = ephemeral_listener().await;
+    let s1 = tokio::spawn(trft_core::transfer::receiver::serve_on(
+        l,
+        opts_resident(out.clone(), None),
+    ));
+
+    send_file_auto(addr, &src, &new_client_opts()).await.unwrap();
+    assert_eq!(
+        sha256_file(&out.join("same.bin")).unwrap(),
+        sha256(&[b'A'; 64 * 1024])
+    );
+
+    // 同尺寸改内容：mtime 变、sid（路径+大小+目标）不变。
+    std::fs::write(&src, vec![b'B'; 64 * 1024]).unwrap();
+    send_file_auto(addr, &src, &new_client_opts()).await.unwrap();
+
+    // 旧档保持原内容；新内容必须真正落地（重名冲突 → same_1.bin）。
+    assert_eq!(
+        sha256_file(&out.join("same.bin")).unwrap(),
+        sha256(&[b'A'; 64 * 1024]),
+        "旧版本不得被删除或覆盖"
+    );
+    let want = sha256(&[b'B'; 64 * 1024]);
+    let delivered = std::fs::read_dir(&out)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && sha256_file(&e.path()).map(|h| h == want).unwrap_or(false)
+        });
+    assert!(delivered, "同尺寸改内容后必须重新传输（不得回 status 2）");
+    s1.abort();
+}

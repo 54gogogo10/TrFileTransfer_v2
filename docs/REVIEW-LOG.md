@@ -20,9 +20,9 @@
 | 6 | 密码学/TOCTOU | 1 | 1 | 1 | 5 | ✅ 全部修复 |
 | 7 | 测试质量/判别纪律 | — | 2 | 10 | 8 | ✅ 修复+补测 |
 | 8 | 安全收尾/残余风险 | — | 2 | — | 4 | ✅ 修复+清单交付 |
-| 9 | 全项目（5 路并行） | — | 6 | 20 | 18 | 📋 已出清单，待修复（[CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md)） |
+| 9 | 全项目（5 路并行） | — | 6 | 20 | 18 | ✅ 全部修复+补测（[CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md)） |
 
-合计约 137 项发现，其中轮 1–8 全部闭环或登记为已声明偏离（见 TECH-STACK.md §7 与本文 §残余风险）；轮 9 为 2026-11-23 全项目复核，清单见独立文档。
+合计约 137 项发现，轮 1–9 全部闭环或登记为已声明偏离（见 TECH-STACK.md §7 与本文 §残余风险）；轮 9 为 2026-11-23 全项目复核，清单与修复记录见独立文档。
 
 ## 各轮要点与关键修复
 
@@ -550,17 +550,10 @@ RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 
    判别：interrupted_encrypted_handshake_counts_toward_lockout（e2e_recv_options）。
 5. **P1 UDT 轻量 ACK 无超前校验**：seq_off 可返回 ≈0x3FFFFF00（10 亿次 pop_front），
 
-### 轮 9（2026-11-23，全项目复盘，5 路并行）
-
-范围：`crates/` 全部 67 个 `.rs`（33,385 行），5 个独立子审查 + 主审逐条复核 P1/P2 关键项；
-`cargo clippy --workspace --all-targets` 0 error / 50 warning（全风格类），`cargo test --workspace` 317 passed。
-结论：**6×P1、19×P2、18×P3，无 P0**；清单、证据与修复顺序见 [CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md)。
-
-要点：
-- **P1-1 RUDP 接收器单包即死**：`serve_rudp_on` 只吞 10040，10054（Windows ICMP 毒化）与跨平台 EMSGSIZE 直接 `return Err`——与 `udp.rs`/`udt.rs` 已有对策不一致。
-- **P1-2 UDT 握手 `flight_flag` 未钳制**：对端给 `i32::MAX` 即让发送侧流窗无界（ACK 路径有 clamp，握手路径漏）。
-- **P1-3/P1-4 C# 方言续传两处数据正确性问题**：0x03「已完整」只核磁盘长度不比哈希（同尺寸改内容被判成功）；0x04 增量复核把读失败当不符直接删既有文件。
-- **P1-5 分块空闲逐出删「组装中」半成品**：单来源配额逐出已排除 `assembling`，TTL 逐出未排除。
-- **P1-6 Web 上传无 fsync/写透**：F2/F3 的发布纪律未覆盖 Web 上传路径。
-- **P2 集中在**：C# 方言发布耐久性（hard_link/缺 sync）、0x04 清单内存与 `manifest_total` 回绕、缓存族文件名接收侧不拒、UDP 会话全局逐出、QUIC 首帧无超时、`token_secret` 切片 panic、v2 0x04 缺 `ensure_contained`、连接任务 panic 无隔离。
-- 已在 `REVIEW-LOG` 登记为「已接受」的项（Web 目录内符号链接跟随、缓存行非 MAC、无配对码可选加固）未重复计入。
+**补记 4（同日）**：第 9 轮全项目审查（5 路并行、67 个源文件）**44 项发现当日全部修复**（6×P1、20×P2、18×P3；
+P3-18 评估后保留并说明理由），修复记录见 [CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md) §八。
+要点：RUDP 瞬态错误统一（10054/EMSGSIZE）、UDT 握手流窗钳制、0x03 完成判定比对哈希、
+0x04 读失败不再删档、分块 TTL 逐出保护组装中会话、Web 上传 fsync+写透、C# 方言发布改 WRITE_THROUGH、
+0x04 清单内存/溢出防线、缓存族名接收侧拒收、UDP 会话按来源分桶、QUIC 首帧超时、
+接收器 panic 监督（GUI 外壳 + JoinSet 留痕）、v2 0x04 包含性校验与按根会话锁、配对失败计数去重。
+全量 `cargo test --workspace` 317 → **361 项全绿**；clippy 0 error（53 条风格 warning）。

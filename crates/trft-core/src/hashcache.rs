@@ -232,10 +232,21 @@ pub const CACHE_BAK_NAME: &str = ".trft-hash-cache.bak";
 /// %APPDATA%\TrFileTransfer\hash-cache-server.txt 的等价物）。与客户端缓存分文件：
 /// 服务端进程常驻持有追加句柄，同文件会让 verify 的原子重写撞共享冲突。
 pub const SERVER_CACHE_NAME: &str = ".trft-hash-cache-server.txt";
+/// 服务端 journal 的 `.bak` 镜像（config::atomic_write 用 `with_extension("bak")`
+/// 生成——轮 9 P2-5：旧实现漏判，重写后 8MB 备份会被扫描当用户内容外发）。
+pub const SERVER_CACHE_BAK_NAME: &str = ".trft-hash-cache-server.bak";
 
-/// 缓存族文件判定（主文件 + .bak 镜像 + 服务端 journal）。
+/// 缓存族前缀：主文件 / `.bak` / 服务端 journal 及其 `.bak` 共享此前缀。
+/// 按**前缀**判定而非枚举全名——`atomic_write` 的备份命名规则一变（本次 journal
+/// 的 `.bak` 就是），枚举式判定必漏（轮 9 P2-5）。
+const CACHE_FAMILY_PREFIX: &str = ".trft-hash-cache";
+
+/// 缓存族文件判定（主文件 + `.bak` 镜像 + 服务端 journal 及其 `.bak`）。
+/// 大小写不敏感：Windows 落盘名不分大小写，对端给 `.TRFT-HASH-CACHE.TXT`
+/// 同样会撞上目录里已有的缓存文件。
 pub fn is_cache_artifact(name: &str) -> bool {
-    name == CACHE_FILE_NAME || name == CACHE_BAK_NAME || name == SERVER_CACHE_NAME
+    name.get(..CACHE_FAMILY_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(CACHE_FAMILY_PREFIX))
 }
 
 /// 瞬态文件判定：内部元数据（缓存族）+ 传输未完成时的中间产物。
@@ -336,6 +347,9 @@ mod tests {
     fn transient_names_cover_cache_and_partial_files() {
         assert!(is_transient_name(CACHE_FILE_NAME));
         assert!(is_transient_name(CACHE_BAK_NAME));
+        assert!(is_transient_name(SERVER_CACHE_NAME));
+        assert!(is_transient_name(SERVER_CACHE_BAK_NAME));
+        assert!(is_transient_name(".TRFT-HASH-CACHE-SERVER.TXT"));
         assert!(is_transient_name("movie.bin.1234abcd.trft-part"));
         assert!(is_transient_name("movie.bin.1234ABCD.TRFT-PART"));
         assert!(is_transient_name("big.bin.0123456789abcdef.trft-resume"));
@@ -349,6 +363,23 @@ mod tests {
         );
         assert!(!is_transient_name("resume.trft"));
         assert!(!is_transient_name("part.bin"));
+    }
+
+    /// 轮 9 P2-5 判别：缓存族按**前缀**判定——服务端 journal 的 `.bak`
+    ///（`config::atomic_write` 的 `with_extension("bak")` 产物）必须命中；
+    /// 普通点文件不得被误伤（不拦 .gitignore/.env 等用户文件）。
+    #[test]
+    fn cache_artifact_covers_server_bak_and_plain_dotfiles_are_safe() {
+        assert!(
+            is_cache_artifact(SERVER_CACHE_BAK_NAME),
+            "服务端 journal 的 .bak 漏判（轮 9 P2-5）：{SERVER_CACHE_BAK_NAME}"
+        );
+        assert!(is_cache_artifact(SERVER_CACHE_NAME));
+        assert!(is_cache_artifact(CACHE_BAK_NAME));
+        assert!(is_cache_artifact(".TRFT-HASH-CACHE-SERVER.TXT"), "Windows 大小写不敏感");
+        assert!(!is_cache_artifact(".gitignore"), "普通点文件不得误伤");
+        assert!(!is_cache_artifact(".env"));
+        assert!(!is_cache_artifact("notes.trft-hash-cache.txt"));
     }
 
     #[test]

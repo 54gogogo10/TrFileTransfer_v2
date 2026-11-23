@@ -12,7 +12,9 @@ use crate::protocol::io::{
     read_str_u16, read_u32, read_u64, read_u8_long, write_str_u16, write_u32, write_u64,
     write_u8,
 };
-use crate::transfer::receiver::{publish_part, resolve_root, space_ok, PartGuard, RecvOptions};
+use crate::transfer::receiver::{
+    ensure_contained, publish_part, resolve_root, space_ok, PartGuard, RecvOptions,
+};
 use crate::transfer::resume;
 use crate::transfer::sender::{connect_quic_auth, connect_stack, SendOptions, StackPlan};
 use crate::transfer::{Transport, CHUNK};
@@ -25,10 +27,21 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// `exclude_exts` 为已归一化的扩展名（`crate::extext`）：命中的文件既不进清单、
 /// 也不传输（发送端单侧过滤——接收端按清单落盘，本来就看不到它们的名字）。
 pub fn collect_files(root: &Path, exclude_exts: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    collect_files_limited(root, exclude_exts, MAX_FOLDER_FILES)
+}
+
+/// `collect_files` 的带上限版本（测试可注入小上限）。P3-11：上限必须在 walk 内
+/// 逐项检查——旧实现遍历完才判，百万文件目录会先把清单吃满内存。
+fn collect_files_limited(
+    root: &Path,
+    exclude_exts: &[String],
+    max_files: usize,
+) -> Result<Vec<(String, PathBuf)>> {
     fn walk(
         dir: &Path,
         rel: &str,
         exclude_exts: &[String],
+        max_files: usize,
         out: &mut Vec<(String, PathBuf)>,
     ) -> Result<()> {
         for e in std::fs::read_dir(dir)? {
@@ -54,15 +67,21 @@ pub fn collect_files(root: &Path, exclude_exts: &[String]) -> Result<Vec<(String
                 continue; // 防环：符号链接不入清单（规格 §11 非目标）
             }
             if md.is_dir() {
-                walk(&p, &child_rel, exclude_exts, out)?;
+                walk(&p, &child_rel, exclude_exts, max_files, out)?;
             } else if md.is_file() {
+                // P3-11：每 push 前查上限，立即报错中止遍历（不把整棵目录吃进内存）。
+                if out.len() >= max_files {
+                    return Err(config_err(format!(
+                        "文件夹文件数超过上限 {max_files}（清单构建中止，未完整遍历）"
+                    )));
+                }
                 out.push((child_rel, p));
             }
         }
         Ok(())
     }
     let mut out = Vec::new();
-    walk(root, "", exclude_exts, &mut out)?;
+    walk(root, "", exclude_exts, max_files, &mut out)?;
     out.sort();
     for (rel, _) in &out {
         sanitize_rel(rel).map_err(|e| config_err(format!("清单项不可发送: {e}")))?;
@@ -70,13 +89,41 @@ pub fn collect_files(root: &Path, exclude_exts: &[String]) -> Result<Vec<(String
             return Err(config_err(format!("相对路径超长: {rel}")));
         }
     }
-    if out.len() > MAX_FOLDER_FILES {
-        return Err(config_err(format!(
-            "文件夹含 {} 个文件，超过上限 {MAX_FOLDER_FILES}",
-            out.len()
-        )));
-    }
     Ok(out)
+}
+
+/// 回滚本次新建的根目录（P3-10）：仅 Rename 模式启用（`resolve_root` 原子新建，
+/// 不会误删既有数据）。不跟随符号链接（file_type 是 lstat 语义），失败尽力而为。
+fn remove_tree(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        let _ = std::fs::remove_dir(dir);
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        match e.file_type() {
+            Ok(ft) if ft.is_dir() => remove_tree(&p),
+            _ => {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Rename 新建根的回滚守卫（P3-10）：0x01 中途失败（任一 `?` 早退）时删除本次
+/// 新建的整棵根目录，避免残留半套目录 / 重试生成 root_1、root_2……。
+struct NewRootGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for NewRootGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_tree(&self.path);
+        }
+    }
 }
 
 pub async fn send_folder(addr: SocketAddr, root: &Path, opts: &SendOptions) -> Result<()> {
@@ -297,7 +344,10 @@ where
 
     // 目录解析在会话建立时固定（PerDeviceFolder/AutoArchive，规格 §3.3）。
     let dir = crate::transfer::receiver::resolve_save_dir(opts, peer.ip());
+    // P2-17：复用既有目录前先验包含性，建目录后再验一次（封替换窗口）。
+    ensure_contained(&opts.save_dir, &dir)?;
     tokio::fs::create_dir_all(&dir).await?;
+    ensure_contained(&opts.save_dir, &dir)?;
     // Rename：根目录冲突时对根名追加（规格 §3.1）。
     // Skip：复用已存在的根目录——skip 的语义是「不制造重复副本」，
     // 再建 lib_1 恰恰违背它；文件级冲突在 base 内逐文件比对处理。
@@ -306,7 +356,16 @@ where
         DuplicatePolicy::Rename => resolve_root(&dir, &root_name).await,
     };
 
+    // P2-17：Skip 复用既有根目录（Rename 由 resolve_root 原子新建）——建目录前后
+    // 各验一次，预置 junction/符号链接不得把对端相对路径写出 save_dir。
+    ensure_contained(&opts.save_dir, &base)?;
     tokio::fs::create_dir_all(&base).await?;
+    ensure_contained(&opts.save_dir, &base)?;
+    // P3-10：Rename 模式新建的根中途失败必须回滚（Skip 复用既有根，绝不删）。
+    let mut root_guard = NewRootGuard {
+        path: base.clone(),
+        armed: opts.duplicate == DuplicatePolicy::Rename,
+    };
 
     let mut recv_bytes = 0u64;
     let mut recv_files = 0u32;
@@ -322,7 +381,10 @@ where
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        // P2-17：子目录同样可能是指向树外的链接——建目录前后各验一次。
+        ensure_contained(&opts.save_dir, &parent)?;
         tokio::fs::create_dir_all(&parent).await?;
+        ensure_contained(&opts.save_dir, &parent)?;
         if !space_ok(&parent, size) {
             return Err(Error::Rejected(format!(
                 "{rel}: 磁盘可用空间不足（需要 ≥ {size} 字节 + 64MB 余量）"
@@ -380,6 +442,8 @@ where
             recv_files += 1;
         }
     }
+    // 全部文件落盘成功：新根转正（守卫 drop 不再删除）。
+    root_guard.armed = false;
     crate::transfer::receiver::record_recv(
         opts,
         peer,
@@ -394,4 +458,131 @@ where
         base.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P3-11 判别：文件数上限必须在 walk 内逐项检查、立即报错——旧实现遍历完
+    /// 才判，百万文件目录会先吃满内存。
+    #[test]
+    fn collect_files_stops_at_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join(format!("f{i}.bin")), b"x").unwrap();
+        }
+        std::fs::write(root.join("sub").join("g.bin"), b"x").unwrap();
+        let e = collect_files_limited(&root, &[], 2).unwrap_err();
+        assert!(e.to_string().contains("上限"), "错误信息应指明上限: {e}");
+        assert_eq!(collect_files_limited(&root, &[], 10).unwrap().len(), 4);
+    }
+
+    /// 驱动一次 0x01 接收会话：写 root 名 + count + 逐文件 (rel, size, 载荷, 哈希)。
+    async fn drive_recv_folder(
+        opts: &RecvOptions,
+        root_name: &str,
+        files: &[(&str, &[u8], Option<[u8; 32]>)],
+    ) -> Result<()> {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let o = opts.clone();
+        let peer: SocketAddr = "203.0.113.45:1".parse().unwrap();
+        let task = tokio::spawn(async move { recv_folder_over(&mut server, peer, &o).await });
+        write_str_u16(&mut client, root_name).await?;
+        write_u32(&mut client, files.len() as u32).await?;
+        for (rel, data, hash_override) in files {
+            write_str_u16(&mut client, rel).await?;
+            write_u64(&mut client, data.len() as u64).await?;
+            client.write_all(data).await?;
+            let h = hash_override.unwrap_or_else(|| crate::hash::sha256(data));
+            client.write_all(&h).await?;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// P2-17 判别：0x01(Skip) 复用既有根目录前必须验包含性——根目录若是指向
+    /// 树外的 junction，落盘必须拒绝，不得写出 save_dir。
+    #[tokio::test]
+    async fn folder_skip_refuses_junction_root_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("save");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        if !crate::transfer::receiver::test_dir_link(&save.join("lib"), &outside) {
+            eprintln!("跳过：当前环境无法创建目录链接（junction/symlink）");
+            return;
+        }
+        let opts = RecvOptions {
+            save_dir: save,
+            duplicate: DuplicatePolicy::Skip,
+            ..Default::default()
+        };
+        let r = drive_recv_folder(&opts, "lib", &[("evil.bin", b"pwn", None)]).await;
+        assert!(r.is_err(), "指向树外的根目录 junction 必须拒绝（P2-17）");
+        assert!(
+            !outside.join("evil.bin").exists(),
+            "对端相对路径不得写到保存目录之外"
+        );
+    }
+
+    /// P2-17 判别（续）：根目录内预置的子目录 junction 同样必须拒绝（每个 parent
+    /// 建目录前后各验一次）。
+    #[tokio::test]
+    async fn folder_skip_refuses_junction_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("save");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(save.join("lib")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        if !crate::transfer::receiver::test_dir_link(&save.join("lib").join("link"), &outside) {
+            eprintln!("跳过：当前环境无法创建目录链接（junction/symlink）");
+            return;
+        }
+        let opts = RecvOptions {
+            save_dir: save,
+            duplicate: DuplicatePolicy::Skip,
+            ..Default::default()
+        };
+        let r = drive_recv_folder(&opts, "lib", &[("link/evil.bin", b"pwn", None)]).await;
+        assert!(r.is_err(), "指向树外的子目录 junction 必须拒绝（P2-17）");
+        assert!(
+            !outside.join("evil.bin").exists(),
+            "对端相对路径不得经 junction 写出保存目录"
+        );
+    }
+
+    /// P3-10 判别：Rename 模式新建根的中途失败必须回滚——旧实现把已发布的
+    /// 文件留在 proj/，重试再生成 proj_1、proj_2……并残留半套目录。
+    #[tokio::test]
+    async fn folder_failure_rolls_back_new_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let opts = RecvOptions {
+            save_dir: out.clone(),
+            duplicate: DuplicatePolicy::Rename,
+            ..Default::default()
+        };
+        // 第 2 个文件哈希不符 → 会话失败（第 1 个已发布进新根）。
+        let r = drive_recv_folder(
+            &opts,
+            "proj",
+            &[
+                ("good.bin", b"ok", None),
+                ("bad.bin", b"nope", Some([0u8; 32])),
+            ],
+        )
+        .await;
+        assert!(r.is_err(), "哈希不符必须报错");
+        assert!(
+            !out.join("proj").exists(),
+            "失败会话新建的根必须回滚（P3-10）"
+        );
+    }
 }

@@ -6,7 +6,7 @@
 //! `Cache-Control: no-store` + `X-Frame-Options: DENY` + CSP；仅图片/音视频/pdf/txt 内联，
 //! HTML/SVG 一律 attachment。
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path as AxPath, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path as AxPath, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -54,6 +54,8 @@ pub struct WebState {
     permits: Arc<Semaphore>,
     /// 上传单文件上限（可注入以便测试；生产 = MAX_UPLOAD_BYTES）。
     pub max_upload_bytes: u64,
+    /// /login 请求体读取上限（P2-13，可注入以便测试；生产 = BODY_IDLE_TIMEOUT）。
+    pub login_body_timeout: Duration,
 }
 
 impl WebState {
@@ -75,6 +77,7 @@ impl WebState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
             max_upload_bytes: MAX_UPLOAD_BYTES,
+            login_body_timeout: BODY_IDLE_TIMEOUT,
         }
     }
 
@@ -371,11 +374,31 @@ async fn login_page() -> Html<String> {
     )
 }
 
+/// /login 请求体提取（P2-13）：/login 豁免并发闸，而 `String` 提取器在进入
+/// handler 之前就把 body 读光——未认证连接可慢滴 body 无限占用连接/fd。这里把
+/// 提取 future 本身套上 `login_body_timeout`（默认 BODY_IDLE_TIMEOUT），超时回
+/// 408；内层 `String` 提取器仍沿用路由上的 DefaultBodyLimit(8KB)，超限仍 413。
+struct TimedBody(String);
+
+impl FromRequest<Arc<WebState>> for TimedBody {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &Arc<WebState>) -> Result<Self, Self::Rejection> {
+        match tokio::time::timeout(state.login_body_timeout, String::from_request(req, state)).await
+        {
+            Ok(Ok(body)) => Ok(Self(body)),
+            Ok(Err(rej)) => Err(rej.into_response()),
+            Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "登录请求体空闲超时").into_response()),
+        }
+    }
+}
+
 async fn login_submit(
     State(st): State<Arc<WebState>>,
     addr: Option<axum::Extension<axum::extract::ConnectInfo<SocketAddr>>>,
-    body: String,
+    body: TimedBody,
 ) -> Response {
+    let TimedBody(body) = body;
     let Some(auth) = &st.auth else {
         return Redirect::to("/").into_response();
     };
@@ -817,6 +840,16 @@ async fn download(
 
 // ============ 上传（multipart 流式） ============
 
+/// 上传半成品名（P3-17）：固定短名 `.up{8hex}.part`——目录项只多 16 字节、
+/// 不随原名增长。原名最长可到 255 字节，旧形再拼 stem/ext 必超 Windows
+/// 单段名上限（250 字符名 + 16 字节 → 上传 500）；最终名仍在发布时按原名/冲突
+/// 序号取。
+fn upload_part_name() -> String {
+    let mut rnd = [0u8; 4];
+    OsRng.fill_bytes(&mut rnd);
+    format!(".up{:08x}.part", u32::from_le_bytes(rnd))
+}
+
 async fn upload_root(State(st): State<Arc<WebState>>, mp: Multipart) -> Response {
     upload_impl(st, "", mp).await
 }
@@ -865,8 +898,8 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
             return (StatusCode::BAD_REQUEST, "非法文件名").into_response();
         };
         // 唯一半成品 + 流式落盘（防半截上传出现在最终名上）。
-        let mut rnd = [0u8; 4];
-        OsRng.fill_bytes(&mut rnd);
+        // P3-17：半成品名与原名无关、固定 16 字节（.up{8hex}.part）——原名已可
+        // 长到 255 字节，旧形再拼 stem/ext（+16 字节）必超 Windows 单段名上限。
         let p = Path::new(&name);
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
         let ext = p
@@ -874,10 +907,7 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
             .and_then(|s| s.to_str())
             .map(|e| format!(".{e}"))
             .unwrap_or_default();
-        let part = dest_dir.join(format!(
-            "{stem}.up{:08x}{ext}.part",
-            u32::from_le_bytes(rnd)
-        ));
+        let part = dest_dir.join(upload_part_name());
         let mut out = match tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -926,14 +956,23 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
                 }
             }
         }
-        drop(out);
         if too_big {
+            drop(out);
             let _ = tokio::fs::remove_file(&part).await;
             return (StatusCode::PAYLOAD_TOO_LARGE, "单文件超过 2GB 上限").into_response();
         }
-        // 冲突命名：hard_link fail-if-exists + 冲突名循环重取（轮 2 P3：与 core
-        // publish_part 同纪律——rename 在 Windows 上会静默覆盖，且 exists/rename
-        // 之间存在 TOCTOU）。
+        // P1-6：发布前必须把数据刷进盘——flush 只清用户态缓冲，sync_all 才是
+        // Windows 的 FlushFileBuffers。否则 303「已接收」后数秒内硬断电，最终名
+        // 文件可能为空/截断（与 core F2/F3 同型数据丢失）。
+        if out.flush().await.is_err() || out.sync_all().await.is_err() {
+            let _ = tokio::fs::remove_file(&part).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, "写入失败").into_response();
+        }
+        drop(out);
+        // 冲突命名：write-through 改名 fail-if-exists + 冲突名循环重取（轮 2 P3：
+        // 与 core publish_part 同纪律——rename 在 Windows 上会静默覆盖，且
+        // exists/rename 之间存在 TOCTOU；P1-6：move_noreplace 带
+        // MOVEFILE_WRITE_THROUGH，替代无写透的 hard_link）。
         let mut published: Option<std::path::PathBuf> = None;
         for i in 0..10000u32 {
             let cand = if i == 0 {
@@ -941,13 +980,13 @@ async fn upload_impl(st: Arc<WebState>, path: &str, mp: Multipart) -> Response {
             } else {
                 dest_dir.join(format!("{stem}_{i}{ext}"))
             };
-            match tokio::fs::hard_link(&part, &cand).await {
+            match trft_core::publish::move_noreplace(&part, &cand) {
                 Ok(()) => {
                     published = Some(cand);
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => break, // 卷不支持硬链接 → 走下方独占创建退化路径
+                Err(_) => break, // 改名不可用 → 走下方独占创建退化路径
             }
         }
         let final_path = match published {
@@ -1155,8 +1194,9 @@ fn url_escape(s: &str) -> String {
 /// 续传半成品均有 7 天孤儿清扫兜底（「与进程被杀同口径」），Web 上传半成品
 /// 此前不在任何清扫器覆盖内，落在用户共享目录永久残留。启动时按 7 天清扫
 ///（与 core `cleanup_part_orphans` 同口径；深度封顶防符号链接环）。
-/// 上传半成品文件名判定（轮 8 P3-2）：`{stem}.up{8hex}{ext}.part`——
-/// 与 upload_impl 的自产名严格同形。
+/// 上传半成品文件名判定（轮 8 P3-2 / 轮 9 P3-17）：新短名 `.up{8hex}.part`
+/// 是旧长名 `{stem}.up{8hex}{ext}.part` 在 stem 为空、无扩展名时的特例，同一
+/// 解析即可覆盖——旧形仍要识别，升级前崩溃留下的残件才能被 7 天孤儿清扫回收。
 fn is_upload_part_name(name: &str) -> bool {
     let Some(dot) = name.rfind(".up") else {
         return false;
@@ -1194,8 +1234,8 @@ pub fn cleanup_upload_orphans(dir: &std::path::Path) {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
-            // 上传半成品形态："{stem}.up{8 位 hex}{ext}.part"——按自产格式收紧
-            // （轮 8 P3-2：宽松的 contains(".up") 理论上可误删形如
+            // 上传半成品形态：".up{8 位 hex}.part"（旧长名同形）——按自产格式
+            // 收紧（轮 8 P3-2：宽松的 contains(".up") 理论上可误删形如
             // my.uploader.part 的用户文件）。
             if !is_upload_part_name(&name) {
                 continue;
@@ -1218,6 +1258,19 @@ pub fn cleanup_upload_orphans(dir: &std::path::Path) {
     walk(dir, 0);
 }
 
+/// accept 瞬态错误分类（P2-16）：这些错误只涉及单条连接，监听仍可用，
+/// 重试下一次 accept 即可（Windows 上对端握手前 RST 会以 ConnectionAborted/
+/// ConnectionReset 暴露，不能据此判定整个共享结束）。
+fn accept_error_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
 /// axum::serve 的替代：手动 serve 每条连接并设置 hyper `header_read_timeout`——
 /// 慢速只发半个请求头的连接 15 秒后被掐断，32 个并发闸不再能被永久占满。
 /// main 与 GUI 共享同一入口（行为一致）。
@@ -1235,7 +1288,19 @@ pub async fn serve_with_header_timeout(
     use hyper_util::rt::{TokioIo, TokioTimer};
     use tower::util::ServiceExt as _;
     loop {
-        let (socket, remote_addr) = listener.accept().await?;
+        let (socket, remote_addr) = match listener.accept().await {
+            Ok(v) => v,
+            // P2-16：瞬态错误（对端握手前 RST/中止、系统调用被中断、非阻塞
+            // 空转）只影响这一条连接——继续接下一个，不整体退出。
+            Err(e) if accept_error_is_transient(&e) => continue,
+            Err(e) => {
+                // 其余错误（fd 耗尽等）退避后重试：accept 可幂等重试，整体退出
+                // 会让 GUI 槽位仍显示运行中而共享实际已停（UI 状态失真）。
+                eprintln!("[web] accept 错误（100ms 后重试）: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let app = router.clone();
         tokio::spawn(async move {
             let service = hyper_util::service::TowerToHyperService::new(tower::service_fn(
@@ -1278,11 +1343,14 @@ mod tests {
         assert_eq!(sem.available_permits(), 1, "body 销毁后名额必须归还");
     }
 
-    /// 轮 8 P3-2 判别：上传半成品判定与自产名严格同形——宽松匹配
+    /// 轮 8 P3-2 / 轮 9 P3-17 判别：上传半成品判定与自产名严格同形——宽松匹配
     /// （contains(".up")）会误删形如 my.uploader.part 的用户文件。
     #[test]
     fn upload_part_name_matches_produced_shape_only() {
-        // 自产名全命中。
+        // 当前自产短名（P3-17：与原名无关）。
+        assert!(is_upload_part_name(".up1a2b3c4d.part"));
+        assert!(is_upload_part_name(".up00000000.part"));
+        // 旧版长名仍命中（升级前崩溃残件要能被 7 天清扫回收）。
         assert!(is_upload_part_name("a.up1a2b3c4d.txt.part"));
         assert!(is_upload_part_name("报表.updeadbeef.pdf.part"));
         assert!(is_upload_part_name("noext.up00000000.part"));
@@ -1300,6 +1368,18 @@ mod tests {
         );
     }
 
+    /// 轮 9 P3-17 判别：半成品名必须与原名无关且固定足够短——旧形在原名上
+    /// 再加 16 字节，250 字节的文件名在 Windows 单段上限 255 下必然上传 500。
+    #[test]
+    fn upload_part_name_is_short_and_independent_of_original() {
+        for _ in 0..8 {
+            let n = upload_part_name();
+            assert_eq!(n.len(), 16, "半成品名固定 16 字节: {n}");
+            assert!(n.starts_with(".up") && n.ends_with(".part"), "{n}");
+            assert!(is_upload_part_name(&n), "自产名必须被孤儿清扫识别: {n}");
+        }
+    }
+
     /// 轮 UI-5 P1 判别：磁盘文件名可含多字节字符，".up" 后第 8 字节可能落在
     /// 字符中间——旧实现 `after[..8]` 直接 panic（"byte index 8 is not a char
     /// boundary"），而本函数在服务启动/开共享时对目录内每个文件调用。
@@ -1308,6 +1388,8 @@ mod tests {
         assert!(!is_upload_part_name("a.up1234567é.txt.part"));
         assert!(!is_upload_part_name("x.up备份文件.part"));
         assert!(!is_upload_part_name("报表.up文件名很长很长.part"));
+        // 短名 hex 段后直接跟多字节字符同样不得越界。
+        assert!(!is_upload_part_name(".up1234567é.part"));
         // 多字节 stem/ext 不影响自产形的判定。
         assert!(is_upload_part_name("报表.up1a2b3c4d.数据.part"));
         assert!(is_upload_part_name("noext.up00000000.part"));
@@ -1326,5 +1408,32 @@ mod tests {
         assert_eq!(cookie_of(&h, SID_COOKIE).as_deref(), Some("abc123"));
         assert_eq!(cookie_of(&h, CSRF_COOKIE).as_deref(), Some("zzz"));
         assert_eq!(cookie_of(&h, "missing"), None);
+    }
+
+    /// 轮 9 P2-16 判别：瞬态 accept 错误必须归「继续」类——旧实现
+    /// `accept().await?` 让一次 Windows RST/EMFILE 就整体退出共享。
+    #[test]
+    fn transient_accept_errors_are_retriable() {
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(
+                accept_error_is_transient(&std::io::Error::from(kind)),
+                "{kind:?} 属瞬态"
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::AddrInUse,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                !accept_error_is_transient(&std::io::Error::from(kind)),
+                "{kind:?} 不得当瞬态"
+            );
+        }
     }
 }

@@ -747,3 +747,122 @@ async fn half_open_header_is_cut_after_timeout() {
     );
     srv.abort();
 }
+
+// ============ 轮 9：P2-13 登录体超时 / P3-17 长文件名 ============
+
+/// 轮 9 P2-13 判别：/login 的 body 改由带超时的自定义提取器读取，
+/// 路由上的 8KB DefaultBodyLimit 必须仍然生效（超限 413，不得退化成 400/500）。
+#[tokio::test]
+async fn login_body_still_capped_at_8kb() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = trft_server::build_router(state_with_auth(dir.path().to_path_buf(), "123456"));
+    let res = send(
+        app,
+        req_with(
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            vec![b'a'; 9000],
+        ),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "登录体超 8KB 仍须 413"
+    );
+}
+
+/// 轮 9 P2-13 判别：/login 豁免并发闸，慢滴 body 必须被请求体上限掐断并回 408——
+/// 修复前 handler 直接用 `String` 提取器，body 不读满永不返回，未认证连接可
+/// 无限占用连接/fd。用注入的小上限在真实 TCP 上判别。
+#[tokio::test]
+async fn login_slow_body_times_out_with_408() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::try_unwrap(state_with_auth(dir.path().to_path_buf(), "123456"))
+        .ok()
+        .unwrap();
+    let mut st = st;
+    st.login_body_timeout = std::time::Duration::from_millis(100);
+    let app = trft_server::build_router(Arc::new(st));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(trft_server::serve_with_header_timeout(listener, app));
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // 声明 100 字节但只发 8 字节：body 读取挂起，100ms 上限必须触发 408。
+    sock.write_all(
+        b"POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n\r\ncode=123",
+    )
+    .await
+    .unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut buf = [0u8; 512];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("body 空闲超时必须回响应（修复前永不返回）");
+    let head = String::from_utf8_lossy(&raw);
+    assert!(
+        head.starts_with("HTTP/1.1 408"),
+        "慢滴登录体必须回 408，实际: {head}"
+    );
+    srv.abort();
+}
+
+/// 轮 9 P3-17 判别：250 字节文件名（合法，低于 Windows 单段名 255 上限）在旧
+/// 实现下半成品名再拼 stem/ext（+16 字节）超 255 → create_new 失败 500；短名
+/// `.up{8hex}.part` 与原名无关，必须 303 且发布内容完整、无半成品残留。
+#[tokio::test]
+async fn upload_long_filename_uses_short_part_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = trft_server::build_router(state_open(dir.path().to_path_buf()));
+    let boundary = "XyZZy";
+    let name = format!("{}.txt", "a".repeat(246)); // 250 字节
+    assert_eq!(name.len(), 250);
+    let body = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\nlong-name\r\n--{boundary}--\r\n"
+    );
+    let res = send(
+        app,
+        req_with(
+            "POST",
+            "/up/",
+            &[(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )],
+            body.into_bytes(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::SEE_OTHER,
+        "250 字节文件名必须可上传（旧半成品名 +16 字节超 255）"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(&name)).unwrap(),
+        b"long-name",
+        "发布内容必须完整"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".up"))
+        .collect();
+    assert!(leftovers.is_empty(), "半成品不得残留: {leftovers:?}");
+}

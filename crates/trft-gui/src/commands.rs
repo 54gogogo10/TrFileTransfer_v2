@@ -31,6 +31,29 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// 队列子任务 id（P3-14）：`send_cancel` 只为队列子任务记「用户取消」——
+/// 直发任务没有 `run_single_send` 消费该记账，统一插入会永久残留。
+static QUEUE_CHILDREN: std::sync::LazyLock<std::sync::Mutex<HashSet<u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// 队列子任务标记守卫（P3-14）：`run_single_send` 正常收尾或父队列任务被
+/// abort 时都经 Drop 回收标记与可能的取消记账（兜底无界泄漏）。
+struct QueueChildGuard {
+    app: tauri::AppHandle,
+    id: u64,
+}
+
+impl Drop for QueueChildGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = QUEUE_CHILDREN.lock() {
+            g.remove(&self.id);
+        }
+        if let Ok(mut g) = self.app.state::<AppState>().user_cancelled.lock() {
+            g.remove(&self.id);
+        }
+    }
+}
+
 /// spawn_hidden 的收尾动作留痕（UI-1 P3-7）：失败写 warn 日志。
 fn log_spawn(app: &tauri::AppHandle, r: std::io::Result<()>, what: &str) {
     if let Err(e) = r {
@@ -110,17 +133,25 @@ fn validate_code(code: &Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// 64 位十六进制 → 32 字节（P2-14：先做长度与字符检查再切片——短值/非 ASCII
+/// 值不得 panic；`token_secret` 被手工改短时曾在持配置锁期间越界崩溃）。
+fn parse_hex32(h: &str) -> Option<[u8; 32]> {
+    if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 fn parse_pin(pin: &Option<String>) -> Result<Option<[u8; 32]>, String> {
     match pin {
         None => Ok(None),
-        Some(h) if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => {
-            let mut out = [0u8; 32];
-            for i in 0..32 {
-                out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).map_err(err)?;
-            }
-            Ok(Some(out))
-        }
-        Some(_) => Err("QUIC 指纹需要 64 位十六进制".into()),
+        Some(h) => parse_hex32(h)
+            .map(Some)
+            .ok_or_else(|| "QUIC 指纹需要 64 位十六进制".into()),
     }
 }
 
@@ -419,7 +450,7 @@ async fn settle_send(
 pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, String> {
     // 命令入口不消费结果（前端靠 trft://task 事件）：接收端立即丢弃，
     // settle_send 的 send 静默失败即可。
-    let (id, _done) = spawn_send(app, req).await?;
+    let (id, _done) = spawn_send(app, req, false).await?;
     Ok(id)
 }
 
@@ -428,6 +459,7 @@ pub async fn send_start(app: tauri::AppHandle, req: SendRequest) -> Result<u64, 
 async fn spawn_send(
     app: tauri::AppHandle,
     req: SendRequest,
+    from_queue: bool,
 ) -> Result<(u64, tokio::sync::oneshot::Receiver<Result<(), String>>), String> {
     let name = req.display_name();
     let (ptx, prx) = mpsc::unbounded_channel();
@@ -460,6 +492,11 @@ async fn spawn_send(
         let st = app.state::<AppState>();
         st.alloc_task_id()
     };
+    // P3-14：队列子任务在发出 task-start 事件前打标——`send_cancel` 据此决定
+    // 是否记「用户取消」（直发任务无人消费该记账）；标记由 QueueChildGuard 回收。
+    if from_queue {
+        QUEUE_CHILDREN.lock().expect("队列标记锁").insert(id);
+    }
     let app2 = app.clone();
     let name2 = name.clone();
     let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -609,7 +646,11 @@ pub fn send_cancel(app: tauri::AppHandle, id: u64, paused: Option<bool>) {
     if let Some(t) = t {
         // 轮 UI-4 F5：先记账后 abort——另一 worker 在 insert 前消费到 done 断流
         // 会把已取消任务误判失败并重试复活（窗口极窄，对调即闭合）。
-        {
+        // P3-14：只有队列子任务有人消费该记账（`run_single_send` 凭它把 abort
+        // 判成用户终止，避免失败重试复活已取消传输）；直发任务的 done 通道由
+        // 命令入口直接丢弃，插入必永久残留。标记在 `spawn_send` 内、task-start
+        // 发出前写入，不存在「用户先点取消、标记尚未落」的窗口。
+        if QUEUE_CHILDREN.lock().expect("队列标记锁").contains(&id) {
             let st = app.state::<AppState>();
             st.user_cancelled.lock().expect("取消记账锁").insert(id);
         }
@@ -758,9 +799,14 @@ enum QueueItemResult {
 }
 
 async fn run_single_send(app: tauri::AppHandle, req: SendRequest) -> QueueItemResult {
-    let (id, done) = match spawn_send(app.clone(), req).await {
+    let (id, done) = match spawn_send(app.clone(), req, true).await {
         Ok(v) => v,
         Err(e) => return QueueItemResult::ParamErr(e),
+    };
+    // P3-14：守卫覆盖正常收尾与父队列任务被 abort 两条路径。
+    let _guard = QueueChildGuard {
+        app: app.clone(),
+        id,
     };
     match tokio::time::timeout(QUEUE_ITEM_TIMEOUT, done).await {
         Ok(Ok(res)) => QueueItemResult::Outcome(res),
@@ -931,6 +977,16 @@ fn next_free_port(proto: Proto, ip: std::net::IpAddr, port: u16) -> Option<u16> 
     None
 }
 
+/// 保存目录准备（P2-15）：创建失败或路径不是目录都返回明确错误——
+/// 接收器/共享若忽略该失败，会对外报「已启动」而所有落盘都失败。
+fn prepare_save_dir(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("无法创建 {}: {e}", dir.display()))?;
+    if !dir.is_dir() {
+        return Err(format!("{} 不是文件夹", dir.display()));
+    }
+    Ok(())
+}
+
 /// serve 任务收尾（轮 3 F5）：退出（异常/endpoint 关闭）时自摘注册表条目——
 /// 否则死句柄残留：显示运行中、无法重新启动、防睡眠计数恒 >0，无自愈。
 /// `exited`：本代已退出任务计数——最后一个退出的任务负责摘除
@@ -969,6 +1025,47 @@ fn receiver_task_exit(
         // 轮 7 F7：前端复位接收卡/标签圆点（异步退出此前只发日志）。
         let _ = app.emit("trft://sync-state", ());
     }
+}
+
+/// 内层任务随监督外壳一起撤销（P2-20）：recv_stop/替换只会 abort 外壳句柄，
+/// 若外壳被杀而内层 JoinHandle 被 detach，监听器会变成无法停止的孤儿。
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 接收器任务监督（P2-20 GUI 半边）：裸 `spawn` 的 panic 被静默吞进 JoinHandle，
+/// `receiver_task_exit` 不执行 → 注册表残留「假运行」且无自愈。外壳任务 await
+/// 内层 serve 句柄：panic 时 emit「接收器异常退出」并照常走收尾；正常路径把
+/// serve 结果原样交给 `receiver_task_exit`。
+fn spawn_receiver<F>(
+    app: tauri::AppHandle,
+    proto: Proto,
+    gen: Arc<()>,
+    exited: Arc<std::sync::atomic::AtomicUsize>,
+    serve: F,
+) -> tauri::async_runtime::JoinHandle<()>
+where
+    F: std::future::Future<Output = Result<(), trft_core::error::Error>> + Send + 'static,
+{
+    let inner = tauri::async_runtime::spawn(serve);
+    let abort = AbortOnDrop(inner.inner().abort_handle());
+    tauri::async_runtime::spawn(async move {
+        let _abort = abort;
+        let r = match inner.await {
+            Ok(r) => r,
+            Err(e) => {
+                // 内层被 abort 只发生在本外壳 Drop 时（外壳已不再被 poll），
+                // 因此这里只能是 panic：显式留痕后走与正常退出相同的状态清理。
+                emit_log(&app, "err", &format!("{} 接收器异常退出: {e}", proto.label()));
+                Ok(())
+            }
+        };
+        receiver_task_exit(app, proto, gen, exited, r);
+    })
 }
 
 #[tauri::command]
@@ -1012,7 +1109,16 @@ pub async fn recv_start(
             Proto::Udp => cfg.save_dir_udp.clone(),
         },
     };
-    let _ = std::fs::create_dir_all(&dir);
+    // P2-15：目录建不出来/不是目录时不得报「启动成功」并把坏路径写回配置——
+    // 否则来传文件全部在落盘阶段失败。失败回滚占位（仅当仍是本代）。
+    if let Err(e) = prepare_save_dir(&dir) {
+        let st = app.state::<AppState>();
+        let mut g = st.receivers.lock().expect("接收器锁");
+        if g.get(&proto).is_some_and(|r| Arc::ptr_eq(&r.gen, &gen)) {
+            g.remove(&proto);
+        }
+        return Err(format!("{} 保存目录不可用: {e}", proto.label()));
+    }
     let bind_list = match parse_bind_addrs(addrs) {
         Ok(l) => l,
         Err(e) => {
@@ -1128,13 +1234,13 @@ pub async fn recv_start(
             Proto::Tcp => match trft_core::transfer::bind_tcp(addr).await {
                 Ok(listener) => {
                     let o = shared.as_ref().expect("TCP 选项已建").clone();
-                    let a2 = app2.clone();
-                    let g2 = gen.clone();
-                    let ex = exited.clone();
-                    handles.push(tauri::async_runtime::spawn(async move {
-                        let r = serve_on(listener, o).await;
-                        receiver_task_exit(a2, Proto::Tcp, g2, ex, r);
-                    }));
+                    handles.push(spawn_receiver(
+                        app2.clone(),
+                        Proto::Tcp,
+                        gen.clone(),
+                        exited.clone(),
+                        serve_on(listener, o),
+                    ));
                     bound.push(addr.to_string());
                 }
                 Err(e) => failed.push((addr, e.to_string())),
@@ -1142,14 +1248,13 @@ pub async fn recv_start(
             Proto::Quic => match trft_core::transfer::quic::server_endpoint(addr, Some(&dir)).await {
                 Ok((endpoint, cert_fp)) => {
                     let o = shared.as_ref().expect("QUIC 选项已建").clone();
-                    let a2 = app2.clone();
-                    let g2 = gen.clone();
-                    let ex = exited.clone();
-                    handles.push(tauri::async_runtime::spawn(async move {
-                        let r =
-                            trft_core::transfer::quic::serve_quic_on(endpoint, cert_fp, o).await;
-                        receiver_task_exit(a2, Proto::Quic, g2, ex, r);
-                    }));
+                    handles.push(spawn_receiver(
+                        app2.clone(),
+                        Proto::Quic,
+                        gen.clone(),
+                        exited.clone(),
+                        trft_core::transfer::quic::serve_quic_on(endpoint, cert_fp, o),
+                    ));
                     bound.push(addr.to_string());
                 }
                 Err(e) => failed.push((addr, e.to_string())),
@@ -1158,13 +1263,13 @@ pub async fn recv_start(
             Proto::Rudp => match bind_udp(addr).await {
                 Ok(socket) => {
                     let o = shared.as_ref().expect("RUDP 选项已建").clone();
-                    let a2 = app2.clone();
-                    let g2 = gen.clone();
-                    let ex = exited.clone();
-                    handles.push(tauri::async_runtime::spawn(async move {
-                        let r = trft_core::transfer::rudp::serve_rudp_on(socket, o).await;
-                        receiver_task_exit(a2, Proto::Rudp, g2, ex, r);
-                    }));
+                    handles.push(spawn_receiver(
+                        app2.clone(),
+                        Proto::Rudp,
+                        gen.clone(),
+                        exited.clone(),
+                        trft_core::transfer::rudp::serve_rudp_on(socket, o),
+                    ));
                     bound.push(addr.to_string());
                 }
                 Err(e) => failed.push((addr, e.to_string())),
@@ -1173,13 +1278,13 @@ pub async fn recv_start(
             Proto::Udt => match bind_udp(addr).await {
                 Ok(socket) => {
                     let o = shared.as_ref().expect("UDT 选项已建").clone();
-                    let a2 = app2.clone();
-                    let g2 = gen.clone();
-                    let ex = exited.clone();
-                    handles.push(tauri::async_runtime::spawn(async move {
-                        let r = trft_core::transfer::udt::serve_udt_on(socket, o).await;
-                        receiver_task_exit(a2, Proto::Udt, g2, ex, r);
-                    }));
+                    handles.push(spawn_receiver(
+                        app2.clone(),
+                        Proto::Udt,
+                        gen.clone(),
+                        exited.clone(),
+                        trft_core::transfer::udt::serve_udt_on(socket, o),
+                    ));
                     bound.push(addr.to_string());
                 }
                 Err(e) => failed.push((addr, e.to_string())),
@@ -1197,13 +1302,13 @@ pub async fn recv_start(
                         auto_archive: cfg.auto_archive,
                         stats: Some(st.stats.clone()),
                     };
-                    let a2 = app2.clone();
-                    let g2 = gen.clone();
-                    let ex = exited.clone();
-                    handles.push(tauri::async_runtime::spawn(async move {
-                        let r = serve_udp_on(socket, o, None).await;
-                        receiver_task_exit(a2, Proto::Udp, g2, ex, r);
-                    }));
+                    handles.push(spawn_receiver(
+                        app2.clone(),
+                        Proto::Udp,
+                        gen.clone(),
+                        exited.clone(),
+                        serve_udp_on(socket, o, None),
+                    ));
                     bound.push(addr.to_string());
                 }
                 Err(e) => failed.push((addr, e.to_string())),
@@ -1407,26 +1512,46 @@ pub async fn http_start(
             return Err("共享已在运行".into());
         }
     }
-    let _ = std::fs::create_dir_all(&dir);
+    // P2-15：目录不可用 → 收回占位并报错（不得带着坏目录对外报「已启动」）。
+    if let Err(e) = prepare_save_dir(&dir) {
+        let st = app.state::<AppState>();
+        let mut g = st.http.lock().expect("http 锁");
+        if g.as_ref().is_some_and(|h| Arc::ptr_eq(&h.gen, &gen)) {
+            g.take();
+        }
+        return Err(format!("共享目录不可用: {e}"));
+    }
     // 上传半成品孤儿清扫（轮 5 P2-2：Drop 守卫不覆盖进程被杀——7 天口径与
     // core 半成品清扫一致，`http_start` 是共享目录的天然启动钩子）。
     trft_server::cleanup_upload_orphans(&dir);
     // `?t=` 令牌派生密钥（轮 6 P2-4）：每安装随机 32B，持久化 config——
     // 泄漏只作废令牌（换密钥），不回传低熵配对码。守卫不跨 await。
+    // P2-14：解析移出配置锁——手工改短/篡改的 token_secret 此前在持锁期间
+    // 定长切片越界 panic，锁中毒后所有命令连锁 panic；现边界检查解析，非法即重生成。
     let secret = {
-        let st = app.state::<AppState>();
-        let mut st_cfg = st.cfg.lock().expect("配置锁");
-        if st_cfg.token_secret.is_none() {
-            st_cfg.token_secret = Some(trft_core::config::new_token_secret());
-            let _ = st_cfg.save(&app.state::<AppState>().cfg_path);
-        }
-        let mut secret = [0u8; 32];
-        if let Some(h) = &st_cfg.token_secret {
-            for i in 0..32 {
-                secret[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0);
+        let stored = {
+            let st = app.state::<AppState>();
+            let g = st.cfg.lock().expect("配置锁");
+            g.token_secret.clone()
+        };
+        match stored.as_deref().and_then(parse_hex32) {
+            Some(s) => s,
+            None => {
+                let fresh = trft_core::config::new_token_secret();
+                let secret = parse_hex32(&fresh).expect("new_token_secret 恒为 64 hex");
+                let cfg_path = app.state::<AppState>().cfg_path.clone();
+                let save_err = {
+                    let st = app.state::<AppState>();
+                    let mut st_cfg = st.cfg.lock().expect("配置锁");
+                    st_cfg.token_secret = Some(fresh);
+                    st_cfg.save(&cfg_path).err()
+                };
+                if let Some(e) = save_err {
+                    emit_log(&app, "warn", &format!("令牌密钥保存失败（本次仍生效）: {e}"));
+                }
+                secret
             }
         }
-        secret
     };
     let token = cfg
         .pairing_code
@@ -2579,5 +2704,32 @@ mod tests {
             "旧代收尾不得覆盖新代"
         );
         assert_eq!(slot.as_ref().unwrap().port, 3);
+    }
+
+    /// P2-14 判别：短值/非 hex/非 ASCII 的 secret 不得 panic（旧实现定长切片越界）。
+    #[test]
+    fn parse_hex32_rejects_malformed_secret_without_panic() {
+        assert!(parse_hex32("").is_none());
+        assert!(parse_hex32("ab").is_none());
+        assert!(parse_hex32(&"a".repeat(63)).is_none());
+        assert!(parse_hex32(&"a".repeat(65)).is_none());
+        assert!(parse_hex32(&"g".repeat(64)).is_none());
+        // 64 字节但非 ASCII（32 个两字节字符）：按字节切片会劈开 UTF-8 边界。
+        assert!(parse_hex32(&"é".repeat(32)).is_none());
+        let bytes = parse_hex32(&"ab".repeat(32)).expect("合法 64 hex");
+        assert_eq!(bytes, [0xab; 32]);
+    }
+
+    /// P2-15 判别：路径已是普通文件时必须报错（旧实现忽略 create_dir_all 失败，
+    /// 仍报启动成功并把坏路径写回配置）；目录不存在时自动创建（既有语义）。
+    #[test]
+    fn prepare_save_dir_rejects_non_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(prepare_save_dir(&file).is_err());
+        let nested = tmp.path().join("a").join("b");
+        assert!(prepare_save_dir(&nested).is_ok());
+        assert!(nested.is_dir());
     }
 }

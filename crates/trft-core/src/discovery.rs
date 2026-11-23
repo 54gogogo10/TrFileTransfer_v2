@@ -11,9 +11,10 @@
 //! 守卫：name ≤ 64 字节、包总长 ≤ 512 字节（超出整包忽略——fail-closed）。
 //! 应答方仅在有监听器时启动（GUI 决定生命周期）；标志位**实时**读取。
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::net::UdpSocket;
@@ -24,6 +25,13 @@ pub const FRAME_RESP: u8 = 0xD2;
 pub const MAX_NAME: usize = 64;
 /// 单包上限（守卫，超出忽略）。
 pub const MAX_PACKET: usize = 512;
+/// 单源探测应答速率上限（每秒）——轮 9 P3-3：1 字节探测换 ≥5 字节应答，
+/// 可被伪造源反射放大；同源每秒最多应答 5 次，超限静默丢弃。
+pub const PROBE_RATE_PER_SOURCE: u32 = 5;
+/// 全局探测应答速率上限（每秒，所有来源合计）——伪造源洪泛时兜底。
+pub const PROBE_RATE_GLOBAL: u32 = 200;
+/// 每源限速表容量（伪造源地址洪泛时防无界内存；超限先清过期项，仍满则整体清空）。
+const RATE_TABLE_CAP: usize = 1024;
 
 pub const FLAG_TCP: u8 = 1;
 /// bit1：QUIC 槽位监听中（旧版本将此位显示为「UDT」——其 UDT 即本仓库的 QUIC 槽位）。
@@ -282,16 +290,62 @@ fn decode_cs_response(buf: &[u8]) -> Option<DiscoveryMsg> {
 pub type DiscoveryFlagsFn =
     Arc<dyn Fn() -> (Option<u16>, Option<u16>, Option<u16>, Option<u16>, bool) + Send + Sync>;
 
+/// 探测应答令牌桶：每源 + 全局各一（轮 9 P3-3）。
+/// 窗口为 1 秒（固定窗口，简单且有界）；令牌未被消耗的探测包直接静默丢弃。
+#[derive(Default)]
+struct RateLimiter {
+    global_window: Option<Instant>,
+    global_used: u32,
+    per_source: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl RateLimiter {
+    fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
+        let window = Duration::from_secs(1);
+        if self
+            .global_window
+            .is_none_or(|start| now.duration_since(start) >= window)
+        {
+            self.global_window = Some(now);
+            self.global_used = 0;
+        }
+        if self.global_used >= PROBE_RATE_GLOBAL {
+            return false;
+        }
+        // 伪造源地址洪泛：每源表先清过期窗口，仍满则整体清空（最坏放行一轮，
+        // 全局桶仍兜底）——不因限速表本身变成内存放大面。
+        if self.per_source.len() >= RATE_TABLE_CAP && !self.per_source.contains_key(&source) {
+            self.per_source
+                .retain(|_, (_, start)| now.duration_since(*start) < window);
+            if self.per_source.len() >= RATE_TABLE_CAP {
+                self.per_source.clear();
+            }
+        }
+        let entry = self.per_source.entry(source).or_insert((0, now));
+        if now.duration_since(entry.1) >= window {
+            *entry = (0, now);
+        }
+        if entry.0 >= PROBE_RATE_PER_SOURCE {
+            return false;
+        }
+        entry.0 += 1;
+        self.global_used += 1;
+        true
+    }
+}
+
 /// 应答服务：收到 0xD1 → 按实时 flags 回 0xD2（单播）。
 /// 双协议兼容（TECH-STACK §7.30）：
 /// - 裸 `[0xD1]` 单字节探测 = C# 版请求 → 回 **C# 旧格式**应答（只报 UDT 端口）；
 /// - 带 name 的 v2 探测 → 回 v2 格式（含全部槽位端口）。
+/// 每个有效探测先过令牌桶（每源 5 次/秒 + 全局 200 次/秒），超限静默丢弃。
 pub async fn serve_answer(
     socket: UdpSocket,
     name: String,
     flags: DiscoveryFlagsFn,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_PACKET];
+    let mut limiter = RateLimiter::default();
     loop {
         let (n, peer) = socket.recv_from(&mut buf).await?;
         if n > MAX_PACKET {
@@ -299,6 +353,9 @@ pub async fn serve_answer(
         }
         if n == 1 && buf[0] == FRAME_REQ {
             // C# 探测（裸 0xD1）→ C# 格式应答。
+            if !limiter.allow(peer.ip(), Instant::now()) {
+                continue;
+            }
             let (tcp, _quic, _rudp, udt, pairing) = flags();
             if let Some(udt_port) = udt {
                 if let Some(resp) = encode_cs_response(&name, udt_port, pairing) {
@@ -309,6 +366,9 @@ pub async fn serve_answer(
             continue;
         }
         if matches!(decode(&buf[..n]), Some(DiscoveryMsg::Request { .. })) {
+            if !limiter.allow(peer.ip(), Instant::now()) {
+                continue;
+            }
             let (tcp, quic, rudp, udt, pairing) = flags();
             if let Some(resp) = encode_response_ext(&name, tcp, quic, rudp, udt, pairing) {
                 let _ = socket.send_to(&resp, peer).await;
@@ -487,6 +547,54 @@ mod tests {
             decode(&v2),
             Some(DiscoveryMsg::Response { tcp_port: Some(8080), .. })
         ));
+    }
+
+    /// 轮 9 P3-3 判别：每源令牌桶（每秒 5 次）+ 全局上限；超限静默丢弃，
+    /// 跨窗口/换源恢复——1 字节探测不得成为反射放大入口。
+    #[test]
+    fn probe_rate_limiter_limits_per_source_and_globally() {
+        let mut limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        for i in 0..PROBE_RATE_PER_SOURCE {
+            assert!(limiter.allow(a, t0), "第 {} 次同源探测应放行", i + 1);
+        }
+        assert!(!limiter.allow(a, t0), "同源每秒第 6 次必须静默丢弃");
+        // 其他来源不受同一来源的桶影响。
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(limiter.allow(b, t0), "不同来源独立计数");
+        // 窗口滚动后恢复。
+        assert!(
+            limiter.allow(a, t0 + Duration::from_secs(1)),
+            "每秒窗口滚动后应恢复"
+        );
+
+        // 全局上限：伪造大量来源时合计仍封顶。
+        let mut limiter = RateLimiter::default();
+        let mut allowed = 0;
+        for i in 0..300u32 {
+            let ip: IpAddr = format!("10.1.{}.{}", i / 250, i % 250).parse().unwrap();
+            if limiter.allow(ip, t0) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, PROBE_RATE_GLOBAL, "全局限速必须封顶");
+    }
+
+    /// 轮 9 P3-3：伪造源洪泛不得让限速表无界增长（超容量清理后仍可用）。
+    #[test]
+    fn probe_rate_limiter_table_is_bounded() {
+        let mut limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        for i in 0..(RATE_TABLE_CAP as u32 + 50) {
+            let ip: IpAddr = format!("10.2.{}.{}", i / 250, i % 250).parse().unwrap();
+            limiter.allow(ip, t0);
+        }
+        assert!(
+            limiter.per_source.len() <= RATE_TABLE_CAP,
+            "限速表必须有界（实际 {}）",
+            limiter.per_source.len()
+        );
     }
 
     /// 裸 0xD1（C# 探测）→ C# 格式应答（大端端口 + bit1=UDT）；v2 探测 → v2 格式应答。

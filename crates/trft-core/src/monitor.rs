@@ -382,7 +382,10 @@ pub fn copy_complete(path: &Path, window: Duration) -> bool {
     }
     #[cfg(not(windows))]
     {
-        if std::fs::OpenOptions::new().append(true).open(path).is_err() {
+        // 轮 9 P3-4：只读打开即可探测「文件存在且可读」——旧实现用 append 写打开，
+        // 只读文件永远打不开 → 监控永不发送（Windows 的 share_mode(0) 不受影响）。
+        // Unix 无强制共享锁，就绪判定由后面的稳定窗（大小/mtime 双采样）承担。
+        if std::fs::OpenOptions::new().read(true).open(path).is_err() {
             return false;
         }
     }
@@ -535,6 +538,22 @@ mod tests {
         assert!(
             copy_complete(&p, Duration::from_millis(50)),
             "稳定文件必须判就绪"
+        );
+    }
+
+    /// 轮 9 P3-4 判别（非 Windows）：只读文件也必须判就绪——旧实现用
+    /// append 写打开探测，只读文件恒失败 → 监控永不发送。
+    #[cfg(unix)]
+    #[test]
+    fn copy_complete_accepts_readonly_file_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ro.bin");
+        std::fs::write(&p, b"read only").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            copy_complete(&p, Duration::from_millis(20)),
+            "只读文件不得被 append 打开失败挡住"
         );
     }
 

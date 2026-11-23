@@ -386,8 +386,15 @@ async fn handle_incoming(
         .map_err(io_err)?;
     let mut qs = QuicStream { send, recv };
     // quinn 的流是懒打开：客户端必须先写一个版本字节，accept_bi 才能看到流。
-    // 顺带充当协议版本校验（fail-closed）。
-    let v = crate::protocol::io::read_u8(&mut qs).await?;
+    // 顺带充当协议版本校验（fail-closed）。读版本字节同样套 30s 超时（轮 9
+    // P2-9）：建流后可以只靠 keepalive 保活、一直不写字节——没有这个上限，
+    // 64 条零数据连接即可长期占死全部并发许可（accept_bi 的超时只覆盖建流）。
+    let v = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::protocol::io::read_u8(&mut qs),
+    )
+    .await
+    .map_err(|_| proto("QUIC 首帧读取超时（30s）"))??;
     if v != crate::protocol::PROTO_VERSION {
         let _ = v;
         return Err(proto("对端协议版本不兼容"));

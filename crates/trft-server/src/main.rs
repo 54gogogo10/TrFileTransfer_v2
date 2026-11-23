@@ -47,12 +47,21 @@ async fn main() {
         .map(|pairing_code| AuthConfig { pairing_code });
     let state = Arc::new(WebState::new(args.dir.clone(), auth));
     let app = trft_server::build_router(state);
-    let addr = format!("{}:{}", args.bind, args.port)
-        .parse::<std::net::SocketAddr>()
-        .expect("绑定地址非法");
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("端口绑定失败");
+    // 用法错误（P3-15）：非法 --bind 属参数错误，按约定 exit 2；不再 panic 抛栈。
+    let addr = match parse_bind(&args.bind, args.port) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("错误: {e}");
+            std::process::exit(2);
+        }
+    };
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("错误: 端口绑定失败 {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
     let auth_note = if args.code.is_some() {
         "鉴权=配对码"
     } else {
@@ -65,7 +74,27 @@ async fn main() {
     // 上传半成品孤儿清扫（轮 5 P2-2：Drop 守卫不覆盖进程被杀，7 天口径与 core 一致）。
     trft_server::cleanup_upload_orphans(&args.dir);
     // 头读超时 15s（规格 §6.1；轮 2 P1——slowloris 不得占满并发闸）。
-    trft_server::serve_with_header_timeout(listener, app)
-        .await
-        .expect("服务器异常退出");
+    // 运行期异常是错误路径（退出码 1），不得 panic 抛栈（P3-15）。
+    if let Err(e) = trft_server::serve_with_header_timeout(listener, app).await {
+        eprintln!("错误: 服务器异常退出: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// 绑定地址解析（P3-15：`--bind` 非法属用法错误，由调用方按退出码 2 处理）。
+fn parse_bind(bind: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    format!("{bind}:{port}")
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("--bind 非法（{bind}:{port}）: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_bind_is_reported_as_error() {
+        assert!(parse_bind("not-an-ip", 8090).is_err());
+        assert!(parse_bind("127.0.0.1", 8090).is_ok());
+    }
 }

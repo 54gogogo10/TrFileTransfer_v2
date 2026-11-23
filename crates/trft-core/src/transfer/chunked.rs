@@ -9,7 +9,8 @@
 //!   组装失败必须移除会话，让 0x0C 回 0x00 强制客户端整组重来（杜绝假成功）。
 //! - 会话表全局 64 组、**单来源 8 组**：超配额只逐出本来源最旧（组装中的组不删），
 //!   全局满则拒绝新组（fail-closed）——绝不跨 peer 逐出；10 分钟无块逐出并删除
-//!   半成品；孤儿 `.trft-part` 另受 7 天清扫兜底。
+//!   半成品（组装中的组同样不按 TTL 删，见 `ensure`）；孤儿 `.trft-part` 另受
+//!   7 天清扫兜底。
 
 use crate::error::{config_err, proto, Error, Result};
 use crate::hash::sha256_file;
@@ -70,6 +71,9 @@ pub(crate) struct GroupSession {
     /// 「最旧」只能靠它裁决——否则逐出顺序取决于 HashMap 的随机迭代顺序
     /// （CI 上表现为「victim 永不逐出」的假红/真抖动）。
     seq: u64,
+    /// 0x0C 成功记账去重（P3-13）：同一组可由多条并行连接各发一次 0x0C，
+    /// 成功只能计一次——否则 `recv --count N` 被同组重复收尾提前打满。
+    counted: std::sync::atomic::AtomicBool,
     /// 组装结论唤醒（finish 成功/失败时唤醒 0x0C 等待者）。
     notify: std::sync::Arc<tokio::sync::Notify>,
     /// 进度上报（会话创建时注册；None = 不上报）。
@@ -175,13 +179,26 @@ impl ChunkTracker {
         // 逐出即放弃会话：必须对进度 Reporter 补发终态（轮 3 F1——否则发送端
         // 中途放弃的组被逐出后，接收侧进度卡永久 running；与 UDP 引擎惰性清扫
         // 同纪律）。
+        // P1-5：组装中的组不得按 TTL 删——慢盘上 sync_all + 整文件 SHA-256 可超
+        // SESSION_TTL，此时删 .part 会让整组已传数据丢失。与下方配额逐出同口径，
+        // try_lock 失败视同组装中；已组装完成（assembled）的组不在保护范围，空闲
+        // 到期后可正常回收（否则完成态永久占用全局表）。
         map.retain(|_, s| {
             let fresh = now.saturating_sub(s.last_seen_ms.load(Ordering::Relaxed))
                 < SESSION_TTL.as_millis() as u64;
-            if !fresh {
-                drop_group(s);
+            if fresh {
+                return true;
             }
-            fresh
+            let assembling = s
+                .state
+                .try_lock()
+                .map(|g| g.assembling && !g.assembled)
+                .unwrap_or(true);
+            if assembling {
+                return true;
+            }
+            drop_group(s);
+            false
         });
         if let Some(s) = map.get(&gid) {
             if s.name != name || s.total != total {
@@ -271,6 +288,7 @@ impl ChunkTracker {
                 assembled: false,
             }),
             last_seen_ms: AtomicU64::new(now),
+            counted: std::sync::atomic::AtomicBool::new(false),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             report: self.progress.as_ref().map(|h| {
                 let r = h.register("recv", name, total);
@@ -412,9 +430,13 @@ impl ChunkTracker {
     }
 
     /// 0x0B：合并区间（None = 会话不存在）。
+    /// P3-8：先 clone Arc 再释放会话表锁，避免持全局表锁 await 状态锁——
+    /// 慢盘写停顿（receive 持 state 锁做写盘）不得阻塞所有新组的 ensure。
     pub(crate) async fn ranges_of(&self, gid: [u8; 16]) -> Option<Vec<(u64, u64)>> {
-        let map = self.sessions.lock().await;
-        let s = map.get(&gid)?;
+        let s = {
+            let map = self.sessions.lock().await;
+            map.get(&gid).cloned()?
+        };
         let st = s.state.lock().await;
         Some(st.ranges.clone())
     }
@@ -452,6 +474,18 @@ impl ChunkTracker {
             }
             // 被唤醒：重查（会话可能已被失败路径移除 → 下一轮回 0x00）。
         }
+    }
+
+    /// 0x0C 成功记账去重（P3-13）：同一组（并行连接的重复 0x0C）只返回一次 true。
+    /// 会话被 TTL 逐出后同 gid 重建 = 新的一次传输，重新计数（去重状态随会话消亡，
+    /// 不会无界增长）。
+    pub(crate) async fn mark_counted(&self, gid: [u8; 16]) -> bool {
+        let s = {
+            let map = self.sessions.lock().await;
+            map.get(&gid).cloned()
+        };
+        s.map(|s| !s.counted.swap(true, Ordering::Relaxed))
+            .unwrap_or(false)
     }
 }
 
@@ -531,9 +565,9 @@ where
 }
 
 /// 0x0C 收尾：回判决字节（会话不存在 → 0x00 + 连接失败）。
-/// 返回判决值：调用方据此判定「是否算一次成功接收」——0x02 中途判决
-/// （INCOMPLETE）不是成功事件（见 receiver 里的计数注释）。
-pub(crate) async fn recv_chunk_end<S>(s: &mut S, opts: &RecvOptions) -> Result<u8>
+/// 返回 (判决值, 是否本次首次成功记账)：0x02 中途判决（INCOMPLETE）不是成功事件；
+/// 同一组重复/并行 0x0C 只在首次 0x01 时计一次成功（P3-13，见 receiver 里的计数注释）。
+pub(crate) async fn recv_chunk_end<S>(s: &mut S, opts: &RecvOptions) -> Result<(u8, bool)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -543,7 +577,8 @@ where
     if st == STATUS_REJECT {
         return Err(proto("分块传输已中断（会话已失效）"));
     }
-    Ok(st)
+    let first_ok = st == STATUS_OK && opts.chunk_sessions.mark_counted(gid).await;
+    Ok((st, first_ok))
 }
 
 /// 0x0B 覆盖率查询：直答合并区间（内存 tracker，规格 §3.1）。
@@ -1220,5 +1255,86 @@ mod tests {
             }
         }
         assert!(!done_flipped, "已完成的会话被逐出不得翻转为 failed");
+    }
+
+    /// P1-5 判别：组装中的组不得按 TTL 逐出——慢盘上 sync_all + 整文件 SHA-256
+    /// 可超 SESSION_TTL，此时删 .part 会让整组已传数据丢失。修复前 TTL 分支只按
+    /// last_seen 判新鲜，本用例（把 last_seen 拨到 TTL 之前再触发 ensure）必删组。
+    #[tokio::test]
+    async fn ttl_eviction_skips_assembling_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let t = ChunkTracker::default();
+        let gid = [0xE1u8; 16];
+        let data = vec![9u8; 100];
+        // 一次收满 → assembling = true（组装开始，尚未完成）。
+        assert!(
+            t.receive(gid, "slow.bin", 100, 0, &data, &out, "203.0.113.5")
+                .await
+                .unwrap()
+        );
+        {
+            let map = t.sessions.lock().await;
+            let s = map.get(&gid).expect("会话应存在");
+            assert!(s.state.lock().await.assembling);
+            s.last_seen_ms.store(0, Ordering::Relaxed); // 空闲超过 TTL
+        }
+        // 触发 TTL 逐出扫描：组装中的组必须保留，半成品不得删除。
+        let other = [0xE2u8; 16];
+        t.ensure(other, "trigger.bin", 100, &out, "203.0.113.5")
+            .await
+            .unwrap();
+        assert!(
+            t.sessions.lock().await.contains_key(&gid),
+            "组装中的组不得按 TTL 逐出"
+        );
+        assert!(
+            group_part_path(&out, "slow.bin", &gid).exists(),
+            "组装中的半成品不得删除（P1-5）"
+        );
+        // 组装完成后（assembled = true）不再受保护：空闲到期可回收（否则完成态
+        // 永久占用全局表）。
+        t.finish(gid, &RecvOptions::default()).await.unwrap();
+        t.ensure([0xE3u8; 16], "trigger2.bin", 100, &out, "203.0.113.5")
+            .await
+            .unwrap();
+        assert!(
+            !t.sessions.lock().await.contains_key(&gid),
+            "已完成组空闲到期可正常回收"
+        );
+    }
+
+    /// P3-13 判别：同一组的重复 0x0C（多连接并行时各发一次）只能计一次成功。
+    /// 修复前每次 0x01 都计，`recv --count N` 会被同组重复收尾提前打满。
+    #[tokio::test]
+    async fn duplicate_chunk_end_counts_success_once() {
+        use tokio::io::AsyncWriteExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let tracker = std::sync::Arc::new(ChunkTracker::default());
+        let opts = RecvOptions {
+            save_dir: out.clone(),
+            chunk_sessions: tracker.clone(),
+            ..Default::default()
+        };
+        let gid = [0x5Au8; 16];
+        let data = vec![3u8; 64];
+        tracker
+            .receive(gid, "c.bin", 64, 0, &data, &out, "203.0.113.7")
+            .await
+            .unwrap();
+        tracker.finish(gid, &opts).await.unwrap();
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&gid).await.unwrap();
+        let (st, counted) = recv_chunk_end(&mut server, &opts).await.unwrap();
+        assert_eq!(st, STATUS_OK);
+        assert!(counted, "首次 0x01 必须计数");
+        client.write_all(&gid).await.unwrap();
+        let (st2, counted2) = recv_chunk_end(&mut server, &opts).await.unwrap();
+        assert_eq!(st2, STATUS_OK, "重复 0x0C 的判决仍是 0x01");
+        assert!(!counted2, "同组重复 0x0C 不得再计一次成功（P3-13）");
     }
 }

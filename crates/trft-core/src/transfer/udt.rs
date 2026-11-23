@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
 /// 发送侧拥塞窗初值（UDT4 慢启动起点）。
 const CWND_INIT: f64 = 16.0;
@@ -42,6 +42,24 @@ fn now_us_since(epoch: &Instant) -> u64 {
 
 /// 出口通道元素（服务端共享出口携带 dst；客户端泵忽略 dst 直发对端）。
 type OutPkt = (SocketAddr, Arc<[u8]>);
+
+/// NAK 单包载荷上限（字）：控制包 = 16B 头 + 字数×4，载荷上限
+/// `UDT_PAYLOAD_MAX`(1456B) → 最多 364 字（超了会 IP 分片/被接收端丢）。
+const NAK_WORDS_MAX: usize = pw::UDT_PAYLOAD_MAX / 4;
+/// 单包最多损失条目：`encode_loss` 每条目至多 2 字（区间首字 + 尾字）。
+const NAK_LOSSES_PER_PKT: usize = NAK_WORDS_MAX / 2;
+
+/// 周期 NAK 分批（轮 9 P2-11）：重丢包时损失表可达数万条，一次 `encode_loss`
+/// 编码出来的载荷可远超单包上限（曾被 IP 分片/整包丢弃，恢复通道反而失效）。
+/// 按输入条目切批再各自编码——每批内自包含，不会把一个区间拆到两个包里。
+fn nak_batches(loss: &BTreeSet<i32>) -> Vec<Vec<u32>> {
+    loss.iter()
+        .copied()
+        .collect::<Vec<_>>()
+        .chunks(NAK_LOSSES_PER_PKT)
+        .map(pw::encode_loss)
+        .collect()
+}
 
 /// 中位数（libudt nth_element 同效；不改原序——拷贝小窗排序）。
 fn median_of(win: &[u32; 16]) -> u32 {
@@ -108,13 +126,16 @@ struct SendState {
 }
 
 impl SendState {
+    /// `flow_window` = 对端通告的流窗（握手与 ACK 两路）。入口统一钳到
+    /// `[2, UDT_FLIGHT_FLAG]`（轮 9 P1-2）：握手路径此前只 `.max(2)`，
+    /// 恶意/异常对端报 i32::MAX 会让发送侧把整个待发文件驻留内存（OOM）。
     fn new(isn: i32, flow_window: i32) -> Self {
         Self {
             pkts: VecDeque::new(),
             last_ack: isn,
             next_seq: pw::seq_dec(isn),
             loss: BTreeMap::new(),
-            flow_window,
+            flow_window: flow_window.clamp(2, pw::UDT_FLIGHT_FLAG),
             cwnd: CWND_INIT,
             in_slow_start: true,
             peer_rtt_us: 0,
@@ -894,9 +915,13 @@ impl UdtConn {
                 let guard = (r.rtt_us + 4 * r.rttvar_us).max(floor as i64) as u64;
                 if now_us.saturating_sub(r.last_nak_us) >= guard {
                     r.last_nak_us = now_us;
-                    let words = pw::encode_loss(&r.loss.iter().copied().collect::<Vec<_>>());
+                    // 按单包载荷上限分批发（P2-11）：整表可能数万条，单包编码
+                    // 远超 MTU/接收端上限；对端逐包 decode_loss，多包合并即全表。
+                    let batches = nak_batches(&r.loss);
                     drop(r);
-                    self.send_ctrl(pw::C_NAK, 0, &words);
+                    for words in batches {
+                        self.send_ctrl(pw::C_NAK, 0, &words);
+                    }
                 }
             }
         }
@@ -1108,13 +1133,17 @@ impl AsyncWrite for UdtStream {
             return Poll::Ready(Ok(0));
         }
         loop {
+            // 快路径：窗口有余量直接入队（不注册 waker——每写一次 alloc 的税）。
             let n = self.conn.enqueue(buf);
             if n > 0 {
+                self.window_fut = None; // 丢弃可能残留的未触发注册
                 return Poll::Ready(Ok(n));
             }
-            // 窗口满：先注册 waker 再返回 Pending（notify_waiters 只唤醒已注册者；
-            // 注册前发生的一次通知若对应开窗，下一轮 enqueue 即成功，否则由后续
-            // ACK 周期通知兜底）。
+            // 窗口满：**先注册** notified 再二次查窗（轮 9 P2-12）。notify_waiters
+            // 只唤醒已注册的 waiter；若像旧代码那样「查窗返回 0 之后才注册」，两次
+            // 操作之间到达的 ACK 开窗通知会永久丢失，写侧挂到连接空闲超时才醒。
+            // 注册（首次 poll 才真正挂到 notify 上）后重查一次：期间开窗则本次
+            // 直接写出；仍满才带着已注册的 waker 返回 Pending。
             if self.window_fut.is_none() {
                 let notify = Arc::clone(&self.conn.window_notify);
                 self.window_fut = Some(Box::pin(async move { notify.notified().await }));
@@ -1122,11 +1151,24 @@ impl AsyncWrite for UdtStream {
             let fut = self.window_fut.as_mut().expect("已插入");
             match fut.as_mut().poll(cx) {
                 Poll::Ready(()) => {
+                    // 注册完成前已有通知（或上一轮唤醒）：清掉重来（窗口已开则
+                    // 下一轮 enqueue 立即返回）。
                     self.window_fut = None;
                     continue;
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {}
             }
+            let n = self.conn.enqueue(buf);
+            if n > 0 {
+                self.window_fut = None;
+                return Poll::Ready(Ok(n));
+            }
+            // 关连接也可能发生在这两次查窗之间（close 的 notify_waiters 只唤醒
+            // 已注册者）：返回 Pending 前复核错误，免得丢通知后永久挂起。
+            if let Some(e) = self.conn.error() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
+            }
+            return Poll::Pending;
         }
     }
 
@@ -1415,8 +1457,9 @@ pub async fn connect_udt(addr: SocketAddr, src_port: Option<u16>) -> Result<UdtS
         }
     }
     // 服务端以客户端 ISN 作为自己的发送 ISN（libudt acceptAndRespond 回显）。
+    // 流窗钳制在 SendState::new 入口统一做（P1-2），这里传对端原值。
     let (pump_conn, stream, in_tx, out_rx, driver) =
-        build_conn(my_id, peer_id, addr, isn, isn, peer_flight.max(2), None, None);
+        build_conn(my_id, peer_id, addr, isn, isn, peer_flight, None, None);
     let mut out_rx = out_rx.expect("客户端连接持专属出包通道");
     let socket = Arc::new(socket);
     // 入包泵：全部（含握手重发响应）交给驱动。批量排空 + 连接关闭退出
@@ -1618,14 +1661,9 @@ pub async fn serve_udt_on(
             r = socket.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(e) => {
-                    let code = e.raw_os_error();
-                    if code == Some(10040) {
-                        continue; // EMSGSIZE 杂包（Windows 10040）
-                    }
-                    if code == Some(10054) {
-                        // Windows UDP 的 ICMP port-unreachable 毒化：向已关端口发包后
-                        // 下一次 recv 报 WSAECONNRESET——瞬态，继续服务（C# 版
-                        // DeviceDiscovery.cs 同款问题的同款对策）。
+                    // EMSGSIZE 杂包 + Windows ICMP port-unreachable 毒化（10054）
+                    // 均按瞬态继续（轮 9 P1-1：与 RUDP/单向 UDP 共用判定）。
+                    if crate::transfer::udp::is_transient_udp_err(&e) {
                         continue;
                     }
                     return Err(Error::Io(e));
@@ -1755,6 +1793,16 @@ pub async fn serve_udt_on(
                                 .await;
                             break 'pkt;
                         }
+                        // 并发闸前移到建连接状态之前（轮 9 P2-10）：连接表上限 256
+                        // 远大于 64 个许可，若先建状态再交给 handle_conn_cs 等闸，等闸
+                        // 期间的无界入包通道 + 重排缓存可被打满（≈9GB）。满闸即丢弃本次
+                        // HS_RESP（不建任何状态；客户端 250ms 重发会自然重试）——这里用
+                        // try_acquire 而非 conn_permit：demux 是单循环，阻塞等闸会拖死
+                        // 所有已建连接。
+                        let permit = match opts.permits.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => break 'pkt,
+                        };
                         // 建连：服务端发送 ISN = 客户端 ISN（libudt acceptAndRespond 回显语义）。
                         let my_id = random_u32_nonzero();
                         let mss = hs.mss.min(pw::UDT_MSS);
@@ -1770,13 +1818,14 @@ pub async fn serve_udt_on(
                             peer_ip: peer_ip_words(src),
                         }
                         .encode_ctrl(0, hs.id as u32);
+                        // 流窗钳制在 SendState::new 入口统一做（P1-2），传对端原值。
                         let (_c, stream, in_tx, _out_rx, driver) = build_conn(
                             my_id,
                             hs.id as u32,
                             src,
                             hs.isn,
                             hs.isn,
-                            hs.flight_flag.max(2),
+                            hs.flight_flag,
                             Some(hs_resp.clone()),
                             Some(out_tx.clone()),
                         );
@@ -1798,7 +1847,12 @@ pub async fn serve_udt_on(
                         // 立即发出握手响应（libudt：新连接响应由 accept 侧发出；
                         // 连接数据出包经共享通道直发——省每连接一跳 forward 任务）。
                         let _ = socket.send_to(&hs_resp, src).await;
-                        let o2 = opts.clone();
+                        // 真实许可已在上方取得并移交监督任务；handle_conn_cs 内部
+                        // conn_precheck 还会再取一次闸——传入仅 1 个许可的副本让它
+                        // 立即通过（等效"许可已持有"，每连接仍只占一个真实许可）。
+                        // receiver.rs/cswire.rs 正被并行修改，不改其签名。
+                        let mut o2 = opts.clone();
+                        o2.permits = Arc::new(Semaphore::new(1));
                         let served2 = served.clone();
                         let conns2 = conns.clone();
                         let by_peer2 = by_peer.clone();
@@ -1808,6 +1862,7 @@ pub async fn serve_udt_on(
                         let peer_id_cs = hs.id as u32;
                         let cs_state2 = Arc::clone(&cs_state);
                         finished.spawn(async move {
+                            let _permit = permit; // 持闸至连接结束（P2-10）
                             let _ = crate::transfer::cswire::handle_conn_cs(
                                 stream,
                                 src,
@@ -2086,6 +2141,103 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(got, pw::UDT_FLIGHT_FLAG, "对端流窗必须钳到 25600");
+    }
+
+    /// 轮 9 P1-2 判别：**握手通告**的流窗（ACK 之外的第二入口）必须同样钳到
+    /// [2, UDT_FLIGHT_FLAG]。旧实现只 `.max(2)`，恶意/异常对端在 HS_RESP 里报
+    /// i32::MAX，发送侧就会把整个待发文件驻留内存（OOM）。
+    #[tokio::test]
+    async fn handshake_flow_window_is_clamped() {
+        let peer: SocketAddr = "127.0.0.1:15".parse().unwrap();
+        let isn = 9;
+        let (huge, _s1, _i1, _o1, drv1) =
+            build_conn(1, 2, peer, isn, isn, i32::MAX, None, None);
+        assert_eq!(
+            huge.send.lock().unwrap().flow_window,
+            pw::UDT_FLIGHT_FLAG,
+            "握手报 i32::MAX 必须钳到 25600"
+        );
+        let (neg, _s2, _i2, _o2, drv2) =
+            build_conn(1, 2, peer, isn, isn, i32::MIN, None, None);
+        assert_eq!(
+            neg.send.lock().unwrap().flow_window,
+            2,
+            "握手报负值必须钳到下限 2"
+        );
+        let (normal, _s3, _i3, _o3, drv3) = build_conn(1, 2, peer, isn, isn, 128, None, None);
+        assert_eq!(
+            normal.send.lock().unwrap().flow_window,
+            128,
+            "合法流窗不得被改动"
+        );
+        huge.close(None);
+        neg.close(None);
+        normal.close(None);
+        drv1.abort();
+        drv2.abort();
+        drv3.abort();
+    }
+
+    /// 轮 9 P2-11 判别：周期 NAK 按单包载荷上限分批——每包自解码、合起来等于
+    /// 原损失表；修复前整表一次编码，重丢包时可远超单包上限被丢。
+    #[test]
+    fn periodic_nak_is_split_by_packet_cap() {
+        let mut loss = BTreeSet::new();
+        // 混合连续区间与孤立缺口（编码后每条目 1–2 字）。
+        for i in 0..1500i32 {
+            let base = i * 10;
+            loss.insert(base);
+            loss.insert(base + 1);
+            loss.insert(base + 2);
+            loss.insert(base + 5);
+        }
+        let batches = nak_batches(&loss);
+        assert!(batches.len() > 1, "大损失表必须分多个 NAK 包");
+        let mut decoded = Vec::new();
+        for b in &batches {
+            assert!(
+                b.len() <= NAK_WORDS_MAX,
+                "单包 {} 字超载荷上限 {NAK_WORDS_MAX}",
+                b.len()
+            );
+            decoded.extend(pw::decode_loss(b).expect("每批必须自解码（不得拆开区间）"));
+        }
+        assert_eq!(decoded, loss.iter().copied().collect::<Vec<_>>());
+    }
+
+    /// 轮 9 P2-12 回归：窗口满时挂起的写必须被 ACK 开窗唤醒（先注册通知再
+    /// 二次查窗的路径；丢失唤醒会让写侧挂到连接空闲超时）。
+    #[tokio::test]
+    async fn pending_write_resumes_after_ack() {
+        let peer: SocketAddr = "127.0.0.1:16".parse().unwrap();
+        let isn = 21;
+        let (_conn, mut stream, in_tx, _out, _drv) =
+            build_conn(1, 2, peer, isn, isn, 1, None, None);
+        // 流窗 1：写满 1 包后下一次写必须挂起。
+        let first = vec![3u8; pw::UDT_PAYLOAD_MAX];
+        stream.write_all(&first).await.unwrap();
+        let big = vec![4u8; 2 * pw::UDT_PAYLOAD_MAX];
+        let h = tokio::spawn(async move {
+            stream.write_all(&big).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!h.is_finished(), "窗口满时写必须阻塞");
+        // 累积确认首包 + 通告流窗 64 → 开窗通知；挂起的写必须被唤醒。
+        let cum = pw::seq_inc(isn);
+        in_tx
+            .send(pw::Pkt::Ctrl {
+                ctype: pw::C_ACK,
+                ext: 0,
+                add: 0,
+                ts: 0,
+                dst: 1,
+                words: vec![cum as u32, 0, 0, 64],
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("ACK 开窗后写侧必须被唤醒（不得丢失通知）")
+            .unwrap();
     }
 
     /// 窗口约束：流窗 3 时写 8 包必须被窗口限流（未被 ACK 放行前不得完成）。
