@@ -234,6 +234,23 @@ pub fn is_cache_artifact(name: &str) -> bool {
     name == CACHE_FILE_NAME || name == CACHE_BAK_NAME
 }
 
+/// 瞬态文件判定：内部元数据（缓存族）+ 传输未完成时的中间产物。
+/// 半成品从未成为最终文件——校验/清单/监控都该按此整类排除，否则
+/// 会把「正在写入的半成品」当成用户内容（校验计入「无记录」、文件夹
+/// 发送把残件传给对端、监控对半成品触发一次发送）。
+/// 后缀比较大小写不敏感（对端/工具可能给出大写扩展名）。
+pub fn is_transient_name(name: &str) -> bool {
+    if is_cache_artifact(name) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    // 0x00/0x01/0x02/UDP：`<原名>.<随机>.trft-part`（接收器写完才 rename）。
+    // 0x03 续传：`<原名>.<ip-fnv>.trft-resume` + 侧车 `.meta`（断点续传的磁盘事实）。
+    lower.ends_with(".trft-part")
+        || lower.ends_with(".trft-resume")
+        || lower.ends_with(".trft-resume.meta")
+}
+
 /// 便捷入口：确保目录级缓存文件名。
 pub fn cache_file_for(dir: &Path) -> std::path::PathBuf {
     dir.join(CACHE_FILE_NAME)
@@ -303,6 +320,26 @@ mod tests {
         assert_eq!(cached, h, "命中必须返回记录的原始摘要");
         let actual = crate::hash::sha256(b"tampered!");
         assert_ne!(actual, cached, "篡改后的内容摘要必须与记录不符");
+    }
+
+    /// 判别：瞬态判定覆盖缓存族 + 两类半成品（大小写不敏感），且不误伤正常文件。
+    #[test]
+    fn transient_names_cover_cache_and_partial_files() {
+        assert!(is_transient_name(CACHE_FILE_NAME));
+        assert!(is_transient_name(CACHE_BAK_NAME));
+        assert!(is_transient_name("movie.bin.1234abcd.trft-part"));
+        assert!(is_transient_name("movie.bin.1234ABCD.TRFT-PART"));
+        assert!(is_transient_name("big.bin.0123456789abcdef.trft-resume"));
+        assert!(is_transient_name(
+            "big.bin.0123456789abcdef.trft-resume.meta"
+        ));
+        assert!(!is_transient_name("movie.bin"));
+        assert!(
+            !is_transient_name("notes.trft-part.txt"),
+            "后缀必须在末尾才算"
+        );
+        assert!(!is_transient_name("resume.trft"));
+        assert!(!is_transient_name("part.bin"));
     }
 
     #[test]

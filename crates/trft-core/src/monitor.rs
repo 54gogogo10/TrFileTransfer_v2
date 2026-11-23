@@ -342,7 +342,7 @@ fn scan_dir(dir: &Path) -> Vec<PathBuf> {
             let p = e.path();
             p.is_file()
                 && p != sent
-                && !crate::hashcache::is_cache_artifact(&e.file_name().to_string_lossy())
+                && !crate::hashcache::is_transient_name(&e.file_name().to_string_lossy())
         })
         .map(|e| e.path())
         .collect();

@@ -28,8 +28,9 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             let e = e?;
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            // 摘要缓存族（主文件 + .bak 镜像）是内部元数据而非内容——与 verify 同口径排除。
-            if crate::hashcache::is_cache_artifact(&name) {
+            // 缓存族 + 半成品（.trft-part/.trft-resume）是内部产物而非内容——
+            // 与 verify 同口径整类排除，避免把残件当文件传给对端。
+            if crate::hashcache::is_transient_name(&name) {
                 continue;
             }
             let child_rel = if rel.is_empty() {

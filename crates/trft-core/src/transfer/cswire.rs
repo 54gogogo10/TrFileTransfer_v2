@@ -3122,9 +3122,9 @@ pub async fn cs_send_folder<S: AsyncRead + AsyncWrite + Unpin>(
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
-            // 本地摘要缓存产物不是要发送的内容（v2 帧 collect_files 同口径——
+            // 本地缓存产物与半成品不是要发送的内容（v2 帧 collect_files 同口径——
             // 否则 0x04 二轮起把 .trft-hash-cache.txt 当文件传给对端）。
-            if crate::hashcache::is_cache_artifact(&e.file_name().to_string_lossy()) {
+            if crate::hashcache::is_transient_name(&e.file_name().to_string_lossy()) {
                 continue;
             }
             if p.is_dir() {
@@ -3783,9 +3783,9 @@ pub(crate) async fn build_sync_manifest(
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
-            // 本地摘要缓存产物不是要发送的内容（v2 帧 collect_files 同口径——
+            // 本地缓存产物与半成品不是要发送的内容（v2 帧 collect_files 同口径——
             // 否则 0x04 二轮起把 .trft-hash-cache.txt 当文件传给对端）。
-            if crate::hashcache::is_cache_artifact(&e.file_name().to_string_lossy()) {
+            if crate::hashcache::is_transient_name(&e.file_name().to_string_lossy()) {
                 continue;
             }
             if p.is_dir() {

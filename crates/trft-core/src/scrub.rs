@@ -42,16 +42,14 @@ impl VerifyReport {
 /// 只作为**防环**兜底——配合"不进入链接目录"一起封死 junction 环导致的栈溢出）。
 const MAX_SCAN_DEPTH: u32 = 32;
 
-/// 扫描时跳过的瞬态文件：摘要缓存自身、接收器正在写入的 `.trft-part`。
-/// 传输中的临时文件不是最终产物，校验不应把它计入「已扫描/无记录」，
-/// 否则会和正在写入的句柄竞争（Windows 上还可能读失败）。
+/// 扫描时跳过的瞬态文件：摘要缓存自身、接收器正在写入的 `.trft-part`、
+/// 0x03 续传的 `.trft-resume`（含 `.meta` 侧车）。半成品不是最终产物，
+/// 校验不应把它计入「已扫描/无记录」，否则会和正在写入的句柄竞争
+/// （Windows 上还可能读失败）。判定与发送清单/监控同源：hashcache::is_transient_name。
 fn is_transient(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())
-        .map(|n| {
-            crate::hashcache::is_cache_artifact(n)
-                || n.to_ascii_lowercase().ends_with(".trft-part")
-        })
+        .map(crate::hashcache::is_transient_name)
         .unwrap_or(false)
 }
 
@@ -213,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_skips_in_progress_trft_part_files() {
+    fn verify_skips_in_progress_temp_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("done.txt"), b"done").unwrap();
         // 接收器写入中的临时文件：不应计入扫描，更不应产生不一致/读取失败。
@@ -221,11 +219,25 @@ mod tests {
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("x.TRFT-PART"), b"case").unwrap();
+        // 0x03 续传半成品与侧车同属瞬态：断点续传期间扫到它们同样只能是噪声。
+        std::fs::write(
+            dir.path().join("big.bin.0123456789abcdef.trft-resume"),
+            b"resume",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("big.bin.0123456789abcdef.trft-resume.meta"),
+            b"meta",
+        )
+        .unwrap();
 
         let cache_path = cache_file_for(dir.path());
         let mut cache = HashCache::load(&cache_path, DEFAULT_TTL_DAYS);
         let r = verify_dir(dir.path(), &mut cache, None, None);
-        assert_eq!(r.scanned, 1, "传输中的 .trft-part 不得计入扫描");
+        assert_eq!(
+            r.scanned, 1,
+            "半成品（.trft-part/.trft-resume）不得计入扫描"
+        );
         assert_eq!(r.fresh, 1);
         assert_eq!(r.unreadable, 0);
         assert!(r.is_consistent());
