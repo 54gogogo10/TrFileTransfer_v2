@@ -500,6 +500,12 @@
     - **双机复核（VM 10.184.213.49，端口不变、接收端进程重启）**：删掉 journal 模拟旧行为 → 二轮 rc=1「对端拒绝: 被对端拒绝接收」、目标文件消失；保留 journal → 二轮 rc=0「同步完成」、哈希与源一致。
     - **残留**：journal 与保存目录同生命周期（删目录即失效，符合缓存语义）；条目 TTL 7 天，过期后退化为「多失败一次后自愈」。
 
+66. **摘要缓存 TTL 贯通设置 + 监控排除扩展名（2026-11-23）**：基线 312 → **313 项全绿**（+1 判别）。
+    - **TTL 贯通**：0x04 服务端 journal（§7.65）原先把 TTL 硬编码为 7 天。现由 `RecvOptions.hash_cache_days` 承载设置页「摘要缓存/同步续点有效期（天，0=永久）」（复用既有的 `Config.hash_cache_days`，CLI `recv` 与 GUI 接收器同源注入），`CsServerState::with_journal(&save_dir, ttl_days)` 装载即按该值淘汰过期条目；设置项标签同步改为兼顾同步续点（0=永久）。
+    - **监控排除扩展名**：新增 `Config.monitor_exclude_exts`（持久化）+ `MonitorConfig.exclude_exts`；`monitor::normalize_exts` 归一化（去空白/前导点、转小写、丢空项与含路径分隔符的项、去重），`scan_dir` 命中即不扫描不入队（大小写不敏感；无扩展名文件不受影响）。GUI 监控卡新增「排除扩展名」输入（逗号/分号/空白分隔均可），启动监控时随请求下发并由后端落盘——用户不必再进设置页手动保存。
+    - **判别**：`monitor_excludes_configured_extensions`（归一化口径 + 扫描过滤 + 空列表不排除）。
+    - **兼容**：旧 `config.toml` 无该键 → serde 缺省空表（不排除）；`RecvOptions` 新字段在 `Default` 取 `DEFAULT_TTL_DAYS`，既有测试构造一律 `..Default::default()`。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |

@@ -982,4 +982,11 @@ TCP 199 / QUIC 179 / UDT 161；真机矩阵 14/14 + GUI 0x02 复验全 SHA-256 �
 双机复测（端口不变、接收端进程重启）：删 journal 模拟旧行为 → 二轮 rc=1 且目标文件消失；保留 journal →
 二轮 rc=0、哈希一致。全量 311 → **312 项全绿**。
 
+**补记 2（同日）**：两项可用性补齐（TECH-STACK §7.66）——① 设置页「摘要缓存有效期（天，0=永久）」
+贯通到 0x04 同步续点 journal（`RecvOptions.hash_cache_days` → `CsServerState::with_journal`，
+CLI `recv` 与 GUI 接收器同源），此前硬编码 7 天；② 监控模式支持排除指定扩展名
+（`Config.monitor_exclude_exts` 持久化、`monitor::normalize_exts` 归一化、`scan_dir` 过滤、
+GUI 监控卡输入并在启动时落盘）。判别 `monitor_excludes_configured_extensions`；
+全量 312 → **313 项全绿**。
+
 
