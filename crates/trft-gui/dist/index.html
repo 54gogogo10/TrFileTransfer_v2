@@ -46,6 +46,7 @@
             <button class="seg-btn" data-kind="folder" data-i18n="kind_folder">文件夹</button>
             <button class="seg-btn" data-kind="text" data-i18n="kind_text">文本</button>
             <button class="seg-btn" data-kind="monitor" data-i18n="kind_monitor">监控</button>
+            <button class="seg-btn" data-kind="queue" data-i18n="kind_queue">队列</button>
           </div>
         </div>
         <div id="monitor-card" class="hidden">
@@ -100,7 +101,7 @@
             <option value="udp">UDP (单向)</option>
           </select>
           <input type="text" id="send-srcport" class="mono w80" data-i18n-ph="srcport_ph" placeholder="源端口" />
-          <label class="lbl-s" data-i18n="chunks_lbl">分块数</label>
+          <label class="lbl-s" id="chunks-lbl" data-i18n="chunks_lbl">分块数</label>
           <input type="text" id="send-chunks" class="mono w80" data-i18n-ph="chunks_ph" placeholder="4" />
         </div>
         <div class="row">
@@ -110,6 +111,30 @@
           <input type="text" id="send-limit" class="mono w80" placeholder="0" />
           <label class="chk"><input type="checkbox" id="send-compress" checked /><span data-i18n="compress">压缩</span></label>
           <label class="chk"><input type="checkbox" id="send-encrypt" checked /><span data-i18n="encrypt">加密</span></label>
+        </div>
+        <div id="queue-card" class="hidden">
+          <div class="card-title">
+            <span data-i18n="queue">发送队列</span>
+            <span class="grow"></span>
+            <label class="lbl-s" data-i18n="after_done">完成后</label>
+            <select id="after-done">
+              <option value="none" data-i18n="ad_none">无动作</option>
+              <option value="shutdown" data-i18n="ad_shutdown">关机（60s 可取消）</option>
+              <option value="sleep" data-i18n="ad_sleep">休眠</option>
+              <option value="command" data-i18n="ad_command">执行命令</option>
+            </select>
+            <input type="text" id="after-command" class="mono w160 hidden" placeholder="cmd /C 命令" />
+          </div>
+          <div class="row">
+            <button id="btn-queue-add-files" class="btn" data-i18n="queue_add_files">添加文件…</button>
+            <button id="btn-queue-add-folder" class="btn" data-i18n="queue_add_folder">添加文件夹…</button>
+            <span class="hint" data-i18n="queue_hint">文件与文件夹可混合入队，按顺序逐项发送</span>
+          </div>
+          <ul id="queue-list" class="list"><li class="empty" data-i18n="queue_empty">队列为空</li></ul>
+          <div class="row">
+            <button id="btn-queue-run" class="btn primary" data-i18n="send">发送</button>
+            <button id="btn-queue-clear" class="btn" data-i18n="queue_clear">清空</button>
+          </div>
         </div>
         <div class="row hidden" id="folder-opts">
           <label class="lbl" data-i18n="folder_mode">发送方式</label>
@@ -129,35 +154,16 @@
         <div class="row">
           <button id="btn-send" class="btn primary" data-i18n="send">发送</button>
           <button id="btn-send-chunked" class="btn hidden" data-i18n="send_chunked">并行分块发送</button>
-          <button id="btn-queue-add" class="btn" data-i18n="queue_add">加入队列</button>
-          <button id="btn-queue-batch" class="btn" data-i18n="batch_add">批量入队</button>
           <span class="hint" data-i18n="drop_hint">可直接拖入文件/文件夹</span>
         </div>
         <div class="row row-tall">
           <label class="lbl" data-i18n="group_targets">群发目标（每行 ip:port）</label>
           <textarea id="group-targets" class="grow mono" rows="2" placeholder="192.168.1.20:8080"></textarea>
           <button id="btn-group-send" class="btn" data-i18n="group_send">并行群发</button>
+          <button id="btn-queue-group-send" class="btn hidden" data-i18n="queue_group_send">群发队列</button>
         </div>
       </div>
 
-
-      <div class="card" id="queue-card">
-        <div class="card-title">
-          <span data-i18n="queue">发送队列</span>
-          <span class="grow"></span>
-          <label class="lbl-s" data-i18n="after_done">完成后</label>
-          <select id="after-done">
-            <option value="none" data-i18n="ad_none">无动作</option>
-            <option value="shutdown" data-i18n="ad_shutdown">关机（60s 可取消）</option>
-            <option value="sleep" data-i18n="ad_sleep">休眠</option>
-            <option value="command" data-i18n="ad_command">执行命令</option>
-          </select>
-          <input type="text" id="after-command" class="mono w160 hidden" placeholder="cmd /C 命令" />
-          <button id="btn-queue-run" class="btn small" data-i18n="queue_run">串行发送</button>
-          <button id="btn-queue-clear" class="btn small danger" data-i18n="queue_clear">清空</button>
-        </div>
-        <ul id="queue-list" class="list"><li class="empty" data-i18n="queue_empty">队列为空</li></ul>
-      </div>
 
       <div class="card" id="progress-card">
         <div class="card-title" data-i18n="progress">传输进度</div>

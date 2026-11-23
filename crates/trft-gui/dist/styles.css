@@ -271,7 +271,8 @@ body::before {
 #monitor-card .card-title::before { display: none; }
 
 /* 监控是「类型」的一种：配置区嵌在同一张发送卡内，与普通发送字段互斥显示。 */
-#monitor-card {
+#monitor-card,
+#queue-card {
   margin-top: 14px;
   padding-top: 14px;
   border-top: 1px solid var(--border);

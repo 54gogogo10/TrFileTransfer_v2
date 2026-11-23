@@ -27,9 +27,11 @@ const L10N = {
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     batch_add: "批量入队", help_title: "使用说明", help_close: "关闭",
-    help_body: "发送：类型选文件/文件夹/文本/监控，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：多选「批量入队」后串行发送，可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
+    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
-    kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控",
+    kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控", kind_queue: "队列",
+    queue_add_files: "添加文件…", queue_add_folder: "添加文件夹…", queue_hint: "文件与文件夹可混合入队，按顺序逐项发送",
+    queue_group_send: "群发队列",
     path: "路径", text: "文本", browse: "浏览…", target: "目标", pairing: "配对码",
     limit: "KB/s", compress: "压缩", encrypt: "加密",
     passes: "重发轮数 1-5", fec_parity: "FEC 校验片 1-8", nofec: "关闭 FEC",
@@ -107,9 +109,11 @@ const L10N = {
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     batch_add: "Batch enqueue", help_title: "Help", help_close: "Close",
-    help_body: "Send: pick a type (file/folder/text/monitor), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: batch-enqueue files and run serially, with an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
+    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
-    kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor",
+    kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor", kind_queue: "Queue",
+    queue_add_files: "Add files…", queue_add_folder: "Add folder…", queue_hint: "Files and folders can be mixed; sent one by one in order",
+    queue_group_send: "Group queue",
     path: "Path", text: "Text", browse: "Browse…", target: "Target", pairing: "Pairing",
     limit: "KB/s", compress: "Compress", encrypt: "Encrypt",
     passes: "Passes 1-5", fec_parity: "FEC parity 1-8", nofec: "Disable FEC",
@@ -340,28 +344,41 @@ function updateKindRows() {
   const isFolder = sendKind === "folder";
   const isText = sendKind === "text";
   const isMonitor = sendKind === "monitor";
+  const isQueue = sendKind === "queue";
   const isUdp = $("#send-proto").value === "udp";
 
-  // 监控是「类型」的第四种：选中时展示监控卡片、隐藏普通发送字段；
+  // 监控与队列都是「类型」的一项：各自展示一块配置区，普通发送字段互斥隐藏。
   // 监控运行中即使切到其他类型也保留卡片（状态/记录可见）。
   const monitorRunning = $("#dot-monitor").classList.contains("on");
-  $("#monitor-card").classList.toggle("hidden", !(isMonitor || monitorRunning));
+  $("#monitor-card").classList.toggle("hidden", isQueue || !(isMonitor || monitorRunning));
+  $("#queue-card").classList.toggle("hidden", !isQueue);
 
-  $("#path-row").classList.toggle("hidden", isText || isMonitor);
+  $("#path-row").classList.toggle("hidden", isText || isMonitor || isQueue);
   $("#text-row").classList.toggle("hidden", !isText);
   // 规格 §3.1 文件夹模式子选项：0x04 差量同步（默认）与 0x01 整夹发送。
-  $("#folder-opts").classList.toggle("hidden", !(isFolder && !isUdp) || isMonitor);
+  $("#folder-opts").classList.toggle("hidden", !(isFolder && !isUdp) || isMonitor || isQueue);
   // 0x02 并行分块与 UDP 单发都只对单文件有意义（规格 §3.6）。
-  $("#btn-send-chunked").classList.toggle("hidden", !(isFile && !isUdp) || isMonitor);
-  $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp) || isMonitor);
+  $("#btn-send-chunked").classList.toggle("hidden", !(isFile && !isUdp) || isMonitor || isQueue);
+  $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp) || isMonitor || isQueue);
   // 源端口仅连接型协议可绑定（§3.1；UDP 无连接语义，与 CLI --srcport 约束同口径）。
   $("#send-srcport").classList.toggle("hidden", isUdp || isMonitor);
+  // 队列逐项按文件/文件夹发送，不走并行分块；隐藏无意义的分块数。
+  $("#send-chunks").classList.toggle("hidden", isQueue);
+  $("#chunks-lbl").classList.toggle("hidden", isQueue);
 
-  // 监控使用自己卡片里的目标/协议/配对码，隐藏普通发送的对应行与动作行。
-  [$("#send-ip"), $("#send-code"), $("#btn-send"), $("#group-targets")].forEach((el) => {
+  // 监控使用自己卡片里的目标/协议/配对码，隐藏普通发送的对应行与动作行；
+  // 队列仍复用主发送卡的目标/配对码（入队时逐项快照）。
+  [$("#send-ip"), $("#send-code")].forEach((el) => {
     const row = el && el.closest(".row");
     if (row) row.classList.toggle("hidden", isMonitor);
   });
+  const sendRow = $("#btn-send") && $("#btn-send").closest(".row");
+  if (sendRow) sendRow.classList.toggle("hidden", isMonitor || isQueue);
+  // 群发行在队列页保留（群发队列），其它普通类型用「并行群发」；监控页不需要。
+  const groupRow = $("#group-targets") && $("#group-targets").closest(".row");
+  if (groupRow) groupRow.classList.toggle("hidden", isMonitor);
+  $("#btn-group-send").classList.toggle("hidden", isQueue);
+  $("#btn-queue-group-send").classList.toggle("hidden", !isQueue);
 }
 $$("#kind-seg .seg-btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -619,71 +636,89 @@ function queueSnapshot() {
     srcPort: sp >= 1 && sp <= 65535 ? sp : null,
   };
 }
-$("#btn-queue-add").addEventListener("click", () => {
-  const p = $("#send-path").value.trim();
-  if (!p) return;
-  if (queueItems.length >= 500) { toast(t("queue_full"), "err"); return; }
-  // 轮 6 P2-4：入队即快照面板参数（规格 §3.2「逐项快照面板参数」——
-  // 入队后改面板不得 retroactively 改变已入队项的行为）。
-  queueItems.push({ kind: sendKind, path: p, snap: queueSnapshot() });
-  renderQueue();
-  persistQueue();
-});
-// 对齐原版「批量添加」：多选文件对话框一次入队多个（拖放之外的入口）。
-$("#btn-queue-batch").addEventListener("click", async () => {
-  const files = await T.dialog.open({
-    multiple: true,
-    directory: false,
-    defaultPath: (appState && appState.config && appState.config.last_path) || undefined,
-  });
-  if (!files || !files.length) return;
+// 入队即快照面板参数（规格 §3.2「逐项快照面板参数」——入队后改面板
+// 不得 retroactively 改变已入队项的行为）。文件与文件夹共用同一条入队路径。
+function queueAddPaths(paths, kind) {
+  if (!paths) return;
+  if (typeof paths === "string") paths = [paths];
+  if (!paths.length) return;
   const snap = queueSnapshot();
-  for (const f of files) {
+  const k = kind === "folder" ? "folder" : "file";
+  for (const p of paths) {
     if (queueItems.length >= 500) { toast(t("queue_full"), "err"); break; }
-    queueItems.push({ kind: sendKind === "text" ? "file" : sendKind, path: f, snap });
+    queueItems.push({ kind: k, path: p, snap });
   }
   renderQueue();
   persistQueue();
+}
+$("#btn-queue-add-files").addEventListener("click", async () => {
+  try {
+    const files = await T.dialog.open({
+      multiple: true,
+      directory: false,
+      defaultPath: (appState && appState.config && appState.config.last_path) || undefined,
+    });
+    queueAddPaths(files, "file");
+  } catch (e) { toast(String(e), "err"); }
+});
+$("#btn-queue-add-folder").addEventListener("click", async () => {
+  try {
+    const dirs = await T.dialog.open({ multiple: true, directory: true });
+    queueAddPaths(dirs, "folder");
+  } catch (e) { toast(String(e), "err"); }
 });
 $("#btn-queue-clear").addEventListener("click", () => { queueItems.length = 0; renderQueue(); persistQueue(); });
-$("#btn-queue-run").addEventListener("click", async () => {
-  if (!queueItems.length) return;
-  // UI-1 P3-3/P3-4：await 期间禁用——连点会起两批队列 + 让首个 confirmDialog
-  // 的 Promise 永不 resolve（onclick 被第二次调用覆盖）。
-  const runBtn = $("#btn-queue-run");
-  if (runBtn.disabled) return;
-  runBtn.disabled = true;
-  const done = () => { runBtn.disabled = false; };
-  // 轮 6 P2-4：逐项按入队快照构造（旧条目无快照时回落当前面板值）。
-  // 轮 7 F2：kind 映射与直发路径一致（proto=udp → "udpfile"）——此前队列
-  // 里的 UDP 项被静默改走 TCP/0x03；UDP 专属参数（passes/fecParity/nofec）
-  // 一并入快照（此前恒丢）。
-  const cur = queueSnapshot();
-  // 轮 7 F13：逐项校验（NaN port 快照此前让整个 invoke 反序列化失败、整批不执行）。
-  const bad = queueItems.filter((item) => {
-    const sp = item.snap || cur;
-    return !sp.ip || !(sp.port >= 1 && sp.port <= 65535);
-  });
-  if (bad.length) {
-    toast(t("group_bad_target") + " ×" + bad.length, "err");
+function queueReqFor(item, sp, target) {
+  const kind0 = item.kind === "folder" ? "folder" : "file";
+  return {
+    kind: sp.proto === "udp" ? "udpfile" : kind0,
+    path: item.path, text: null,
+    ip: target.ip, port: target.port,
+    proto: sp.proto === "udp" ? "udp" : sp.proto,
+    code: sp.code, limit: sp.limit,
+    chunks: null, nocompress: sp.nocompress, noencrypt: sp.noencrypt,
+    passes: sp.passes, fecParity: sp.fecParity, nofec: !!sp.nofec, pin: null,
+    srcPort: sp.srcPort || null,
+  };
+}
+
+function queueGroupTargets() {
+  const lines = $("#group-targets").value.split(String.fromCharCode(10)).map((x) => x.trim()).filter(Boolean);
+  if (!lines.length) return null;
+  const seen = new Set();
+  const out = [];
+  for (const tg of lines) {
+    const m = parseTarget(tg);
+    if (!m || !m.ip || !(m.port >= 1 && m.port <= 65535)) {
+      toast(t("group_bad_target") + ": " + tg, "err");
+      return null;
+    }
+    const key = m.ip + ":" + m.port;
+    if (!seen.has(key)) { seen.add(key); out.push(m); }
   }
-  const reqs = queueItems.filter((item) => {
+  return out.length ? out : null;
+}
+
+async function runQueueSend(btn, group) {
+  if (!queueItems.length || btn.disabled) return;
+  const targets = group ? queueGroupTargets() : null;
+  if (group && !targets) return;
+  btn.disabled = true;
+  // 逐项按入队快照构造（旧条目无快照时回落当前面板值）；群发时每项再展开到每个目标。
+  const cur = queueSnapshot();
+  let bad = 0;
+  const reqs = [];
+  for (const item of queueItems) {
     const sp = item.snap || cur;
-    return !!sp.ip && sp.port >= 1 && sp.port <= 65535;
-  }).map((item) => {
-    const sp = item.snap || cur;
-    const kind0 = item.kind === "folder" ? "folder" : "file";
-    return {
-      kind: sp.proto === "udp" ? "udpfile" : kind0,
-      path: item.path, text: null,
-      ip: sp.ip, port: sp.port,
-      proto: sp.proto === "udp" ? "udp" : sp.proto,
-      code: sp.code, limit: sp.limit,
-      chunks: null, nocompress: sp.nocompress, noencrypt: sp.noencrypt,
-      passes: sp.passes, fecParity: sp.fecParity, nofec: !!sp.nofec, pin: null,
-      srcPort: sp.srcPort || null,
-    };
-  });
+    if (!sp.ip || !(sp.port >= 1 && sp.port <= 65535)) { bad += 1; continue; }
+    if (targets) {
+      for (const t of targets) reqs.push(queueReqFor(item, sp, t));
+    } else {
+      reqs.push(queueReqFor(item, sp, sp));
+    }
+  }
+  if (bad) toast(t("group_bad_target") + " ×" + bad, "err");
+  if (!reqs.length) { btn.disabled = false; return; }
   // 完成后动作执行前确认（规格 §3.2：执行前弹确认；关机/休眠按危险操作呈现）。
   const ad = $("#after-done").value;
   if (ad !== "none") {
@@ -691,7 +726,7 @@ $("#btn-queue-run").addEventListener("click", async () => {
     if (ad === "shutdown") msg = t("confirm_shutdown");
     else if (ad === "sleep") msg = t("confirm_sleep");
     else msg = t("confirm_command") + $("#after-command").value + t("confirm_tail");
-    if (!(await confirmDialog(msg, { danger: ad === "shutdown" || ad === "sleep" }))) { done(); return; }
+    if (!(await confirmDialog(msg, { danger: ad === "shutdown" || ad === "sleep" }))) { btn.disabled = false; return; }
   }
   try {
     await invoke("send_queue", {
@@ -705,8 +740,10 @@ $("#btn-queue-run").addEventListener("click", async () => {
     persistQueue();
     toast(t("queue_sent"), "ok");
   } catch (e) { toast(String(e), "err"); }
-  done();
-});
+  btn.disabled = false;
+}
+$("#btn-queue-run").addEventListener("click", () => runQueueSend($("#btn-queue-run"), false));
+$("#btn-queue-group-send").addEventListener("click", () => runQueueSend($("#btn-queue-group-send"), true));
 /* 群发（规格 §3.2）：并行对每目标起独立客户端，逐目标进度卡 + 汇总 {ok}/{total} */
 function parseTarget(s2) {
   s2 = s2.trim();
@@ -1525,20 +1562,28 @@ function setupDragDrop() {
     } else if (p.type === "drop") {
       document.body.classList.remove("dragging");
       const paths = p.paths || [];
-      if (paths.length === 1) {
+      // 队列是独立类型页：拖入多文件（或当前就在队列页）时统一进队列并切到队列页，
+      // 不再从文件/文件夹/文本页静默入队。
+      if (paths.length === 1 && sendKind !== "queue") {
         $("#send-path").value = paths[0];
         if (sendKind === "text") {
           $$("#kind-seg .seg-btn").forEach((x) => x.classList.toggle("active", x.dataset.kind === "file"));
           sendKind = "file";
           updateKindRows();
         }
-      } else if (paths.length > 1) {
+      } else if (paths.length > 0) {
+        if (sendKind !== "queue") {
+          $$("#kind-seg .seg-btn").forEach((x) => x.classList.toggle("active", x.dataset.kind === "queue"));
+          sendKind = "queue";
+          updateKindRows();
+        }
         const snap = queueSnapshot();
         for (const f of paths) {
           if (queueItems.length >= 500) { toast(t("queue_full"), "err"); break; }
           queueItems.push({ kind: "file", path: f, snap });
         }
         renderQueue();
+        persistQueue();
       }
     }
   });
