@@ -270,6 +270,13 @@ body::before {
 .recv-card .card-title::before,
 #monitor-card .card-title::before { display: none; }
 
+/* 监控是「类型」的一种：配置区嵌在同一张发送卡内，与普通发送字段互斥显示。 */
+#monitor-card {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .lbl { width: 72px; flex: none; color: var(--text-dim); font-size: 13px; }
 .lbl-s { color: var(--text-dim); font-size: 12px; white-space: nowrap; }

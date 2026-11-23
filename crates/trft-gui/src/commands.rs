@@ -1262,6 +1262,19 @@ pub async fn recv_start(
     update_awake(&app);
     update_discovery_answer(&app);
     let st = app.state::<AppState>();
+    // 接收卡片里的保存目录与设置页共用 save_dir_*：启动成功后写回配置，
+    // 使卡片改动成为该协议的持久化默认目录（此前只在本次启动生效，重启丢失）。
+    {
+        let mut c = st.cfg.lock().expect("配置锁");
+        match proto {
+            Proto::Tcp => c.save_dir_tcp = dir.clone(),
+            Proto::Quic => c.save_dir_quic = dir.clone(),
+            Proto::Rudp => c.save_dir_rudp = dir.clone(),
+            Proto::Udt => c.save_dir_udt = dir.clone(),
+            Proto::Udp => c.save_dir_udp = dir.clone(),
+        }
+    }
+    let _ = st.save_config();
     // 规格 §3.7：首次成功启动服务器展示一次 netsh 放行命令。
     // 按所启协议生成（轮 6 P3-11：此前恒 protocol=TCP——首个启动的是 UDP/UDT
     // 接收器时放行错协议，命令无效）。

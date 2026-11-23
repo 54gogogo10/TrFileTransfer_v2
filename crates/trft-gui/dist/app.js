@@ -27,9 +27,9 @@ const L10N = {
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     batch_add: "批量入队", help_title: "使用说明", help_close: "关闭",
-    help_body: "发送：类型选文件/文件夹/文本，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：多选「批量入队」后串行发送，可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
+    help_body: "发送：类型选文件/文件夹/文本/监控，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：多选「批量入队」后串行发送，可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
-    kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本",
+    kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控",
     path: "路径", text: "文本", browse: "浏览…", target: "目标", pairing: "配对码",
     limit: "KB/s", compress: "压缩", encrypt: "加密",
     passes: "重发轮数 1-5", fec_parity: "FEC 校验片 1-8", nofec: "关闭 FEC",
@@ -107,9 +107,9 @@ const L10N = {
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     batch_add: "Batch enqueue", help_title: "Help", help_close: "Close",
-    help_body: "Send: pick a type (file/folder/text), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: batch-enqueue files and run serially, with an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
+    help_body: "Send: pick a type (file/folder/text/monitor), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: batch-enqueue files and run serially, with an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
-    kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text",
+    kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor",
     path: "Path", text: "Text", browse: "Browse…", target: "Target", pairing: "Pairing",
     limit: "KB/s", compress: "Compress", encrypt: "Encrypt",
     passes: "Passes 1-5", fec_parity: "FEC parity 1-8", nofec: "Disable FEC",
@@ -338,16 +338,30 @@ $$("#tabs .tab").forEach((tab) => {
 function updateKindRows() {
   const isFile = sendKind === "file";
   const isFolder = sendKind === "folder";
+  const isText = sendKind === "text";
+  const isMonitor = sendKind === "monitor";
   const isUdp = $("#send-proto").value === "udp";
-  $("#path-row").classList.toggle("hidden", sendKind === "text");
-  $("#text-row").classList.toggle("hidden", sendKind !== "text");
+
+  // 监控是「类型」的第四种：选中时展示监控卡片、隐藏普通发送字段；
+  // 监控运行中即使切到其他类型也保留卡片（状态/记录可见）。
+  const monitorRunning = $("#dot-monitor").classList.contains("on");
+  $("#monitor-card").classList.toggle("hidden", !(isMonitor || monitorRunning));
+
+  $("#path-row").classList.toggle("hidden", isText || isMonitor);
+  $("#text-row").classList.toggle("hidden", !isText);
   // 规格 §3.1 文件夹模式子选项：0x04 差量同步（默认）与 0x01 整夹发送。
-  $("#folder-opts").classList.toggle("hidden", !(isFolder && !isUdp));
+  $("#folder-opts").classList.toggle("hidden", !(isFolder && !isUdp) || isMonitor);
   // 0x02 并行分块与 UDP 单发都只对单文件有意义（规格 §3.6）。
-  $("#btn-send-chunked").classList.toggle("hidden", !(isFile && !isUdp));
-  $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp));
+  $("#btn-send-chunked").classList.toggle("hidden", !(isFile && !isUdp) || isMonitor);
+  $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp) || isMonitor);
   // 源端口仅连接型协议可绑定（§3.1；UDP 无连接语义，与 CLI --srcport 约束同口径）。
-  $("#send-srcport").classList.toggle("hidden", isUdp);
+  $("#send-srcport").classList.toggle("hidden", isUdp || isMonitor);
+
+  // 监控使用自己卡片里的目标/协议/配对码，隐藏普通发送的对应行与动作行。
+  [$("#send-ip"), $("#send-code"), $("#btn-send"), $("#group-targets")].forEach((el) => {
+    const row = el && el.closest(".row");
+    if (row) row.classList.toggle("hidden", isMonitor);
+  });
 }
 $$("#kind-seg .seg-btn").forEach((b) => {
   b.addEventListener("click", () => {
@@ -468,10 +482,13 @@ function sendRequest(kindOverride) {
   const proto = $("#send-proto").value;
   const kind = kindOverride || sendKind;
   const srcPort = parseInt($("#send-srcport").value, 10);
+  const isText = kind === "text";
   const req = {
     kind: proto === "udp" ? "udpfile" : kind,
-    path: $("#send-path").value.trim() || null,
-    text: $("#send-text").value || null,
+    // 只提交当前选中类型的内容：文本页不带文件路径，文件/文件夹页不带文本，
+    // 避免切换类型后把上一页残留的字段一起发给后端。
+    path: isText ? null : ($("#send-path").value.trim() || null),
+    text: isText ? ($("#send-text").value || null) : null,
     ip: $("#send-ip").value.trim(),
     port: parseInt($("#send-port").value, 10),
     proto,
@@ -1189,7 +1206,12 @@ $$(".recv-card").forEach((card) => {
   });
   card.querySelector(".recv-browse").addEventListener("click", async () => {
     const d = await T.dialog.open({ multiple: false, directory: true });
-    if (d) card.querySelector(".recv-dir").value = d;
+    if (d) {
+      const recv = card.querySelector(".recv-dir");
+      recv.value = d;
+      // 程序赋值不触发 input——手动派发，让设置页/内存配置同步。
+      recv.dispatchEvent(new Event("input", { bubbles: true }));
+    }
   });
 });
 
@@ -1328,6 +1350,10 @@ function fillShareDirOptions() {
   });
 }
 
+const SAVE_DIR_KEYS = {
+  tcp: "save_dir_tcp", quic: "save_dir_quic", rudp: "save_dir_rudp", udt: "save_dir_udt", udp: "save_dir_udp",
+};
+
 function fillSettings() {
   const c = appState.config;
   $("#cfg-code").value = c.pairing_code || "";
@@ -1353,15 +1379,37 @@ function fillSettings() {
   $("#http-port").value = c.http_port;
   $("#version-line").textContent = "v" + appState.version;
   $$(".recv-card").forEach((card) => {
-    const key = {
-      tcp: "save_dir_tcp", quic: "save_dir_quic", rudp: "save_dir_rudp", udt: "save_dir_udt", udp: "save_dir_udp",
-    }[card.dataset.proto];
+    const key = SAVE_DIR_KEYS[card.dataset.proto];
     card.querySelector(".recv-dir").value = c[key] || "";
     card.querySelector(".recv-port").value = {
       tcp: c.server_port_tcp, quic: c.server_port_quic, rudp: c.server_port_rudp, udt: c.server_port_udt, udp: c.server_port_udp,
     }[card.dataset.proto];
   });
 }
+
+/* 接收卡片与设置页共用同一组 save_dir_*：一处编辑，另一处立即跟随；
+   启动接收器时 commands.rs 会把卡片值写回配置（持久化默认目录）。 */
+$$(".recv-card").forEach((card) => {
+  const key = SAVE_DIR_KEYS[card.dataset.proto];
+  const input = card.querySelector(".recv-dir");
+  if (!key || !input) return;
+  input.addEventListener("input", () => {
+    if (appState && appState.config) appState.config[key] = input.value.trim();
+    const cfg = document.querySelector('.cfg-dir[data-key="' + key + '"]');
+    if (cfg) cfg.value = input.value;
+  });
+});
+$$(".cfg-dir").forEach((input) => {
+  input.addEventListener("input", () => {
+    if (appState && appState.config) appState.config[input.dataset.key] = input.value.trim();
+    const proto = (input.dataset.key || "").replace("save_dir_", "");
+    const card = document.querySelector('.recv-card[data-proto="' + proto + '"]');
+    if (card) {
+      const recv = card.querySelector(".recv-dir");
+      if (recv) recv.value = input.value;
+    }
+  });
+});
 
 async function saveSettings() {
   // 提交门：红框字段不再放行（与发送面板同口径）。
@@ -1432,7 +1480,11 @@ $("#btn-gen-code").addEventListener("click", () => {
 $$(".cfg-dir-browse").forEach((btn) => {
   btn.addEventListener("click", async () => {
     const d = await T.dialog.open({ multiple: false, directory: true });
-    if (d) document.querySelector('.cfg-dir[data-key="' + btn.dataset.key + '"]').value = d;
+    if (d) {
+      const inp = document.querySelector('.cfg-dir[data-key="' + btn.dataset.key + '"]');
+      inp.value = d;
+      inp.dispatchEvent(new Event("input", { bubbles: true })); // 同步接收卡片
+    }
   });
 });
 
@@ -1633,6 +1685,7 @@ $("#btn-monitor-start").addEventListener("click", async () => {
     $("#dot-monitor").classList.add("on");
     $("#btn-monitor-start").disabled = true;
     $("#btn-monitor-stop").disabled = false;
+    updateKindRows();
   } catch (e) { toast(String(e), "err"); }
 });
 $("#btn-monitor-stop").addEventListener("click", async () => {
@@ -1645,6 +1698,7 @@ $("#btn-monitor-stop").addEventListener("click", async () => {
   $("#dot-monitor").classList.remove("on");
   $("#btn-monitor-start").disabled = false;
   $("#btn-monitor-stop").disabled = true;
+  updateKindRows();
 });
 
 /* ============ 通用确认模态（B1：替代 window.confirm——风格与接收确认弹窗统一） ============ */
@@ -1791,6 +1845,7 @@ async function wireEvents() {
         $("#dot-monitor").classList.toggle("on", !!on);
         $("#btn-monitor-start").disabled = !!on;
         $("#btn-monitor-stop").disabled = !on;
+        updateKindRows();
       }).catch(() => {});
     } catch (e) { /* 状态重拉失败保旧值 */ }
   });
@@ -2015,6 +2070,7 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
     $("#dot-monitor").classList.toggle("on", !!on);
     $("#btn-monitor-start").disabled = !!on;
     $("#btn-monitor-stop").disabled = !on;
+    updateKindRows();
   }).catch(() => {});
   if (appState.config.qr_address) $("#qr-address").value = appState.config.qr_address;
   refreshQr();

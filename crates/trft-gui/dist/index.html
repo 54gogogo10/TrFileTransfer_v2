@@ -45,8 +45,39 @@
             <button class="seg-btn active" data-kind="file" data-i18n="kind_file">文件</button>
             <button class="seg-btn" data-kind="folder" data-i18n="kind_folder">文件夹</button>
             <button class="seg-btn" data-kind="text" data-i18n="kind_text">文本</button>
+            <button class="seg-btn" data-kind="monitor" data-i18n="kind_monitor">监控</button>
           </div>
         </div>
+        <div id="monitor-card" class="hidden">
+        <div class="card-title">
+          <span data-i18n="monitor">监控模式</span>
+          <span class="dot" id="dot-monitor"></span>
+          <span class="grow"></span>
+          <button id="btn-monitor-start" class="btn small primary" data-i18n="monitor_start">启动监控</button>
+          <button id="btn-monitor-stop" class="btn small" data-i18n="monitor_stop">停止监控</button>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="monitor_dir">监控目录</label>
+          <input type="text" id="monitor-dir" class="grow mono" placeholder="C:\drop" />
+          <button id="btn-monitor-browse" class="btn" data-i18n="browse">浏览…</button>
+        </div>
+        <div class="row">
+          <label class="lbl" data-i18n="target">目标</label>
+          <input type="text" id="monitor-ip" class="mono" placeholder="192.168.1.20" />
+          <span class="colon">:</span>
+          <input type="text" id="monitor-port" class="mono w80" value="8080" />
+          <select id="monitor-proto">
+            <option value="tcp">TCP</option>
+            <option value="quic">QUIC</option>
+            <option value="rudp">RUDP</option>
+            <option value="udt">UDT</option>
+            <option value="udp">UDP (单向)</option>
+          </select>
+          <input type="text" id="monitor-code" class="mono w120" data-i18n-ph="code_ph_send" placeholder="对端配对码" />
+        </div>
+        <div class="row"><span class="hint" data-i18n="monitor_hint">目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。</span></div>
+        <ul id="monitor-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
+      </div>
         <div class="row" id="path-row">
           <label class="lbl" data-i18n="path">路径</label>
           <input type="text" id="send-path" class="grow mono" placeholder="C:\path\to\file" />
@@ -109,36 +140,6 @@
         </div>
       </div>
 
-      <div class="card" id="monitor-card">
-        <div class="card-title">
-          <span data-i18n="monitor">监控模式</span>
-          <span class="dot" id="dot-monitor"></span>
-          <span class="grow"></span>
-          <button id="btn-monitor-start" class="btn small primary" data-i18n="monitor_start">启动监控</button>
-          <button id="btn-monitor-stop" class="btn small" data-i18n="monitor_stop">停止监控</button>
-        </div>
-        <div class="row">
-          <label class="lbl" data-i18n="monitor_dir">监控目录</label>
-          <input type="text" id="monitor-dir" class="grow mono" placeholder="C:\drop" />
-          <button id="btn-monitor-browse" class="btn" data-i18n="browse">浏览…</button>
-        </div>
-        <div class="row">
-          <label class="lbl" data-i18n="target">目标</label>
-          <input type="text" id="monitor-ip" class="mono" placeholder="192.168.1.20" />
-          <span class="colon">:</span>
-          <input type="text" id="monitor-port" class="mono w80" value="8080" />
-          <select id="monitor-proto">
-            <option value="tcp">TCP</option>
-            <option value="quic">QUIC</option>
-            <option value="rudp">RUDP</option>
-            <option value="udt">UDT</option>
-            <option value="udp">UDP (单向)</option>
-          </select>
-          <input type="text" id="monitor-code" class="mono w120" data-i18n-ph="code_ph_send" placeholder="对端配对码" />
-        </div>
-        <div class="row"><span class="hint" data-i18n="monitor_hint">目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。</span></div>
-        <ul id="monitor-list" class="list"><li class="empty" data-i18n="none">暂无记录</li></ul>
-      </div>
 
       <div class="card" id="queue-card">
         <div class="card-title">
