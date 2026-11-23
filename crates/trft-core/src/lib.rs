@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod devices;
 pub mod discovery;
 pub mod error;
+pub mod extext;
 pub mod fec;
 pub mod hash;
 pub mod hashcache;

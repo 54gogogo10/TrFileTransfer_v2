@@ -51,6 +51,9 @@ pub struct SendOptions {
     pub progress: Option<crate::progress::Reporter>,
     /// 传输统计（M5'：成功完成记账；None = 不记）。
     pub stats: Option<std::sync::Arc<crate::stats::StatsLog>>,
+    /// 文件夹/同步发送时排除的扩展名（已归一化：小写、不带点；见 `crate::extext`）。
+    /// 只影响清单构建（0x01 / 0x04 / C# 方言），单文件与文本发送忽略。
+    pub exclude_exts: Vec<String>,
 }
 
 impl Default for SendOptions {
@@ -66,6 +69,7 @@ impl Default for SendOptions {
             allow_legacy_pair: false,
             progress: None,
             stats: None,
+            exclude_exts: Vec::new(),
         }
     }
 }

@@ -334,36 +334,6 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
     Ok(())
 }
 
-/// 扩展名归一化（配置/UI 共用）：去空白与前导点、转小写、丢空项与重复项。
-/// 例：`[" .TMP ", "log", ""]` → `["tmp", "log"]`。
-pub fn normalize_exts(raw: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for item in raw {
-        let e = item.trim().trim_start_matches('.').to_ascii_lowercase();
-        if e.is_empty() || e.contains(['/', '\\', ' ']) {
-            continue; // 误填路径/空白的项直接忽略，不让它变成永远不命中的规则
-        }
-        if !out.contains(&e) {
-            out.push(e);
-        }
-    }
-    out
-}
-
-/// 是否命中监控排除扩展名（大小写不敏感；无扩展名的文件不排除）。
-fn ext_excluded(name: &str, exclude_exts: &[String]) -> bool {
-    if exclude_exts.is_empty() {
-        return false;
-    }
-    match Path::new(name).extension().and_then(|e| e.to_str()) {
-        Some(ext) => {
-            let ext = ext.to_ascii_lowercase();
-            exclude_exts.iter().any(|x| x.eq_ignore_ascii_case(&ext))
-        }
-        None => false,
-    }
-}
-
 /// 顶层文件扫描（跳过子目录 / 「已发送文件」/ 摘要缓存元数据 / 配置排除的扩展名；
 /// 排序确定性）。
 fn scan_dir(dir: &Path, exclude_exts: &[String]) -> Vec<PathBuf> {
@@ -380,7 +350,7 @@ fn scan_dir(dir: &Path, exclude_exts: &[String]) -> Vec<PathBuf> {
             p.is_file()
                 && p != sent
                 && !crate::hashcache::is_transient_name(&name)
-                && !ext_excluded(&name, exclude_exts)
+                && !crate::extext::ext_excluded(&name, exclude_exts)
         })
         .map(|e| e.path())
         .collect();
@@ -496,7 +466,7 @@ mod tests {
         std::fs::write(dir.path().join("drop.LOG"), b"x").unwrap();
         std::fs::write(dir.path().join("noext"), b"x").unwrap();
 
-        let exts = normalize_exts(&[
+        let exts = crate::extext::normalize_exts(&[
             " .TMP ".to_string(),
             "log".to_string(),
             "".to_string(),

@@ -912,7 +912,7 @@ pub async fn send_folder_resume(
         .and_then(|n| n.to_str())
         .ok_or_else(|| config_err("目录名不是合法 UTF-8"))?;
     let root_name = sanitize_name(raw)?;
-    let files = collect_files(root)?;
+    let files = collect_files(root, &opts.exclude_exts)?;
     if files.len() > MAX_MANIFEST_FILES {
         // 轮 4 P3-6：客户端/服务端上限不一致（1,000,000 vs 100,000）——
         // 合法大目录整单被拒且无降级，预检给出可读错误。

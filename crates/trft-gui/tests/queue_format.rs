@@ -22,19 +22,37 @@ fn full_item() -> QueueItem {
         fec_parity: Some(4),
         nofec: Some(true),
         src_port: Some(50000),
+        exclude_exts: Some(vec!["tmp".into(), "log".into()]),
     }
 }
 
 #[test]
-fn round_trip_full_thirteen_fields() {
+fn round_trip_full_fourteen_fields() {
     let item = full_item();
     let text = queue_items_to_text(std::slice::from_ref(&item));
-    assert_eq!(text.matches('|').count(), 12, "13 字段 = 12 个分隔符");
+    assert_eq!(text.matches('|').count(), 13, "14 字段 = 13 个分隔符");
     assert!(text.ends_with('\n'));
     let parsed = parse_queue_text(&text);
     assert_eq!(parsed.len(), 1);
+    assert_eq!(
+        parsed[0]["excludeExts"],
+        serde_json::json!(["tmp", "log"]),
+        "排除扩展名按数组形状回给前端"
+    );
     let back: QueueItem = serde_json::from_value(parsed[0].clone()).unwrap();
-    assert_eq!(back, item, "13 字段全量 round-trip 必须逐字段保真");
+    assert_eq!(back, item, "14 字段全量 round-trip 必须逐字段保真");
+}
+
+#[test]
+fn thirteen_field_lines_still_parse() {
+    // 旧 13 字段行（无排除扩展名）：解析不得失败，excludeExts 缺省为空。
+    let line = "folder|D:\\lib|10.0.0.2|9000|tcp|||1|0|2|2|0|50000\n";
+    let v = parse_queue_text(line);
+    assert_eq!(v.len(), 1);
+    assert!(v[0].get("excludeExts").is_none(), "13 字段档不得伪造 excludeExts");
+    let it: QueueItem = serde_json::from_value(v[0].clone()).unwrap();
+    assert_eq!(it.exclude_exts, None);
+    assert_eq!(it.src_port, Some(50000));
 }
 
 #[test]

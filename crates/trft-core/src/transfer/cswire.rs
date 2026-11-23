@@ -3211,7 +3211,7 @@ pub async fn cs_send_folder<S: AsyncRead + AsyncWrite + Unpin>(
     let folder = crate::protocol::frame::sanitize_name(raw)?;
     // 递归清单（确定性排序）。
     let mut files: Vec<PathBuf> = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, exts: &[String], out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return;
         };
@@ -3219,19 +3219,25 @@ pub async fn cs_send_folder<S: AsyncRead + AsyncWrite + Unpin>(
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
+            let fname = e.file_name();
+            let name = fname.to_string_lossy();
             // 本地缓存产物与半成品不是要发送的内容（v2 帧 collect_files 同口径——
             // 否则 0x04 二轮起把 .trft-hash-cache.txt 当文件传给对端）。
-            if crate::hashcache::is_transient_name(&e.file_name().to_string_lossy()) {
+            if crate::hashcache::is_transient_name(&name) {
+                continue;
+            }
+            // 用户配置的排除扩展名（与 v2 帧 collect_files 同口径）。
+            if crate::extext::ext_excluded(&name, exts) {
                 continue;
             }
             if p.is_dir() {
-                walk(&p, out);
+                walk(&p, exts, out);
             } else if p.is_file() {
                 out.push(p);
             }
         }
     }
-    walk(path, &mut files);
+    walk(path, &opts.exclude_exts, &mut files);
     if files.is_empty() {
         return Err(crate::error::config_err("目录为空（C# 0x01 要求 fileCount ≥ 1）"));
     }
@@ -3863,6 +3869,7 @@ pub(crate) struct CsSyncEntry {
 /// 同 §7.31：秒粒度同秒同长改写 = 漏改）。
 pub(crate) async fn build_sync_manifest(
     path: &Path,
+    exclude_exts: &[String],
     client_cache: Option<&std::sync::Arc<tokio::sync::Mutex<crate::hashcache::HashCache>>>,
 ) -> Result<CsSyncManifest> {
     let raw = path
@@ -3872,7 +3879,7 @@ pub(crate) async fn build_sync_manifest(
     let folder = crate::protocol::frame::sanitize_name(raw)?;
     // 递归清单（确定性排序，与 cs_send_folder 同款）。
     let mut files: Vec<PathBuf> = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, exts: &[String], out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return;
         };
@@ -3880,19 +3887,25 @@ pub(crate) async fn build_sync_manifest(
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
+            let fname = e.file_name();
+            let name = fname.to_string_lossy();
             // 本地缓存产物与半成品不是要发送的内容（v2 帧 collect_files 同口径——
             // 否则 0x04 二轮起把 .trft-hash-cache.txt 当文件传给对端）。
-            if crate::hashcache::is_transient_name(&e.file_name().to_string_lossy()) {
+            if crate::hashcache::is_transient_name(&name) {
+                continue;
+            }
+            // 用户配置的排除扩展名（与 v2 帧 collect_files 同口径）。
+            if crate::extext::ext_excluded(&name, exts) {
                 continue;
             }
             if p.is_dir() {
-                walk(&p, out);
+                walk(&p, exts, out);
             } else if p.is_file() {
                 out.push(p);
             }
         }
     }
-    walk(path, &mut files);
+    walk(path, exclude_exts, &mut files);
     if files.is_empty() {
         return Err(crate::error::config_err("目录为空（0x04 要求 fileCount >= 1）"));
     }
@@ -4148,7 +4161,7 @@ pub async fn send_folder_sync_cs(
     let res = async {
         // 清单（全文件哈希）在**建连前**构建——C# BuildFolderManifest 同款：
         // 大目录建连后现算哈希会撞服务端 30s 收超时。
-        let manifest = build_sync_manifest(path, client_cache).await?;
+        let manifest = build_sync_manifest(path, &opts.exclude_exts, client_cache).await?;
         // 0x01 能力位（逐文件跳过清单）随认证栈协商。
         let (mut wire, caps) = cs_connect_stack_full(addr, opts, 0x01).await?;
         folder_sync_cs_after_connect(
@@ -4178,7 +4191,7 @@ pub async fn send_folder_sync_cs_tcp(
         .unwrap_or("folder")
         .to_string();
     let res = async {
-        let manifest = build_sync_manifest(path, client_cache).await?;
+        let manifest = build_sync_manifest(path, &opts.exclude_exts, client_cache).await?;
         let (mut wire, caps) = cs_connect_tcp_full(addr, opts, 0x01).await?;
         folder_sync_cs_after_connect(
             &mut wire, addr, path, &manifest, caps, opts, started, &name,

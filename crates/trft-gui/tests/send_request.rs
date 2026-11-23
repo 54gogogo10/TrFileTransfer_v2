@@ -76,6 +76,7 @@ fn display_name_three_shapes() {
         limit: None,
         chunks: None,
         src_port: None,
+        exclude_exts: Vec::new(),
         nocompress: false,
         noencrypt: false,
         passes: None,

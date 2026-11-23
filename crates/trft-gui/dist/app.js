@@ -27,11 +27,12 @@ const L10N = {
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     help_title: "使用说明", help_close: "关闭",
-    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动；支持定时与周期性自动校验。\n监控：类型选「监控」，设置目录与目标，文件就绪即自动发出；可填排除扩展名（如 .tmp,.log）。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
+    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。「排除扩展名」对整夹/同步/队列里的文件夹项生效。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动；支持定时与周期性自动校验。\n监控：类型选「监控」，设置目录与目标，文件就绪即自动发出；可填排除扩展名（如 .tmp,.log）。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
     kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控", kind_queue: "队列",
     queue_add_files: "添加文件…", queue_add_folder: "添加文件夹…", queue_hint: "文件与文件夹可混合入队，按顺序逐项发送",
     queue_group_send: "群发队列",
+    send_exclude: "排除扩展名",
     path: "路径", text: "文本", browse: "浏览…", target: "目标", pairing: "配对码",
     limit: "KB/s", compress: "压缩", encrypt: "加密",
     passes: "重发轮数 1-5", fec_parity: "FEC 校验片 1-8", nofec: "关闭 FEC",
@@ -117,11 +118,12 @@ const L10N = {
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     help_title: "Help", help_close: "Close",
-    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes received files to detect tampering; supports scheduled and recurring checks.\nMonitor: pick the Monitor type, set the folder and target; ready files are sent automatically (list extensions to skip, e.g. .tmp,.log).\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
+    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups. Skip-extensions applies to folder sends, sync and folder items in the queue.\nVerify: the Verify tab re-hashes received files to detect tampering; supports scheduled and recurring checks.\nMonitor: pick the Monitor type, set the folder and target; ready files are sent automatically (list extensions to skip, e.g. .tmp,.log).\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
     kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor", kind_queue: "Queue",
     queue_add_files: "Add files…", queue_add_folder: "Add folder…", queue_hint: "Files and folders can be mixed; sent one by one in order",
     queue_group_send: "Group queue",
+    send_exclude: "Skip extensions",
     path: "Path", text: "Text", browse: "Browse…", target: "Target", pairing: "Pairing",
     limit: "KB/s", compress: "Compress", encrypt: "Encrypt",
     passes: "Passes 1-5", fec_parity: "FEC parity 1-8", nofec: "Disable FEC",
@@ -375,6 +377,8 @@ function updateKindRows() {
   $("#text-row").classList.toggle("hidden", !isText);
   // 规格 §3.1 文件夹模式子选项：0x04 差量同步（默认）与 0x01 整夹发送。
   $("#folder-opts").classList.toggle("hidden", !(isFolder && !isUdp) || isMonitor || isQueue);
+  // 排除扩展名只对文件夹/同步发送有意义（单文件与文本不产生清单）。
+  $("#folder-exclude-row").classList.toggle("hidden", !(isFolder && !isUdp) || isMonitor || isQueue);
   // 0x02 并行分块与 UDP 单发都只对单文件有意义（规格 §3.6）。
   $("#btn-send-chunked").classList.toggle("hidden", !(isFile && !isUdp) || isMonitor || isQueue);
   $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp) || isMonitor || isQueue);
@@ -513,6 +517,14 @@ function wireValidation() {
   revalidateFields();
 }
 
+/* 排除扩展名输入：逗号/分号/空白分隔都接受；后端再做一次归一化（去点/小写/去重）。 */
+function parseExts(str) {
+  return String(str || "")
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function sendRequest(kindOverride) {
   const proto = $("#send-proto").value;
   const kind = kindOverride || sendKind;
@@ -537,6 +549,10 @@ function sendRequest(kindOverride) {
     fecParity: parseInt($("#send-parity").value, 10) || null,
     nofec: $("#send-nofec").checked,
     pin: null,
+    // 文件夹/同步发送的排除扩展名。**始终带上**：拖放的目录按 "file" 入队后由后端
+    // 自动路由成整夹发送（前端拿不到 is_dir），此处按 kind 过滤会静默丢掉排除项；
+    // 纯单文件/文本发送时该字段被后端忽略（只有文件夹 walker 读它）。
+    excludeExts: parseExts($("#send-exclude").value),
   };
   // 安全轮 P1-1 缓解：TCP/UDT（C# 方言）+ 配对码 = 未加盐码哈希上线（C# 互锁
   // 协议固有约束，线格式不可改）——按会话一次告警，指引加长配对码或换槽位。
@@ -573,6 +589,7 @@ function persistSendMemory() {
   const port = parseInt($("#send-port").value, 10);
   appState.config.client_port = port >= 1 && port <= 65535 ? port : null;
   appState.config.client_proto = $("#send-proto").value;
+  appState.config.folder_exclude_exts = parseExts($("#send-exclude").value);
   invoke("save_config", { config: appState.config }).catch(() => { /* 记忆失败不打扰 */ });
 }
 
@@ -634,7 +651,7 @@ function persistQueue() {
     ? { kind: q.kind, path: q.path, ip: q.snap.ip, port: q.snap.port, proto: q.snap.proto,
         code: q.snap.code, limit: q.snap.limit, nocompress: q.snap.nocompress, noencrypt: q.snap.noencrypt,
         passes: q.snap.passes, fecParity: q.snap.fecParity, nofec: q.snap.nofec,
-        srcPort: q.snap.srcPort || null }
+        srcPort: q.snap.srcPort || null, excludeExts: q.snap.excludeExts || [] }
     : { kind: q.kind, path: q.path });
   invoke("queue_save", { items }).catch((e) => toast(t("send_fail") + ": " + e, "err"));
 }
@@ -652,6 +669,7 @@ function queueSnapshot() {
     fecParity: parseInt($("#send-parity").value, 10) || null,
     nofec: $("#send-nofec").checked,
     srcPort: sp >= 1 && sp <= 65535 ? sp : null,
+    excludeExts: parseExts($("#send-exclude").value),
   };
 }
 // 入队即快照面板参数（规格 §3.2「逐项快照面板参数」——入队后改面板
@@ -697,6 +715,7 @@ function queueReqFor(item, sp, target) {
     chunks: null, nocompress: sp.nocompress, noencrypt: sp.noencrypt,
     passes: sp.passes, fecParity: sp.fecParity, nofec: !!sp.nofec, pin: null,
     srcPort: sp.srcPort || null,
+    excludeExts: sp.excludeExts || [],
   };
 }
 
@@ -1060,6 +1079,7 @@ async function startTask(entry) {
       folder: req.path, ip: req.ip, port: req.port, proto: req.proto,
       code: req.code, limit: req.limit, nocompress: req.nocompress,
       srcPort: req.srcPort || null,
+      excludeExts: req.excludeExts || [],
     });
   } else if (kind === "chunked") {
     id = await invoke("send_chunked_start", { req });
@@ -1609,6 +1629,7 @@ function fillSettings() {
   $("#cfg-duplicate").value = c.duplicate_files === "Skip" ? "skip" : "rename";
   $("#cfg-cache-days").value = c.hash_cache_days;
   $("#monitor-exclude").value = (c.monitor_exclude_exts || []).join(", ");
+  $("#send-exclude").value = (c.folder_exclude_exts || []).join(", ");
   $("#cfg-confirm").value = (c.confirm_receive || "Off").toLowerCase();
   $("#cfg-per-device").checked = !!c.per_device_folder;
   $("#cfg-archive").checked = !!c.auto_archive;

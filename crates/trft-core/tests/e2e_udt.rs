@@ -113,6 +113,37 @@ async fn udt_pairing_required_and_wrong_code_rejected() {
     );
 }
 
+/// 判别（2026-11-23）：C# 方言 0x01 的清单构建同样吃排除扩展名（与 v2 帧
+/// `collect_files` 同口径；两套 walker 各自独立，防止只修一边）。
+#[tokio::test]
+async fn udt_folder_send_excludes_configured_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let (sock, addr) = ephemeral_udp().await;
+    let server = tokio::spawn(serve_udt_on(sock, opts(out.clone(), None, 1)));
+
+    let root = dir.path().join("lib");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    random_file(&root, "keep.bin", 1024);
+    random_file(&root, "drop.tmp", 512);
+    random_file(&root.join("sub"), "drop.LOG", 512);
+    let mut o = udt_opts();
+    o.exclude_exts = trft_core::extext::normalize_exts(&["tmp".into(), ".log".into()]);
+    trft_core::transfer::folder::send_folder_auto(addr, &root, &o)
+        .await
+        .unwrap();
+    wait_server(server).await;
+
+    let base = out.join("lib");
+    assert!(base.join("keep.bin").exists(), "未命中的文件照常发送");
+    assert!(!base.join("drop.tmp").exists(), "C# 0x01 清单必须排除 .tmp");
+    assert!(
+        !base.join("sub").join("drop.LOG").exists(),
+        "子目录 .LOG 必须排除（大小写不敏感）"
+    );
+    common::assert_no_leftovers(&out);
+}
+
 #[tokio::test]
 async fn udt_text_and_folder() {
     let dir = tempfile::tempdir().unwrap();

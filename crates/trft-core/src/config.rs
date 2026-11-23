@@ -110,6 +110,9 @@ pub struct Config {
     /// 监控模式排除的扩展名（小写、不带点；空 = 不排除）。跨重启持久化，
     /// 扫描时命中即不入队（TECH-STACK §7.66）。
     pub monitor_exclude_exts: Vec<String>,
+    /// 发送面板「排除扩展名」（文件夹/同步/队列内文件夹项；面板记忆，
+    /// 发送时再归一化一次）。空 = 不排除（TECH-STACK §7.67）。
+    pub folder_exclude_exts: Vec<String>,
 }
 
 impl Default for Config {
@@ -158,6 +161,7 @@ impl Default for Config {
             last_path: None,
             auto_update_check: true,
             monitor_exclude_exts: Vec::new(),
+            folder_exclude_exts: Vec::new(),
         }
     }
 }

@@ -97,6 +97,9 @@ enum Cmd {
         /// 无法区分旧版对端与伪装的中间人）
         #[arg(long = "allow-legacy-pair")]
         allow_legacy_pair: bool,
+        /// 发送文件夹时排除的扩展名（逗号分隔或重复给出，如 --exclude-exts tmp,log）
+        #[arg(long = "exclude-exts", value_delimiter = ',')]
+        exclude_exts: Vec<String>,
     },
     /// 无人值守接收
     Recv {
@@ -139,6 +142,9 @@ enum Cmd {
         /// 显式放行旧版对端的明文配对（默认拒绝）
         #[arg(long = "allow-legacy-pair")]
         allow_legacy_pair: bool,
+        /// 同步时排除的扩展名（逗号分隔或重复给出，如 --exclude-exts tmp,log）
+        #[arg(long = "exclude-exts", value_delimiter = ',')]
+        exclude_exts: Vec<String>,
     },
     /// 文件库校验（重算 SHA-256；发现不一致退出码 1）
     Verify {
@@ -216,6 +222,7 @@ fn stream_opts(
     compress: bool,
     pin: Option<[u8; 32]>,
     allow_legacy_pair: bool,
+    exclude_exts: Vec<String>,
 ) -> SendOptions {
     SendOptions {
         pairing_code: code,
@@ -226,6 +233,7 @@ fn stream_opts(
         compress,
         quic_pin: pin,
         allow_legacy_pair,
+        exclude_exts,
         progress: None,
         // 规格 §3.3 stats.log：CLI 与 GUI 共享同一统计（TECH-STACK §7.10）。
         stats: Some(std::sync::Arc::new(
@@ -313,6 +321,7 @@ async fn run() -> i32 {
             nocompress,
             quic_pin,
             allow_legacy_pair,
+            exclude_exts,
         } => {
             if let Err(e) = validate_code(&code) {
                 return usage_fail(&e);
@@ -401,6 +410,7 @@ async fn run() -> i32 {
                 !nocompress,
                 pin,
                 allow_legacy_pair,
+                trft_core::extext::normalize_exts(&exclude_exts),
             );
             let r = match (folder, file, text) {
                 // 规格 §3.2 AutoRetry：文件夹 0x01 失败转 0x04 差量续传（轮 6 P2-5）。
@@ -543,6 +553,7 @@ async fn run() -> i32 {
             nocompress,
             quic_pin,
             allow_legacy_pair,
+            exclude_exts,
         } => {
             if proto == Proto::Udp {
                 return usage_fail("单向 UDP 不支持文件夹传输（仅单文件，规格 §3.6）");
@@ -566,6 +577,7 @@ async fn run() -> i32 {
                     Ok(p) => p,
                     Err(e) => return usage_fail(&e),
                 },
+                exclude_exts: trft_core::extext::normalize_exts(&exclude_exts),
                 // CLI 与 GUI 同享 stats.log（TECH-STACK §7.10；轮 5 P2：sync 此前漏注）。
                 stats: Some(std::sync::Arc::new(
                     trft_core::stats::StatsLog::default_log(),

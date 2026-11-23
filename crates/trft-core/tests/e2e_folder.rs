@@ -63,6 +63,51 @@ async fn folder_roundtrip_nested_and_root_conflict() {
     assert!(out.join("proj_1").join("docs").join("说明.txt").exists());
 }
 
+/// 判别（2026-11-23）：文件夹发送的排除扩展名——命中的文件既不进清单也不传输；
+/// 顶层与子目录同口径（大小写不敏感、无扩展名文件不受影响）。
+#[tokio::test]
+async fn folder_send_excludes_configured_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("lib");
+    make_file(&src.join("keep.bin"), 2048);
+    make_file(&src.join("drop.tmp"), 1024);
+    make_file(&src.join("sub").join("drop.LOG"), 1024);
+    make_file(&src.join("sub").join("noext"), 16);
+    let out = dir.path().join("out");
+
+    let (listener, addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(listener, opts(out.clone(), None, 1)));
+    let o = SendOptions {
+        exclude_exts: trft_core::extext::normalize_exts(&[
+            " .TMP ".into(),
+            "log".into(),
+            "tmp".into(),
+        ]),
+        ..Default::default()
+    };
+    send_folder(addr, &src, &o).await.unwrap();
+    timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let base = out.join("lib");
+    assert!(
+        base.join("keep.bin").exists(),
+        "未命中排除项的文件必须照常发送"
+    );
+    assert!(
+        base.join("sub").join("noext").exists(),
+        "无扩展名文件不受影响"
+    );
+    assert!(!base.join("drop.tmp").exists(), "顶层 .tmp 必须被排除");
+    assert!(
+        !base.join("sub").join("drop.LOG").exists(),
+        "子目录 .LOG 必须被排除（大小写不敏感）"
+    );
+}
+
 #[tokio::test]
 async fn folder_skip_drops_identical_copy() {
     let dir = tempfile::tempdir().unwrap();

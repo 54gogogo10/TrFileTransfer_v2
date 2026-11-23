@@ -22,8 +22,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// 递归收集文件清单（相对路径用 '/' 分隔，跳过符号链接防环；排序保证确定性；
 /// 发送端即做接收端同款净化预检，避免中途失败）。
-pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
-    fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+/// `exclude_exts` 为已归一化的扩展名（`crate::extext`）：命中的文件既不进清单、
+/// 也不传输（发送端单侧过滤——接收端按清单落盘，本来就看不到它们的名字）。
+pub fn collect_files(root: &Path, exclude_exts: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    fn walk(
+        dir: &Path,
+        rel: &str,
+        exclude_exts: &[String],
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> Result<()> {
         for e in std::fs::read_dir(dir)? {
             let e = e?;
             let p = e.path();
@@ -31,6 +38,10 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             // 缓存族 + 半成品（.trft-part/.trft-resume）是内部产物而非内容——
             // 与 verify 同口径整类排除，避免把残件当文件传给对端。
             if crate::hashcache::is_transient_name(&name) {
+                continue;
+            }
+            // 用户配置的排除扩展名（整夹/同步发送共用一套口径）。
+            if crate::extext::ext_excluded(&name, exclude_exts) {
                 continue;
             }
             let child_rel = if rel.is_empty() {
@@ -43,7 +54,7 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
                 continue; // 防环：符号链接不入清单（规格 §11 非目标）
             }
             if md.is_dir() {
-                walk(&p, &child_rel, out)?;
+                walk(&p, &child_rel, exclude_exts, out)?;
             } else if md.is_file() {
                 out.push((child_rel, p));
             }
@@ -51,7 +62,7 @@ pub fn collect_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
         Ok(())
     }
     let mut out = Vec::new();
-    walk(root, "", &mut out)?;
+    walk(root, "", exclude_exts, &mut out)?;
     out.sort();
     for (rel, _) in &out {
         sanitize_rel(rel).map_err(|e| config_err(format!("清单项不可发送: {e}")))?;
@@ -145,7 +156,7 @@ async fn send_folder_inner(
         .and_then(|n| n.to_str())
         .ok_or_else(|| config_err("目录名不是合法 UTF-8"))?;
     let root_name = sanitize_name(raw)?;
-    let files = collect_files(root)?;
+    let files = collect_files(root, &opts.exclude_exts)?;
     // 进度总量 = 清单逐文件 stat 汇总（0x01 清单流式发送，总量先知）。
     if let Some(r) = &opts.progress {
         let mut total = 0u64;

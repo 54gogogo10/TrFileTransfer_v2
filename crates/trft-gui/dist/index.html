@@ -148,6 +148,10 @@
           </select>
           <span class="hint" data-i18n="sync_hint">按 (源路径, 目标地址) 派生稳定会话 ID，与 CLI sync 互相接力</span>
         </div>
+        <div class="row hidden" id="folder-exclude-row">
+          <label class="lbl" data-i18n="send_exclude">排除扩展名</label>
+          <input type="text" id="send-exclude" class="grow mono" placeholder=".tmp, .log" />
+        </div>
         <div class="row hidden" id="udp-opts">
           <label class="lbl-s" data-i18n="passes">重发轮数 1-5</label>
           <input type="text" id="send-passes" class="mono w60" placeholder="2" />

@@ -227,6 +227,9 @@ pub struct SendRequest {
     /// 源端口可选绑定（规格 §3.1/§12.1 SrcPort；CLI --srcport 同源）。
     /// UDP 单向不走此字段（无连接语义，前端对该协议隐藏输入）。
     pub src_port: Option<u16>,
+    /// 发送文件夹/同步时排除的扩展名（前端拼接；单文件与文本忽略）。
+    #[serde(default)]
+    pub exclude_exts: Vec<String>,
 }
 
 impl SendRequest {
@@ -288,6 +291,7 @@ impl SendRequest {
             allow_legacy_pair: false,
             progress: reporter,
             stats,
+            exclude_exts: trft_core::extext::normalize_exts(&self.exclude_exts),
         })
     }
 }
@@ -792,6 +796,7 @@ pub async fn sync_start(
     limit: Option<u64>,
     nocompress: bool,
     src_port: Option<u16>,
+    exclude_exts: Option<Vec<String>>,
 ) -> Result<u64, String> {
     if proto == Proto::Udp {
         return Err("单向 UDP 不支持文件夹同步（仅单文件，规格 §3.6）".into());
@@ -830,6 +835,7 @@ pub async fn sync_start(
         compress: !nocompress,
         progress: Some(reporter),
         stats: Some(app.state::<AppState>().stats.clone()),
+        exclude_exts: trft_core::extext::normalize_exts(&exclude_exts.unwrap_or_default()),
         ..Default::default()
     };
     // 稳定会话 ID：与 CLI sync 互相接力（规格 §3.2）。
@@ -1970,7 +1976,7 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
         }
     });
 
-    let exclude_exts = trft_core::monitor::normalize_exts(&req.exclude_exts);
+    let exclude_exts = trft_core::extext::normalize_exts(&req.exclude_exts);
     {
         // 排除项属于设置项：启动即落盘（用户不必再进设置页手动保存）。
         let st = app.state::<AppState>();
@@ -2323,6 +2329,8 @@ pub struct QueueItem {
     pub nofec: Option<bool>,
     // 源端口（§3.1 可选绑定；第 13 字段，旧格式行缺省 = 不绑定）。
     pub src_port: Option<u16>,
+    // 文件夹排除扩展名快照（第 14 字段，逗号分隔；旧格式行缺省 = 执行时用当前配置）。
+    pub exclude_exts: Option<Vec<String>>,
 }
 
 fn queue_path() -> PathBuf {
@@ -2330,7 +2338,8 @@ fn queue_path() -> PathBuf {
 }
 
 /// 队列项 → 行格式文本（纯函数，`queue_save` 委托；`|` 分隔，含分隔符的字段整行跳过）。
-/// 行格式分档：`kind|path` ＋ ≥9 快照 ＋ ≥12 UDP 专属 ＋ ≥13 源端口（旧格式行兼容回读）。
+/// 行格式分档：`kind|path` ＋ ≥9 快照 ＋ ≥12 UDP 专属 ＋ ≥13 源端口 ＋ ≥14 排除扩展名
+/// （旧格式行兼容回读；第 14 字段为空 = 执行时回落当前面板/配置）。
 pub fn queue_items_to_text(items: &[QueueItem]) -> String {
     let mut out = String::new();
     for it in items {
@@ -2343,7 +2352,7 @@ pub fn queue_items_to_text(items: &[QueueItem]) -> String {
             continue; // 快照字段同样不得含分隔符
         }
         out.push_str(&format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}
 ",
             it.kind,
             it.path,
@@ -2362,6 +2371,10 @@ pub fn queue_items_to_text(items: &[QueueItem]) -> String {
             it.fec_parity.map(|n| n.to_string()).unwrap_or_default(),
             it.nofec.map(|b| if b { "1" } else { "0" }).unwrap_or(""),
             it.src_port.map(|n| n.to_string()).unwrap_or_default(),
+            it.exclude_exts
+                .as_ref()
+                .map(|v| v.join(","))
+                .unwrap_or_default(),
         ));
     }
     out
@@ -2412,6 +2425,15 @@ pub fn parse_queue_text(text: &str) -> Vec<serde_json::Value> {
             // ≥13 字段：源端口（§3.1 可选绑定）。
             if f.len() >= 13 {
                 v["srcPort"] = serde_json::json!(f[12].parse::<u16>().ok());
+            }
+            // ≥14 字段：文件夹排除扩展名（逗号分隔；空 = 未快照）。
+            if f.len() >= 14 && !f[13].is_empty() {
+                let exts: Vec<String> = f[13]
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                v["excludeExts"] = serde_json::json!(exts);
             }
             Some(v)
         })
