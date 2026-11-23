@@ -1383,6 +1383,36 @@ fn sync_hash_of(
     h
 }
 
+/// 记录某路径当前 (size, mtime) 的完整摘要（C# `FileHashes.Store` 同义：写完/校验完
+/// 才登记，键取登记时刻的磁盘事实——与 `sync_hash_of` 的键构造同式）。
+fn remember_sync_hash(state: &Arc<CsServerState>, p: &Path, hash: &[u8; 32]) {
+    let Ok(md) = std::fs::metadata(p) else {
+        return;
+    };
+    let key = (
+        fnv1a(p.to_string_lossy().as_bytes()),
+        md.len(),
+        mtime_nanos(p),
+    );
+    let mut cache = state.sync_hashes.lock().expect("同步缓存锁");
+    if cache.len() >= CS_SYNC_HASH_CAP {
+        cache.clear();
+    }
+    cache.insert(key, *hash);
+}
+
+/// 0x04 续点判定：当前 (size, mtime) 已被本进程登记过摘要 = 盘上是某个**完整版本**
+/// （C# `KnownComplete` / `FileHashes.Knows` 同义）。短于发送端的已知完整文件是
+/// 「旧版本」，不能当断点前缀拼接；只有从未登记过的短文件才按半成品续传。
+fn known_complete(state: &Arc<CsServerState>, p: &Path, size: u64) -> bool {
+    let key = (fnv1a(p.to_string_lossy().as_bytes()), size, mtime_nanos(p));
+    state
+        .sync_hashes
+        .lock()
+        .expect("同步缓存锁")
+        .contains_key(&key)
+}
+
 /* ============ 服务端连接处理 ============ */
 
 #[derive(Default, Debug)]
@@ -2699,7 +2729,11 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
                 resume_offset = 0;
                 break;
             }
-            if len > 0 && len < e.size {
+            // C# KnownComplete 守卫（移植时丢失，2026-11-23 双机测试暴露）：短于发送端
+            // 但**已知完整**的文件是「该文件的上一个版本」，其字节不是待续传的前缀；
+            // 只有当它从未被登记为完整摘要时，才可能是断点半成品（C# 注释同义：
+            // 「bytes on disk belong to different content」）。
+            if len > 0 && len < e.size && !known_complete(state, &p, len) {
                 resume_index = i as i32;
                 resume_offset = len as i64;
                 break;
@@ -2865,6 +2899,9 @@ async fn handle_folder_resume<S: AsyncRead + AsyncWrite + Unpin>(
                 return Ok((false, 0, files));
             }
         }
+        // C# FileHashes.Store 同构：本轮落盘的版本登记为「已知完整」——下一轮续点
+        // 判断据此区分「旧完整版本」与「断点半成品」（known_complete）。
+        remember_sync_hash(state, &save_path, &e.hash);
         files += 1;
     }
     if let Some(r) = &reporter {

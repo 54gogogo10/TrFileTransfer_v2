@@ -599,6 +599,61 @@ async fn cs_dialect_sync_incremental_roundtrip() {
     server.abort();
 }
 
+/// 判别（2026-11-23 双机测试抓到）：首轮落盘后把某文件**改大**，二轮同步必须整文件
+/// 替换成功。旧实现把「变长的旧版本」当作断点前缀去追加（C# KnownComplete 守卫在
+/// 移植时丢失）→ 拼接后尾哈希不符 → 服务端删旧档 + 回拒绝，同步失败一次且目标
+/// 目录丢该文件（重试才自愈）。去掉修复本测必红。
+#[tokio::test]
+async fn cs_dialect_sync_replaces_file_that_grew() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lib");
+    std::fs::create_dir_all(&root).unwrap();
+    // 旧版本不得是新版本的前缀——这正是「旧完整文件被误当断点」的判别场景
+    // （若新内容只是旧内容的追加，拼接碰巧正确，测不出缺陷）。
+    std::fs::write(root.join("log.txt"), b"alpha\n").unwrap();
+    std::fs::write(root.join("keep.bin"), vec![7u8; 4096]).unwrap();
+    let out = dir.path().join("out");
+    let (sock, addr) = ephemeral_udp().await;
+    let server = tokio::spawn(serve_udt_on(sock, common::opts_resident(out.clone(), None)));
+
+    let cache = sync_cache(dir.path());
+    trft_core::transfer::cswire::send_folder_sync_cs(addr, &root, &udt_opts(), Some(&cache))
+        .await
+        .unwrap();
+    let session_dir = std::fs::read_dir(&out)
+        .unwrap()
+        .find_map(|e| {
+            let n = e.unwrap().file_name().to_string_lossy().to_string();
+            n.starts_with("lib.").then(|| out.join(n))
+        })
+        .expect("服务端必须建立 <folder>.<guid8> 会话目录");
+    assert_eq!(
+        std::fs::read(session_dir.join("log.txt")).unwrap(),
+        b"alpha\n"
+    );
+
+    // 改写为更长的不同内容（"文件变长"是最常见的变更形态：配置/文本/导出）。
+    std::fs::write(root.join("log.txt"), b"beta version two\n").unwrap();
+    let r =
+        trft_core::transfer::cswire::send_folder_sync_cs(addr, &root, &udt_opts(), Some(&cache))
+            .await;
+    assert!(
+        r.is_ok(),
+        "文件变长后二轮同步必须成功（旧实现：按旧长度续传 → 拼接 → 哈希不符 → 删档 + 拒绝）: {r:?}"
+    );
+    assert_eq!(
+        std::fs::read(session_dir.join("log.txt")).unwrap(),
+        b"beta version two\n",
+        "变长文件必须整文件替换（不得拼接成半旧半新）"
+    );
+    assert_eq!(
+        std::fs::read(session_dir.join("keep.bin")).unwrap(),
+        vec![7u8; 4096],
+        "未变文件保持原样"
+    );
+    server.abort();
+}
+
 /* ============ 轮 UI-5 判别：C# 方言层的假成功/数据丢失防线 ============ */
 
 /// 0x04 清单头：[0x04][sid 16][folderLen i16][folder][count i32][totalBytes i64]。
