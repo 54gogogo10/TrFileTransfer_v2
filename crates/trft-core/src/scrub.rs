@@ -42,6 +42,19 @@ impl VerifyReport {
 /// 只作为**防环**兜底——配合"不进入链接目录"一起封死 junction 环导致的栈溢出）。
 const MAX_SCAN_DEPTH: u32 = 32;
 
+/// 扫描时跳过的瞬态文件：摘要缓存自身、接收器正在写入的 `.trft-part`。
+/// 传输中的临时文件不是最终产物，校验不应把它计入「已扫描/无记录」，
+/// 否则会和正在写入的句柄竞争（Windows 上还可能读失败）。
+fn is_transient(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            crate::hashcache::is_cache_artifact(n)
+                || n.to_ascii_lowercase().ends_with(".trft-part")
+        })
+        .unwrap_or(false)
+}
+
 /// 收集待校验文件（先全量走一遍：GUI 进度条需要总数；不可读目录计一次 unreadable）。
 /// 本轮 F8：此前用 `p.is_dir()`（跟随链接）且无深度上限——目录联接成环时
 /// `collect` 无限递归直到栈溢出。现改为 `file_type()` 不跟随链接：真目录才递归，
@@ -77,19 +90,15 @@ fn collect(
             // 链接不进入递归（目录联接环的唯一入口）；指向文件的链接仍需校验。
             match std::fs::metadata(&p) {
                 Ok(m) if m.is_dir() => continue,
-                Ok(_) => out.push(p),
+                Ok(_) if !is_transient(&p) => out.push(p),
+                Ok(_) => { /* 传输中的临时文件，跳过 */ }
                 Err(_) => *unreadable += 1,
             }
             continue;
         }
         if ft.is_dir() {
             collect(&p, depth + 1, visited, out, unreadable);
-        } else if !e
-            .file_name()
-            .to_str()
-            .map(crate::hashcache::is_cache_artifact)
-            .unwrap_or(false)
-        {
+        } else if !is_transient(&p) {
             out.push(p);
         }
     }
@@ -201,6 +210,25 @@ mod tests {
         assert_eq!(r2.hit, 2);
         assert_eq!(r2.fresh, 0);
         assert_eq!(r2.mismatches, vec!["a.txt".to_string()], "不一致必须点名");
+    }
+
+    #[test]
+    fn verify_skips_in_progress_trft_part_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("done.txt"), b"done").unwrap();
+        // 接收器写入中的临时文件：不应计入扫描，更不应产生不一致/读取失败。
+        std::fs::write(dir.path().join("movie.bin.1234abcd.trft-part"), b"half").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("x.TRFT-PART"), b"case").unwrap();
+
+        let cache_path = cache_file_for(dir.path());
+        let mut cache = HashCache::load(&cache_path, DEFAULT_TTL_DAYS);
+        let r = verify_dir(dir.path(), &mut cache, None, None);
+        assert_eq!(r.scanned, 1, "传输中的 .trft-part 不得计入扫描");
+        assert_eq!(r.fresh, 1);
+        assert_eq!(r.unreadable, 0);
+        assert!(r.is_consistent());
     }
 
     /// 本轮 F8 判别：目录联接（junction）回指祖先时不得无限递归。
