@@ -2383,6 +2383,69 @@ fn text_history_path() -> PathBuf {
 /// 单条截断至 2KB（轮 5 P2-3）：协议允许 1MB 文本——不截断时稳态历史可达
 /// ~200MB，且每条触发全量重读+重写（磁盘写放大 200:1、async worker 阻塞）；
 /// 前端展示只取 120 字符，2KB 足够。
+/// 单条历史保留上限（字符）。协议允许 1MB；历史是回看用途，64KB 足够，
+/// 且把 200 条的稳态上限压在 ~12.8MB（旧值 2KB 会把多行文本截掉大半，
+/// 点开历史也看不到原文）。
+const TEXT_HISTORY_MAX_CHARS: usize = 64 * 1024;
+
+/// 历史行编码：v2\t<unix秒>\t<0|1 截断>\t<转义正文>。
+/// 换行在行格式里必须转义（否则一条消息变多行），反斜杠随之转义。
+fn history_line(stamp: u64, text: &str) -> String {
+    let one = text.replace('\r', "");
+    let (body, truncated) = if one.chars().count() > TEXT_HISTORY_MAX_CHARS {
+        (
+            one.chars().take(TEXT_HISTORY_MAX_CHARS).collect::<String>(),
+            true,
+        )
+    } else {
+        (one, false)
+    };
+    let escaped = body.replace('\\', "\\\\").replace('\n', "\\n");
+    format!(
+        "v2\t{stamp}\t{}\t{escaped}",
+        if truncated { 1 } else { 0 }
+    )
+}
+
+/// 历史行解码；旧格式（stamp\t文本）照读（正文当时已把换行换成空格）。
+fn history_parse(line: &str) -> Option<serde_json::Value> {
+    if let Some(rest) = line.strip_prefix("v2\t") {
+        let mut it = rest.splitn(3, '\t');
+        let stamp = it.next()?;
+        let trunc = it.next()?;
+        let body = it.next().unwrap_or("");
+        return Some(serde_json::json!({
+            "time": stamp,
+            "text": history_unescape(body),
+            "truncated": trunc == "1",
+        }));
+    }
+    let (stamp, text) = line.split_once('\t')?;
+    Some(serde_json::json!({ "time": stamp, "text": text, "truncated": false }))
+}
+
+fn history_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// 追加一条；超过 200 条重写保留末 200。
 pub fn text_history_append(text: &str) {
     // UI-4 P3-10：进程级串行化——每条接收器各有一个文本消费任务并发做
     // 「全量读→改→原子重写」，后写覆盖前写丢一条历史（两协议同收文本即触发）。
@@ -2396,14 +2459,7 @@ pub fn text_history_append(text: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let one_line = text.replace('\n', " ").replace('\r', " ");
-    let one_line = if one_line.chars().count() > 2048 {
-        let cut: String = one_line.chars().take(2048).collect();
-        format!("{cut}…")
-    } else {
-        one_line
-    };
-    lines.push(format!("{stamp}	{one_line}"));
+    lines.push(history_line(stamp, text));
     let keep: Vec<String> = if lines.len() > 200 {
         lines[lines.len() - 200..].to_vec()
     } else {
@@ -2420,13 +2476,7 @@ pub fn text_history_append(text: &str) {
 #[tauri::command]
 pub fn text_history_load() -> Vec<serde_json::Value> {
     std::fs::read_to_string(text_history_path())
-        .map(|t| {
-            t.lines()
-                .rev()
-                .filter_map(|l| l.split_once('\t'))
-                .map(|(stamp, text)| serde_json::json!({ "time": stamp, "text": text }))
-                .collect()
-        })
+        .map(|t| t.lines().rev().filter_map(history_parse).collect())
         .unwrap_or_default()
 }
 
@@ -2741,5 +2791,27 @@ mod tests {
         let nested = tmp.path().join("a").join("b");
         assert!(prepare_save_dir(&nested).is_ok());
         assert!(nested.is_dir());
+    }
+
+    /// 轮 10 判别：历史行必须保留换行与反斜杠、超长显式标记截断，旧格式仍可读。
+    #[test]
+    fn text_history_roundtrip_preserves_newlines_and_flags_truncation() {
+        let line = history_line(1_700_000_000, "第一行\n第二行\\路径");
+        let v = history_parse(&line).expect("parse");
+        assert_eq!(v["time"], "1700000000");
+        assert_eq!(v["text"], "第一行\n第二行\\路径");
+        assert_eq!(v["truncated"], false);
+
+        let long = "x".repeat(TEXT_HISTORY_MAX_CHARS + 10);
+        let v2 = history_parse(&history_line(1, &long)).expect("parse long");
+        assert_eq!(v2["truncated"], true);
+        assert_eq!(
+            v2["text"].as_str().unwrap().chars().count(),
+            TEXT_HISTORY_MAX_CHARS
+        );
+
+        let old = history_parse("1700000000\t旧文本").expect("parse legacy");
+        assert_eq!(old["text"], "旧文本");
+        assert_eq!(old["truncated"], false);
     }
 }

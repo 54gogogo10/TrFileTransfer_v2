@@ -28,6 +28,7 @@ const L10N = {
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     help_title: "使用说明", help_close: "关闭",
     text_title: "收到文本", text_from: "来自", text_copy_ok: "已复制",
+    text_history_label: "历史记录", text_truncated: "（原文超过 64KB，这里只保留前 64KB）", text_view_full: "点击查看全文",
     help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。「排除扩展名」对整夹/同步/队列里的文件夹项生效。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动；支持定时与周期性自动校验。\n监控：类型选「监控」，设置目录与目标，文件就绪即自动发出；可填排除扩展名（如 .tmp,.log）。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
     kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控", kind_queue: "队列",
@@ -120,6 +121,7 @@ const L10N = {
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     help_title: "Help", help_close: "Close",
     text_title: "Text received", text_from: "from", text_copy_ok: "Copied",
+    text_history_label: "History", text_truncated: "(original exceeds 64 KB; only the first 64 KB is kept)", text_view_full: "Click to view full text",
     help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups. Skip-extensions applies to folder sends, sync and folder items in the queue.\nVerify: the Verify tab re-hashes received files to detect tampering; supports scheduled and recurring checks.\nMonitor: pick the Monitor type, set the folder and target; ready files are sent automatically (list extensions to skip, e.g. .tmp,.log).\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
     kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor", kind_queue: "Queue",
@@ -1314,7 +1316,15 @@ function renderTextHistory(items) {
     txt.textContent = it.text.length > 120 ? it.text.slice(0, 120) + "…" : it.text;
     li.appendChild(time);
     li.appendChild(txt);
-    li.addEventListener("click", () => { navigator.clipboard.writeText(it.text); toast(t("copied"), "ok"); });
+    // 点一条看全文（轮 10）：复用接收弹窗，带历史时间与截断标记。
+    li.title = t("text_view_full");
+    li.addEventListener("click", () => {
+      showTextModal(it.text, "", {
+        at: d.toLocaleTimeString(),
+        history: true,
+        truncated: !!it.truncated,
+      });
+    });
     list.appendChild(li);
   });
 }
@@ -2183,7 +2193,8 @@ async function wireEvents() {
     tx.textContent = text.length > 120 ? text.slice(0, 120) + "…" : text;
     li.appendChild(tm);
     li.appendChild(tx);
-    li.addEventListener("click", () => { navigator.clipboard.writeText(text); toast(t("copied"), "ok"); });
+    li.title = t("text_view_full");
+    li.addEventListener("click", () => showTextModal(text, from));
     list.prepend(li);
     while (list.children.length > 200) list.lastChild.remove();
   });
@@ -2305,9 +2316,11 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
 // 多条连续到达时按「时间 · 来源」分段累积；关闭即清空。
 const textModal = { parts: [] };
 
-function showTextModal(text, from) {
-  const at = new Date().toLocaleTimeString();
-  textModal.parts.push({ text, from, at });
+function showTextModal(text, from, opts = {}) {
+  const at = opts.at || new Date().toLocaleTimeString();
+  // 历史条目可能带截断标记（>64KB 只保留前段）——在正文末尾如实说明。
+  const body = opts.truncated ? text + "\n\n" + t("text_truncated") : text;
+  textModal.parts.push({ text: body, from, at });
   const multi = textModal.parts.length > 1;
   const pre = $("#text-body");
   pre.textContent = textModal.parts
@@ -2317,7 +2330,9 @@ function showTextModal(text, from) {
       return head + "\n" + p.text;
     })
     .join("\n\n");
-  $("#text-meta").textContent = (from ? t("text_from") + " " + from + " · " : "") + at;
+  $("#text-meta").textContent = from
+    ? t("text_from") + " " + from + " · " + at
+    : (opts.history ? t("text_history_label") + " · " : "") + at;
   $("#text-title").textContent = multi ? t("text_title") + "（" + textModal.parts.length + "）" : t("text_title");
   $("#text-overlay").classList.remove("hidden");
   pre.scrollTop = pre.scrollHeight;
