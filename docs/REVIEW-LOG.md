@@ -550,8 +550,7 @@ RFC 908/1151 的 RUDP 已历史化，本实现线格式以 WIRE-PROTOCOL.md §7 
    判别：interrupted_encrypted_handshake_counts_toward_lockout（e2e_recv_options）。
 5. **P1 UDT 轻量 ACK 无超前校验**：seq_off 可返回 ≈0x3FFFFF00（10 亿次 pop_front），
 
-**补记 4（同日）**：第 9 轮全项目审查（5 路并行、67 个源文件）**44 项发现当日全部修复**（6×P1、20×P2、18×P3；
-P3-18 评估后保留并说明理由），修复记录见 [CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md) §八。
+**补记 4（同日）**：第 9 轮全项目审查（5 路并行、67 个源文件）**44 项发现当日全部修复**（6×P1、20×P2、18×P3），修复记录见 [CODE-REVIEW-2026-11-23.md](CODE-REVIEW-2026-11-23.md) §八。
 要点：RUDP 瞬态错误统一（10054/EMSGSIZE）、UDT 握手流窗钳制、0x03 完成判定比对哈希、
 0x04 读失败不再删档、分块 TTL 逐出保护组装中会话、Web 上传 fsync+写透、C# 方言发布改 WRITE_THROUGH、
 0x04 清单内存/溢出防线、缓存族名接收侧拒收、UDP 会话按来源分桶、QUIC 首帧超时、

@@ -225,4 +225,4 @@ match tokio::fs::hard_link(&part, &cand).await { Ok(()) => { ... } }
 | P3-15 | `trft-server` 非法 `--bind` → exit 2，运行错误 → exit 1 |
 | P3-16 | CLI：`sync --pin` 守卫、UDP 拒绝 `--noencrypt`、端口 range(1..=65535) |
 | P3-17 | 上传半成品名改固定短名 `.up{8hex}.part` |
-| P3-18 | 未改（评估保留）：journal 每文件一次 flush 是「写完即落盘」的代价；大目录 0x04 可后续做批量提交 |
+| P3-18 | journal 追加改 64 行攒批 flush（Drop 兜底、重写/保存前清空计数）；崩溃最多丢最近 63 条，只多算一次哈希 |

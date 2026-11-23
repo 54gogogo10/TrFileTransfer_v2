@@ -47,7 +47,14 @@ pub struct HashCache {
     gen: u32,
     rewrite_threshold: u64,
     appended: AtomicU64,
+    /// 尚未 flush 的追加行数（攒批，见 FLUSH_BATCH）。
+    pending: u32,
 }
+
+/// 追加写攒批条数（第 9 轮 P3-18）：journal 是缓存，崩溃时丢最近几条只会多算
+/// 一次哈希；而每行一次 FlushFileBuffers 在 0x04 大目录同步下会把元数据开销
+/// 放大数倍。写失败与重写路径仍即时处理，Drop 兜底 flush。
+const FLUSH_BATCH: u32 = 64;
 
 impl HashCache {
     /// 加载：坏行丢弃（fail-open，规格 §3.1「不可写时静默退化」同源语义）；
@@ -99,6 +106,7 @@ impl HashCache {
             gen: 0,
             rewrite_threshold: REWRITE_THRESHOLD,
             appended: AtomicU64::new(0),
+            pending: 0,
         }
     }
 
@@ -164,10 +172,17 @@ impl HashCache {
         );
         let line = format!("{:016x}|{inner}\n", fnv1a(inner.as_bytes()));
         let f = self.log.as_mut().unwrap();
-        match f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+        match f.write_all(line.as_bytes()) {
             Ok(()) => {
                 self.log_size += line.len() as u64;
                 self.appended.fetch_add(1, Ordering::Relaxed);
+                self.pending += 1;
+                if self.pending >= FLUSH_BATCH {
+                    self.pending = 0;
+                    if let Some(f) = self.log.as_mut() {
+                        let _ = f.flush();
+                    }
+                }
             }
             Err(_) => {
                 self.degraded = true; // 静默退化：内存缓存继续工作
@@ -184,6 +199,7 @@ impl HashCache {
         self.map.retain(|_, (_, g)| *g >= keep_from);
         // 先关追加句柄再换入（Windows 上打开句柄会锁住 persist 目标）。
         self.log = None;
+        self.pending = 0;
         if let Some(p) = self.log_path.clone() {
             self.save(&p)?;
         }
@@ -196,6 +212,7 @@ impl HashCache {
     /// 缺此步则 insert 过的缓存 save 恒失败，M4' 实测修复）。
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.log = None;
+        self.pending = 0;
         let mut out = String::with_capacity(self.map.len() * 96);
         for ((pf, size, mtime), (h, _)) in &self.map {
             let body = format!("{}|{size}|{mtime}|{:016x}", crate::hash::hex(h), pf);
@@ -210,6 +227,23 @@ impl HashCache {
 
     pub fn appended_count(&self) -> u64 {
         self.appended.load(Ordering::Relaxed)
+    }
+
+    /// 把攒批的追加行刷到盘（Drop 与显式收尾调用）。
+    pub fn flush(&mut self) {
+        if self.pending == 0 {
+            return;
+        }
+        self.pending = 0;
+        if let Some(f) = self.log.as_mut() {
+            let _ = f.flush();
+        }
+    }
+}
+
+impl Drop for HashCache {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
