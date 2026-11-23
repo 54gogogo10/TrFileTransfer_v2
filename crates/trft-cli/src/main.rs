@@ -483,9 +483,14 @@ async fn run() -> i32 {
                 }
                 _ => {
                     // 接收侧摘要缓存：0x00/0x01/0x03/0x02 组装免费填充 + 0x03 skip 判定。
+                    // TTL 取设置（GUI 设置页「摘要缓存有效期」）——0x04 服务端 journal 同口径。
+                    let cfg = trft_core::config::Config::load(
+                        &trft_core::config::app_data_dir().join("config.toml"),
+                    )
+                    .unwrap_or_default();
                     let cache = Arc::new(Mutex::new(HashCache::load(
                         &cache_file_for(&save),
-                        trft_core::hashcache::DEFAULT_TTL_DAYS,
+                        cfg.hash_cache_days,
                     )));
                     let o = RecvOptions {
                         save_dir: save.clone(),
@@ -494,6 +499,7 @@ async fn run() -> i32 {
                         max_count: count,
                         encrypt: !noencrypt,
                         hash_cache: Some(cache),
+                        hash_cache_days: cfg.hash_cache_days,
                         stats: Some(Arc::new(trft_core::stats::StatsLog::default_log())),
                         ..Default::default()
                     };

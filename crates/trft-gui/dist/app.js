@@ -10,7 +10,7 @@ const L10N = {
   zh: {
     tab_send: "发送", tab_recv: "接收", tab_share: "共享", tab_verify: "校验", tab_settings: "设置",
     bind_addr: "绑定地址", wildcard_v4: "全部 IPv4 (0.0.0.0)", wildcard_v6: "全部 IPv6 (::)", no_addr_selected: "请至少勾选一个绑定地址", partial_bind: "部分地址绑定失败", dd_placeholder: "选择监听地址…",
-    duplicate: "重复文件", dup_rename: "改名保留（file_1）", dup_skip: "跳过相同内容", cache_days: "摘要缓存有效期（天）",
+    duplicate: "重复文件", dup_rename: "改名保留（file_1）", dup_skip: "跳过相同内容", cache_days: "摘要缓存/同步续点有效期（天，0=永久）",
     share_dir: "共享目录", after_done: "完成后", ad_none: "无动作", ad_shutdown: "关机（60s 可取消）", ad_sleep: "休眠", ad_command: "执行命令",
     confirm_shutdown: "队列完成后将关闭系统（60 秒后执行，shutdown /a 可取消）。确认执行队列？",
     confirm_sleep: "队列完成后系统将进入休眠。确认执行队列？",
@@ -27,7 +27,7 @@ const L10N = {
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     help_title: "使用说明", help_close: "关闭",
-    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动；支持定时与周期性自动校验。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
+    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动；支持定时与周期性自动校验。\n监控：类型选「监控」，设置目录与目标，文件就绪即自动发出；可填排除扩展名（如 .tmp,.log）。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
     kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控", kind_queue: "队列",
     queue_add_files: "添加文件…", queue_add_folder: "添加文件夹…", queue_hint: "文件与文件夹可混合入队，按顺序逐项发送",
@@ -73,7 +73,8 @@ const L10N = {
     stats_clear_confirm: "确定清除全部传输统计？（不可恢复）",
     locate: "在资源管理器中定位", dir_apply_hint: "目录类选项将在对应接收器下次启动时生效",
     monitor: "监控模式", monitor_start: "启动监控", monitor_stop: "停止监控", monitor_dir: "监控目录",
-    monitor_hint: "目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。",
+    monitor_exclude: "排除扩展名",
+    monitor_hint: "目录内文件就绪即自动发出（独占打开 + 稳定窗双判定）；成功后移入「已发送文件/」。排除的扩展名（如 .tmp, .log）不入队。",
     mon_queued: "入队", mon_not_ready: "未就绪（等待）", mon_dropped: "已消失（丢弃）", mon_sending: "发送中", mon_sent: "已发送", mon_failed: "失败",
     confirm_receive: "接收前确认", cf_off: "关闭（不确认）", cf_unknown: "仅未知设备（已知放行）", cf_all: "一律确认（30 秒无应答视为拒绝）",
     per_device: "按设备分目录", auto_archive: "按日期归档",
@@ -99,7 +100,7 @@ const L10N = {
   en: {
     tab_send: "Send", tab_recv: "Receive", tab_share: "Share", tab_verify: "Verify", tab_settings: "Settings",
     bind_addr: "Bind addresses", wildcard_v4: "All IPv4 (0.0.0.0)", wildcard_v6: "All IPv6 (::)", no_addr_selected: "Select at least one bind address", partial_bind: "Some addresses failed to bind", dd_placeholder: "Select bind addresses…",
-    duplicate: "Duplicates", dup_rename: "Rename (file_1)", dup_skip: "Skip identical", cache_days: "Hash cache TTL (days)",
+    duplicate: "Duplicates", dup_rename: "Rename (file_1)", dup_skip: "Skip identical", cache_days: "Hash / sync-resume TTL (days; 0 = forever)",
     share_dir: "Shared dir", after_done: "After done", ad_none: "None", ad_shutdown: "Shutdown (60s)", ad_sleep: "Sleep", ad_command: "Run command",
     confirm_shutdown: "The system will shut down after the queue finishes (60s, cancellable via shutdown /a). Run the queue?",
     confirm_sleep: "The system will sleep after the queue finishes. Run the queue?",
@@ -116,7 +117,7 @@ const L10N = {
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     help_title: "Help", help_close: "Close",
-    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes received files to detect tampering; supports scheduled and recurring checks.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
+    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes received files to detect tampering; supports scheduled and recurring checks.\nMonitor: pick the Monitor type, set the folder and target; ready files are sent automatically (list extensions to skip, e.g. .tmp,.log).\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
     kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor", kind_queue: "Queue",
     queue_add_files: "Add files…", queue_add_folder: "Add folder…", queue_hint: "Files and folders can be mixed; sent one by one in order",
@@ -162,7 +163,8 @@ const L10N = {
     stats_clear_confirm: "Clear all transfer statistics? (irreversible)",
     locate: "Locate in Explorer", dir_apply_hint: "Directory options take effect when the receiver next starts",
     monitor: "Monitor", monitor_start: "Start monitor", monitor_stop: "Stop monitor", monitor_dir: "Watch dir",
-    monitor_hint: "Ready files are sent automatically (exclusive open + stable window); moved to \"Sent files\" on success.",
+    monitor_exclude: "Skip extensions",
+    monitor_hint: "Ready files in the folder are sent automatically (exclusive open + stable window); on success they move to the Sent folder. Skipped extensions (e.g. .tmp, .log) are ignored.",
     mon_queued: "queued", mon_not_ready: "not ready (waiting)", mon_dropped: "vanished (dropped)", mon_sending: "sending", mon_sent: "sent", mon_failed: "failed",
     confirm_receive: "Confirm before receive", cf_off: "Off (no confirm)", cf_unknown: "Unknown devices only", cf_all: "Always (30s silence = deny)",
     per_device: "Per-device folder", auto_archive: "Date archive",
@@ -1606,6 +1608,7 @@ function fillSettings() {
   $("#cfg-notify-sound").checked = c.notify_sound !== false;
   $("#cfg-duplicate").value = c.duplicate_files === "Skip" ? "skip" : "rename";
   $("#cfg-cache-days").value = c.hash_cache_days;
+  $("#monitor-exclude").value = (c.monitor_exclude_exts || []).join(", ");
   $("#cfg-confirm").value = (c.confirm_receive || "Off").toLowerCase();
   $("#cfg-per-device").checked = !!c.per_device_folder;
   $("#cfg-archive").checked = !!c.auto_archive;
@@ -1918,6 +1921,11 @@ $("#btn-monitor-start").addEventListener("click", async () => {
   const port = parseInt($("#monitor-port").value, 10);
   if (!dir) { toast(t("monitor_dir"), "err"); return; }
   if (!ip || !(port >= 1 && port <= 65535)) { toast(t("target") + "/" + t("port"), "err"); return; }
+  // 排除扩展名：逗号/分号/空白分隔都接受，原样交给后端归一化（去点、小写、去重）。
+  const excludeExts = $("#monitor-exclude").value
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
   try {
     await invoke("monitor_start", {
       req: {
@@ -1928,8 +1936,11 @@ $("#btn-monitor-start").addEventListener("click", async () => {
         srcPort: parseInt($("#send-srcport").value, 10) || null,
         limit: parseInt($("#send-limit").value, 10) || null,
         passes: null, fecParity: null, nofec: false,
+        excludeExts,
       },
     });
+    // 后端已把归一化后的列表落盘；本地副本同步，避免后续 save_config 用旧值覆盖。
+    if (appState && appState.config) appState.config.monitor_exclude_exts = excludeExts;
     $("#dot-monitor").classList.add("on");
     $("#btn-monitor-start").disabled = true;
     $("#btn-monitor-stop").disabled = false;

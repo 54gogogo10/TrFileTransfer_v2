@@ -250,6 +250,10 @@ pub struct RecvOptions {
     pub enable_resume: bool,
     /// 接收侧摘要缓存（0x00/0x01/0x03/0x02 组装免费填充；0x03 skip 判定/0x04 位图判定读取）。
     pub hash_cache: Option<Arc<Mutex<HashCache>>>,
+    /// 目录级摘要缓存 TTL（天；0 = 永不过期）。同一口径决定 0x04 服务端 journal
+    /// （`.trft-hash-cache-server.txt`）装载时的过期淘汰——GUI 设置页
+    /// 「摘要缓存有效期」一项统一管这两处（TECH-STACK §7.66）。
+    pub hash_cache_days: u32,
     /// 0x02 分块会话表（groupId → 半成品 + 合并区间）。
     pub chunk_sessions: Arc<ChunkTracker>,
     /// 0x03 会话锁（对端 IP + 文件名 → 锁，防跨连接并发写坏半成品）。
@@ -298,6 +302,7 @@ impl Default for RecvOptions {
             enable_chunked: true,
             enable_resume: true,
             hash_cache: None,
+            hash_cache_days: crate::hashcache::DEFAULT_TTL_DAYS,
             chunk_sessions: Arc::new(ChunkTracker::default()),
             resume_locks: Arc::new(Mutex::new(HashMap::new())),
             gate: Arc::new(Mutex::new(PairingGate::default())),

@@ -107,6 +107,9 @@ pub struct Config {
     /// 启动静默检查更新开关（规格 §12.1 AutoUpdateCheck，默认开——对齐原版
     /// UpdateDialog 复选框；仅 gate 启动 3s 检查，手动「检查更新」不受限）。
     pub auto_update_check: bool,
+    /// 监控模式排除的扩展名（小写、不带点；空 = 不排除）。跨重启持久化，
+    /// 扫描时命中即不入队（TECH-STACK §7.66）。
+    pub monitor_exclude_exts: Vec<String>,
 }
 
 impl Default for Config {
@@ -154,6 +157,7 @@ impl Default for Config {
             client_proto: None,
             last_path: None,
             auto_update_check: true,
+            monitor_exclude_exts: Vec::new(),
         }
     }
 }

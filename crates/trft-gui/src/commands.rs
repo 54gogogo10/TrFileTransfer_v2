@@ -1098,6 +1098,7 @@ pub async fn recv_start(
                 duplicate: cfg.duplicate_files,
                 text_tx: Some(ttx),
                 hash_cache: Some(cache),
+                hash_cache_days: cfg.hash_cache_days,
                 progress: Some(hub.clone()),
                 strict_verify: cfg.sync_verify_content,
                 ip_filter_mode: cfg.ip_filter_mode,
@@ -1926,6 +1927,10 @@ pub struct MonitorRequest {
     /// 发送面板源端口快照（规格 §3.1 SrcPort——对齐原版监控继承客户端面板
     /// SrcPort/限速的快照语义，TECH-STACK §7.31）。
     pub src_port: Option<u16>,
+    /// 排除的扩展名（大小写/前导点不敏感；空 = 不排除）。启动时归一化并写回配置，
+    /// 跨重启保留（TECH-STACK §7.66）。
+    #[serde(default)]
+    pub exclude_exts: Vec<String>,
 }
 
 #[tauri::command]
@@ -1965,12 +1970,23 @@ pub async fn monitor_start(app: tauri::AppHandle, req: MonitorRequest) -> Result
         }
     });
 
+    let exclude_exts = trft_core::monitor::normalize_exts(&req.exclude_exts);
+    {
+        // 排除项属于设置项：启动即落盘（用户不必再进设置页手动保存）。
+        let st = app.state::<AppState>();
+        {
+            let mut c = st.cfg.lock().expect("配置锁");
+            c.monitor_exclude_exts = exclude_exts.clone();
+        }
+        let _ = st.save_config();
+    }
     let mut mcfg = trft_core::monitor::MonitorConfig::new(
         PathBuf::from(&req.watch_dir),
         addr,
         core_proto,
         srx,
     );
+    mcfg.exclude_exts = exclude_exts;
     mcfg.send_opts = SendOptions {
         pairing_code: req.code.clone(),
         speed_limit_bps: req.limit.unwrap_or(0).min(10_000_000) * 1024,

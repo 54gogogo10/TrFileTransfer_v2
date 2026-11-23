@@ -1567,6 +1567,7 @@ pub async fn serve_udt_on(
     // 落盘 journal（与 serve_tcp_on 同口径）：跨进程保留「已知完整」事实。
     let cs_state = Arc::new(crate::transfer::cswire::CsServerState::with_journal(
         &opts.save_dir,
+        opts.hash_cache_days,
     ));
     // 连接出包共享通道（此前每连接一跳 forward 任务——每包两次调度 + 一跳通道）。
     let (out_tx, mut out_rx) = unbounded_channel::<OutPkt>();

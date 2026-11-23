@@ -61,6 +61,9 @@ pub struct MonitorConfig {
     pub udp_opts: UdpSendOptions,
     pub poll_interval: Duration,
     pub stable_window: Duration,
+    /// 排除的扩展名（小写、不带点，见 `normalize_exts`；空 = 不过滤）。
+    /// 只作用于顶层扫描——被排除的文件既不进「就绪」判定也不入队。
+    pub exclude_exts: Vec<String>,
     /// 事件出口（GUI 面板；None = 仅日志）。
     pub events: Option<mpsc::UnboundedSender<MonitorEvent>>,
     /// 停止信号（true = 停）。
@@ -83,6 +86,7 @@ impl MonitorConfig {
                 ..Default::default()
             },
             udp_opts: UdpSendOptions::default(),
+            exclude_exts: Vec::new(),
             poll_interval: POLL_INTERVAL,
             stable_window: STABLE_WINDOW,
             events: None,
@@ -137,7 +141,7 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
     let mut mut_stop = cfg.stop.clone();
 
     // 启动全量扫描（规格 §3.2）。
-    for f in scan_dir(&cfg.watch_dir) {
+    for f in scan_dir(&cfg.watch_dir, &cfg.exclude_exts) {
         queued.insert(f.clone());
         queue.push_back(f);
     }
@@ -169,7 +173,7 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
         while tick_rx.try_recv().is_ok() {}
 
         // 扫描新文件（唯一事实来源）：入队去重（已发送/已消失的不再出现）。
-        for f in scan_dir(&cfg.watch_dir) {
+        for f in scan_dir(&cfg.watch_dir, &cfg.exclude_exts) {
             if queued.insert(f.clone()) {
                 cfg.emit(MonitorEvent::Queued {
                     name: file_name(&f),
@@ -330,8 +334,39 @@ pub async fn run_monitor(cfg: MonitorConfig) -> Result<()> {
     Ok(())
 }
 
-/// 顶层文件扫描（跳过子目录 / 「已发送文件」/ 摘要缓存元数据；排序确定性）。
-fn scan_dir(dir: &Path) -> Vec<PathBuf> {
+/// 扩展名归一化（配置/UI 共用）：去空白与前导点、转小写、丢空项与重复项。
+/// 例：`[" .TMP ", "log", ""]` → `["tmp", "log"]`。
+pub fn normalize_exts(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in raw {
+        let e = item.trim().trim_start_matches('.').to_ascii_lowercase();
+        if e.is_empty() || e.contains(['/', '\\', ' ']) {
+            continue; // 误填路径/空白的项直接忽略，不让它变成永远不命中的规则
+        }
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// 是否命中监控排除扩展名（大小写不敏感；无扩展名的文件不排除）。
+fn ext_excluded(name: &str, exclude_exts: &[String]) -> bool {
+    if exclude_exts.is_empty() {
+        return false;
+    }
+    match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            let ext = ext.to_ascii_lowercase();
+            exclude_exts.iter().any(|x| x.eq_ignore_ascii_case(&ext))
+        }
+        None => false,
+    }
+}
+
+/// 顶层文件扫描（跳过子目录 / 「已发送文件」/ 摘要缓存元数据 / 配置排除的扩展名；
+/// 排序确定性）。
+fn scan_dir(dir: &Path, exclude_exts: &[String]) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -339,10 +374,13 @@ fn scan_dir(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = rd
         .flatten()
         .filter(|e| {
+            let fname = e.file_name();
+            let name = fname.to_string_lossy();
             let p = e.path();
             p.is_file()
                 && p != sent
-                && !crate::hashcache::is_transient_name(&e.file_name().to_string_lossy())
+                && !crate::hashcache::is_transient_name(&name)
+                && !ext_excluded(&name, exclude_exts)
         })
         .map(|e| e.path())
         .collect();
@@ -448,6 +486,48 @@ fn throttled_log(map: &mut HashMap<String, Instant>, name: &str, f: impl FnOnce(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 判别（2026-11-23）：监控排除扩展名——归一化（去点/大小写/去重/丢空项）
+    /// 与扫描过滤必须同时成立；空列表 = 不排除。
+    #[test]
+    fn monitor_excludes_configured_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.bin"), b"x").unwrap();
+        std::fs::write(dir.path().join("drop.tmp"), b"x").unwrap();
+        std::fs::write(dir.path().join("drop.LOG"), b"x").unwrap();
+        std::fs::write(dir.path().join("noext"), b"x").unwrap();
+
+        let exts = normalize_exts(&[
+            " .TMP ".to_string(),
+            "log".to_string(),
+            "".to_string(),
+            "tmp".to_string(),
+            "a/b".to_string(),
+        ]);
+        assert_eq!(
+            exts,
+            vec!["tmp".to_string(), "log".to_string()],
+            "归一化口径"
+        );
+
+        let names = |v: Vec<std::path::PathBuf>| {
+            let mut n: Vec<String> = v
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect();
+            n.sort();
+            n
+        };
+        assert_eq!(
+            names(scan_dir(dir.path(), &exts)),
+            vec!["keep.bin".to_string(), "noext".to_string()],
+            "配置排除的扩展名不得入队（.LOG 大小写不敏感）"
+        );
+        assert_eq!(
+            scan_dir(dir.path(), &[]).len(),
+            4,
+            "空列表 = 不排除任何文件"
+        );
+    }
 
     /// 轮 UI-5 续 P2 判别：失败退避必须指数增长并封顶 10 分钟。
     #[test]
@@ -515,7 +595,7 @@ mod tests {
         std::fs::write(sent.join("b.bin"), b"2").unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub").join("c.bin"), b"3").unwrap();
-        let found = scan_dir(dir.path());
+        let found = scan_dir(dir.path(), &[]);
         assert_eq!(found, vec![dir.path().join("a.bin")], "仅顶层文件入扫描");
     }
 

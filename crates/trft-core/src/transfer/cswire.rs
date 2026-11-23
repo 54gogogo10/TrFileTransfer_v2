@@ -1103,12 +1103,11 @@ impl CsServerState {
     /// 打开保存目录的落盘摘要 journal。服务端重启后（新进程、新状态）首轮 0x04
     /// 仍能认出「上一轮写完的完整版本」——此前纯内存，重启即失，会把变长的旧档
     /// 当成断点半成品去拼接（TECH-STACK §7.64 残留项）。
-    pub fn with_journal(save_dir: &Path) -> Self {
+    pub fn with_journal(save_dir: &Path, ttl_days: u32) -> Self {
         let st = Self::default();
         let path = crate::hashcache::server_cache_file_for(save_dir);
-        *st.sync_journal.lock().expect("同步 journal 锁") = Some(
-            crate::hashcache::HashCache::load(&path, crate::hashcache::DEFAULT_TTL_DAYS),
-        );
+        *st.sync_journal.lock().expect("同步 journal 锁") =
+            Some(crate::hashcache::HashCache::load(&path, ttl_days));
         st
     }
 }
@@ -1843,7 +1842,10 @@ pub async fn serve_tcp_on(listener: tokio::net::TcpListener, opts: RecvOptions) 
     crate::transfer::resume::cleanup_resume_orphans(&opts.save_dir);
     let served = Arc::new(AtomicU64::new(0));
     // 落盘 journal：服务端重启后首轮 0x04 仍能区分「旧完整版本」与「断点半成品」。
-    let state = Arc::new(CsServerState::with_journal(&opts.save_dir));
+    let state = Arc::new(CsServerState::with_journal(
+        &opts.save_dir,
+        opts.hash_cache_days,
+    ));
     match opts.max_count {
         // 限量模式（CLI --count）：串行处理，收满即停（与 v2 帧同口径：只有
         // 真实完成的一次传输才计数——0x02 的中间块不计）。
@@ -4312,13 +4314,19 @@ mod tests {
         std::fs::write(&done, b"alpha\n").unwrap();
         let hash = crate::hash::sha256_file(&done).unwrap();
 
-        let st1 = Arc::new(CsServerState::with_journal(dir.path()));
+        let st1 = Arc::new(CsServerState::with_journal(
+            dir.path(),
+            crate::hashcache::DEFAULT_TTL_DAYS,
+        ));
         let size = std::fs::metadata(&done).unwrap().len();
         remember_sync_hash(&st1, &done, &hash);
         assert!(known_complete(&st1, &done, size), "当前进程必须认得刚写完的版本");
 
         // 重启：新状态、空内存缓存，只有落盘 journal。
-        let st2 = Arc::new(CsServerState::with_journal(dir.path()));
+        let st2 = Arc::new(CsServerState::with_journal(
+            dir.path(),
+            crate::hashcache::DEFAULT_TTL_DAYS,
+        ));
         assert!(
             st2.sync_hashes.lock().unwrap().is_empty(),
             "前提：新状态的内存缓存必须是空的"
