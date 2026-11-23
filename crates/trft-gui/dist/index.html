@@ -336,6 +336,20 @@
           <button id="btn-verify-start" class="btn primary" data-i18n="verify_start">开始校验</button>
           <button id="btn-verify-stop" class="btn" data-i18n="verify_stop">停止</button>
         </div>
+        <div class="row verify-schedule">
+          <label class="chk"><input type="checkbox" id="verify-once-enable" /><span data-i18n="verify_once">定时校验</span></label>
+          <input type="datetime-local" id="verify-once-at" class="mono" />
+          <span class="grow"></span>
+          <label class="chk"><input type="checkbox" id="verify-period-enable" /><span data-i18n="verify_periodic">周期性校验</span></label>
+          <label class="lbl-s" data-i18n="verify_every">每</label>
+          <input type="number" id="verify-period-value" class="mono w60" min="1" value="1" />
+          <select id="verify-period-unit">
+            <option value="minute" data-i18n="verify_minute">分钟</option>
+            <option value="hour" data-i18n="verify_hour" selected>小时</option>
+            <option value="day" data-i18n="verify_day">天</option>
+          </select>
+        </div>
+        <div class="row"><span id="verify-next" class="hint"></span></div>
         <div class="row">
           <progress id="verify-bar" class="grow" value="0" max="1"></progress>
           <span id="verify-text" class="mono w120">0 / 0</span>

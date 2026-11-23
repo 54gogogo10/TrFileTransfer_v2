@@ -586,6 +586,9 @@ progress { accent-color: var(--accent); }
 .input-group input:focus + .btn { border-color: var(--accent); }
 
 /* ============ 校验 / 统计 ============ */
+/* 校验定时/周期设置：与手动校验按钮同卡，独立分隔线。 */
+.verify-schedule { margin-top: 10px; padding-top: 12px; border-top: 1px solid var(--border); }
+#verify-next { min-height: 17px; }
 .verify-results { display: flex; gap: 10px; margin-top: 4px; }
 .vstat {
   flex: 1; text-align: center;

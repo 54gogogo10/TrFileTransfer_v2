@@ -27,7 +27,7 @@ const L10N = {
     text_history: "文本历史（200 条）", th_empty: "暂无记录", gen_code: "生成配对码", pairing_len: "配对码位数",
     code_ph_send: "对端配对码", code_ph_local: "4-12 位数字",
     batch_add: "批量入队", help_title: "使用说明", help_close: "关闭",
-    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
+    help_body: "发送：类型选文件/文件夹/文本/监控/队列，填对方 IP 与端口，点「发送」；「分块数」可多连接加速大文件。\n接收：在「接收」页启动监听（TCP/QUIC/RUDP/UDP 可同时运行，各自独立端口与目录）。首次启动按提示放行防火墙。\n配对码：接收方在「设置」页设置或生成配对码；发送方填入相同配对码即可。建议 8 位以上。\n共享：「共享」页开启 HTTP 共享，手机扫码即可浏览/上传/下载。\n同步：文件夹发送默认差量同步——重复发送只传差异，适合日常备份。\n校验：「校验」页重算全部接收文件的 SHA-256，核对是否被改动；支持定时与周期性自动校验。\n监控：「发送」页设置监控目录，文件就绪即自动发出。\n队列：类型选「队列」，添加文件/文件夹后发送；可设完成后动作（关机/休眠/命令）。\n拖放：文件直接拖入窗口——单文件填路径，多文件入队列。",
     notify_sound: "提示音", sync_strict: "同步逐字节核对（绕过摘要缓存，双侧生效）",
     kind: "类型", kind_file: "文件", kind_folder: "文件夹", kind_text: "文本", kind_monitor: "监控", kind_queue: "队列",
     queue_add_files: "添加文件…", queue_add_folder: "添加文件夹…", queue_hint: "文件与文件夹可混合入队，按顺序逐项发送",
@@ -44,6 +44,13 @@ const L10N = {
     qr_hint: "手机浏览器扫码即可浏览 / 上传 / 下载共享目录。",
     verify_desc: "聚合扫描全部已配置保存目录，重算 SHA-256 与摘要缓存比对。",
     verify_start: "开始校验", verify_stop: "停止",
+    verify_once: "定时校验", verify_periodic: "周期性校验", verify_every: "每",
+    verify_minute: "分钟", verify_hour: "小时", verify_day: "天",
+    verify_next: "下次自动校验：{time}", verify_next_none: "未设置自动校验",
+    verify_once_missing: "请选择定时校验的时间", verify_period_invalid: "请输入有效的周期（至少 1 分钟）",
+    verify_scheduled_start: "已启动定时校验",
+    verify_schedule_failed: "自动校验启动失败",
+    verify_busy: "校验正在进行，稍后重试",
     v_scanned: "已扫描", v_hit: "一致", v_fresh: "无记录", v_bad: "不一致", v_unread: "无法读取",
     settings_general: "通用", notify: "完成通知", autostart: "开机自启",
     folder_mode: "发送方式", mode_sync: "差量同步（二次只传差异）", mode_plain: "整夹发送（全量）",
@@ -109,7 +116,7 @@ const L10N = {
     text_history: "Text history (200)", th_empty: "No records", gen_code: "Gen pairing code", pairing_len: "Code length",
     code_ph_send: "Receiver's code", code_ph_local: "4-12 digits",
     batch_add: "Batch enqueue", help_title: "Help", help_close: "Close",
-    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes all received files to detect tampering.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
+    help_body: "Send: pick a type (file/folder/text/monitor/queue), fill the target IP and port, click Send. \"Chunks\" speeds up large files with parallel connections.\nReceive: start listeners on the Receive tab (TCP/QUIC/RUDP/UDP can run at once, each with its own port and folder). Allow the firewall on first start.\nPairing code: the receiver sets or generates it in Settings; the sender enters the same code. 8+ digits recommended.\nShare: enable HTTP sharing on the Share tab, then scan the QR with a phone to browse/upload/download.\nSync: folder sends are delta-sync by default - only differences are re-sent, ideal for backups.\nVerify: the Verify tab re-hashes received files to detect tampering; supports scheduled and recurring checks.\nMonitor: set a watch folder on the Send tab; ready files are sent automatically.\nQueue: pick the Queue type, add files/folders, then send; set an after-done action (shutdown/sleep/command).\nDrag & drop: drop files onto the window - single file fills the path, multiple files go to the queue.",
     notify_sound: "Sound", sync_strict: "Sync byte-verify (bypass digest cache, both sides)",
     kind: "Type", kind_file: "File", kind_folder: "Folder", kind_text: "Text", kind_monitor: "Monitor", kind_queue: "Queue",
     queue_add_files: "Add files…", queue_add_folder: "Add folder…", queue_hint: "Files and folders can be mixed; sent one by one in order",
@@ -126,6 +133,13 @@ const L10N = {
     qr_hint: "Scan with a mobile browser to browse / upload / download the shared folder.",
     verify_desc: "Scan all configured save dirs, re-hash SHA-256 and compare with the digest cache.",
     verify_start: "Start verify", verify_stop: "Stop",
+    verify_once: "Scheduled verify", verify_periodic: "Recurring verify", verify_every: "Every",
+    verify_minute: "minute(s)", verify_hour: "hour(s)", verify_day: "day(s)",
+    verify_next: "Next auto-verify: {time}", verify_next_none: "No auto-verify scheduled",
+    verify_once_missing: "Pick a date and time for the scheduled verify", verify_period_invalid: "Enter a valid interval (at least 1 minute)",
+    verify_scheduled_start: "Scheduled verify started",
+    verify_schedule_failed: "Failed to start scheduled verify",
+    verify_busy: "Verify is already running; will retry",
     v_scanned: "Scanned", v_hit: "Matched", v_fresh: "No record", v_bad: "Mismatch", v_unread: "Unreadable",
     settings_general: "General", notify: "Notifications", autostart: "Launch on startup",
     folder_mode: "Send mode", mode_sync: "Delta sync (changes only)", mode_plain: "Full folder send",
@@ -250,6 +264,8 @@ function applyLang() {
   $("#lang-zh").classList.toggle("active", lang === "zh");
   $("#lang-en").classList.toggle("active", lang === "en");
   localStorage.setItem("trft-lang", lang);
+  // 定时校验状态是动态文案（含时间），语言切换后单独刷新。
+  if (typeof renderVerifyNext === "function") renderVerifyNext();
 }
 
 /* ============ 主题 ============ */
@@ -1375,6 +1391,193 @@ $("#btn-verify-start").addEventListener("click", async () => {
 });
 $("#btn-verify-stop").addEventListener("click", () => invoke("verify_stop"));
 
+/* ============ 校验定时 / 周期 ============ */
+// 调度是 GUI 侧的轻量定时器（不依赖后端）：配置随 localStorage 持久化，
+// 应用运行（含隐藏到托盘）期间按到期时间触发 verify_start；应用退出后
+// 下次启动会补跑已到期的定时项。
+const VERIFY_ONCE_KEY = "trft-verify-once-at";
+const VERIFY_PERIOD_KEY = "trft-verify-period-min";
+const VERIFY_LAST_KEY = "trft-verify-last-run";
+let verifyScheduleTimer = null;
+let verifyScheduleWired = false;
+
+function readVerifySchedule() {
+  const num = (k) => {
+    const v = parseInt(localStorage.getItem(k) || "0", 10);
+    return isFinite(v) && v > 0 ? v : 0;
+  };
+  return { once: num(VERIFY_ONCE_KEY), period: num(VERIFY_PERIOD_KEY), last: num(VERIFY_LAST_KEY) };
+}
+function writeVerifySchedule(s) {
+  const put = (k, v) => { if (v > 0) localStorage.setItem(k, String(v)); else localStorage.removeItem(k); };
+  put(VERIFY_ONCE_KEY, s.once || 0);
+  put(VERIFY_PERIOD_KEY, s.period || 0);
+  put(VERIFY_LAST_KEY, s.last || 0);
+}
+function verifyPad2(n) { return String(n).padStart(2, "0"); }
+function toLocalInput(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + "-" + verifyPad2(d.getMonth() + 1) + "-" + verifyPad2(d.getDate())
+    + "T" + verifyPad2(d.getHours()) + ":" + verifyPad2(d.getMinutes());
+}
+function formatVerifyTime(ms) { return new Date(ms).toLocaleString(); }
+function nextVerifyDue(now) {
+  now = now || Date.now();
+  const s = readVerifySchedule();
+  let due = 0;
+  if (s.once > 0) due = s.once;
+  if (s.period > 0) {
+    // 首次周期从当前时刻起算；之后以最近一次自动运行为锚点。
+    let p = s.last > 0 ? s.last + s.period * 60000 : now + s.period * 60000;
+    if (p <= now) p = now + 1000; // 错过的周期只补跑一次，不连续追补
+    due = due > 0 ? Math.min(due, p) : p;
+  }
+  return due;
+}
+function renderVerifyNext() {
+  const el = $("#verify-next");
+  if (!el) return;
+  const due = nextVerifyDue();
+  el.textContent = due > 0 ? t("verify_next").replace("{time}", formatVerifyTime(due)) : t("verify_next_none");
+}
+function syncVerifyScheduleUi(loadInputs) {
+  const s = readVerifySchedule();
+  const onceChk = $("#verify-once-enable"), onceAt = $("#verify-once-at");
+  const pChk = $("#verify-period-enable"), pVal = $("#verify-period-value"), pUnit = $("#verify-period-unit");
+  if (!onceChk || !onceAt || !pChk || !pVal || !pUnit) return;
+  onceChk.checked = s.once > 0;
+  if (!s.once) onceAt.value = "";
+  if (loadInputs) {
+    if (s.once > 0) onceAt.value = toLocalInput(s.once);
+    pChk.checked = s.period > 0;
+    if (s.period > 0) {
+      if (s.period % 1440 === 0) { pVal.value = s.period / 1440; pUnit.value = "day"; }
+      else if (s.period % 60 === 0) { pVal.value = s.period / 60; pUnit.value = "hour"; }
+      else { pVal.value = s.period; pUnit.value = "minute"; }
+    } else {
+      pVal.value = 1;
+      pUnit.value = "hour";
+    }
+  }
+  if (!s.period) pChk.checked = false;
+  renderVerifyNext();
+}
+async function runScheduledVerify() {
+  const s = readVerifySchedule();
+  const now = Date.now();
+  const onceDue = s.once > 0 && s.once <= now;
+  const periodDue = s.period > 0 && s.last > 0 && s.last + s.period * 60000 <= now;
+  // 只有周期项确实到期（或首次启用）才重置周期锚点；一次性的运行不应推迟
+  // 尚未到期的周期校验。
+  const resetPeriod = periodDue || (s.period > 0 && s.last === 0);
+  if (!onceDue && !periodDue) return "none";
+  try {
+    await invoke("verify_start");
+    const cur = readVerifySchedule();
+    if (onceDue) cur.once = 0;
+    if (resetPeriod) cur.last = now;
+    writeVerifySchedule(cur);
+    renderVerifyNext();
+    toast(t("verify_scheduled_start"), "ok");
+    return "started";
+  } catch (e) {
+    const msg = String(e);
+    if (msg.indexOf("进行中") >= 0 || msg.toLowerCase().indexOf("running") >= 0) {
+      toast(t("verify_busy"), "warn");
+      return "busy"; // 保留到期项，60s 后重试
+    }
+    const cur = readVerifySchedule();
+    if (onceDue) cur.once = 0;
+    if (resetPeriod) cur.last = now; // 周期项失败后等下一个周期，避免紧循环
+    writeVerifySchedule(cur);
+    renderVerifyNext();
+    toast(t("verify_schedule_failed") + ": " + msg, "err");
+    return "failed";
+  }
+}
+function scheduleVerifyTimer() {
+  if (verifyScheduleTimer) { clearTimeout(verifyScheduleTimer); verifyScheduleTimer = null; }
+  renderVerifyNext();
+  const due = nextVerifyDue();
+  if (!due) return;
+  const delay = Math.max(0, Math.min(due - Date.now(), 2147483647));
+  verifyScheduleTimer = setTimeout(async () => {
+    verifyScheduleTimer = null;
+    const result = await runScheduledVerify();
+    if (result === "busy") {
+      verifyScheduleTimer = setTimeout(scheduleVerifyTimer, 60000);
+      return;
+    }
+    syncVerifyScheduleUi(false);
+    scheduleVerifyTimer();
+  }, delay);
+}
+function saveVerifyOnce() {
+  const chk = $("#verify-once-enable");
+  const at = $("#verify-once-at");
+  const s = readVerifySchedule();
+  if (!chk.checked) {
+    s.once = 0;
+    writeVerifySchedule(s);
+    renderVerifyNext();
+    scheduleVerifyTimer();
+    return;
+  }
+  let ms = at.value ? new Date(at.value).getTime() : 0;
+  if (!ms || isNaN(ms)) {
+    // 勾选但未选时间：默认一小时后，避免“勾了却静默不生效”。
+    ms = Date.now() + 3600000;
+    at.value = toLocalInput(ms);
+  }
+  s.once = ms;
+  writeVerifySchedule(s);
+  renderVerifyNext();
+  scheduleVerifyTimer();
+}
+function saveVerifyPeriod() {
+  const chk = $("#verify-period-enable");
+  const s = readVerifySchedule();
+  if (!chk.checked) {
+    s.period = 0;
+    s.last = 0;
+    writeVerifySchedule(s);
+    renderVerifyNext();
+    scheduleVerifyTimer();
+    return;
+  }
+  const v = parseInt($("#verify-period-value").value, 10);
+  const unit = $("#verify-period-unit").value;
+  const factor = unit === "day" ? 1440 : unit === "hour" ? 60 : 1;
+  if (!v || v < 1) {
+    toast(t("verify_period_invalid"), "err");
+    chk.checked = false;
+    s.period = 0;
+    s.last = 0;
+    writeVerifySchedule(s);
+    renderVerifyNext();
+    scheduleVerifyTimer();
+    return;
+  }
+  let minutes = v * factor;
+  if (minutes > 525600) minutes = 525600; // 上限一年
+  s.period = minutes;
+  s.last = 0; // 修改周期后重新计时
+  writeVerifySchedule(s);
+  renderVerifyNext();
+  scheduleVerifyTimer();
+}
+function initVerifySchedule() {
+  if (verifyScheduleWired) return;
+  verifyScheduleWired = true;
+  syncVerifyScheduleUi(true);
+  $("#verify-once-enable").addEventListener("change", saveVerifyOnce);
+  $("#verify-once-at").addEventListener("change", () => { if ($("#verify-once-enable").checked) saveVerifyOnce(); });
+  $("#verify-period-enable").addEventListener("change", saveVerifyPeriod);
+  $("#verify-period-value").addEventListener("change", () => { if ($("#verify-period-enable").checked) saveVerifyPeriod(); });
+  $("#verify-period-unit").addEventListener("change", () => { if ($("#verify-period-enable").checked) saveVerifyPeriod(); });
+  scheduleVerifyTimer();
+}
+
 /* ============ 设置 ============ */
 function fillShareDirOptions() {
   const sel = $("#share-dir-sel");
@@ -2124,6 +2327,7 @@ $("#btn-help-close").addEventListener("click", () => $("#help-overlay").classLis
   setupDragDrop();
   updateKindRows();
   wireValidation();
+  initVerifySchedule();
   // 规格 §3.7 自动升级：启动 3 秒后台静默检查（配置了 UpdateUrl 才查），「跳过此版本」记忆。
   setTimeout(async () => {
     if (!appState.config.update_url) return;
