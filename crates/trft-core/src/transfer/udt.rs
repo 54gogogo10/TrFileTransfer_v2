@@ -1564,7 +1564,10 @@ pub async fn serve_udt_on(
     let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let socket = Arc::new(socket);
     // C# 方言跨连接状态（分块组装/断点会话/组归属）——serve 级共享。
-    let cs_state = Arc::new(crate::transfer::cswire::CsServerState::default());
+    // 落盘 journal（与 serve_tcp_on 同口径）：跨进程保留「已知完整」事实。
+    let cs_state = Arc::new(crate::transfer::cswire::CsServerState::with_journal(
+        &opts.save_dir,
+    ));
     // 连接出包共享通道（此前每连接一跳 forward 任务——每包两次调度 + 一跳通道）。
     let (out_tx, mut out_rx) = unbounded_channel::<OutPkt>();
     let out_sock = Arc::clone(&socket);

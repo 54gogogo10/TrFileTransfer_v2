@@ -1074,6 +1074,10 @@ pub struct CsServerState {
     /// C# FileHashes 进程内存 Dictionary 同语义：重复同步免整盘重读；不落盘，
     /// 无磁盘产物副作用，服务端重启即失 = 保守方向）。
     pub sync_hashes: Mutex<HashMap<(u64, u64, u64), [u8; 32]>>,
+    /// 同一份「已知完整」事实的**落盘**形态（保存目录下的
+    /// `.trft-hash-cache-server.txt`，C# server journal 同义）。进程重启后首轮同步
+    /// 靠它区分「上一个完整版本」与「断点半成品」；None = 纯内存（单测/无目录）。
+    pub sync_journal: Mutex<Option<crate::hashcache::HashCache>>,
     /// 组会话归属（guid → (首个 peer IP, 最后活跃)）。
     pub group_peers: Mutex<HashMap<String, (String, Instant)>>,
     /// 跨连接存活会话（0x02 tracker + 0x03 resume）的声明总量记账
@@ -1094,6 +1098,20 @@ const CS_MAX_RESUME_SESSIONS: usize = 256;
 const CS_RESUME_TTL: Duration = Duration::from_secs(30 * 60);
 /// 0x04 摘要缓存条目封顶（对齐 hashcache DEGRADED_MAP_CAP 纪律——轮 UI-2 P3-1）。
 const CS_SYNC_HASH_CAP: usize = 200_000;
+
+impl CsServerState {
+    /// 打开保存目录的落盘摘要 journal。服务端重启后（新进程、新状态）首轮 0x04
+    /// 仍能认出「上一轮写完的完整版本」——此前纯内存，重启即失，会把变长的旧档
+    /// 当成断点半成品去拼接（TECH-STACK §7.64 残留项）。
+    pub fn with_journal(save_dir: &Path) -> Self {
+        let st = Self::default();
+        let path = crate::hashcache::server_cache_file_for(save_dir);
+        *st.sync_journal.lock().expect("同步 journal 锁") = Some(
+            crate::hashcache::HashCache::load(&path, crate::hashcache::DEFAULT_TTL_DAYS),
+        );
+        st
+    }
+}
 
 /// C# ChunkTracker 等价物：预分配文件 + 区间合并覆盖。
 pub struct CsChunkTracker {
@@ -1372,6 +1390,23 @@ fn sync_hash_of(
     if let Some(h) = state.sync_hashes.lock().expect("同步缓存锁").get(&key) {
         return *h;
     }
+    let path_str = p.to_string_lossy().to_string();
+    // 进程内未命中 → 查落盘 journal（服务端重启后的首轮：上一轮写完的完整版本
+    // 仍在这里，不必重读盘）。
+    if let Some(h) = state
+        .sync_journal
+        .lock()
+        .expect("同步 journal 锁")
+        .as_ref()
+        .and_then(|j| j.get(&path_str, size, mtime))
+    {
+        let mut cache = state.sync_hashes.lock().expect("同步缓存锁");
+        if cache.len() >= CS_SYNC_HASH_CAP {
+            cache.clear();
+        }
+        cache.insert(key, h);
+        return h;
+    }
     let h = crate::hash::sha256_file(p).unwrap_or_default();
     let mut cache = state.sync_hashes.lock().expect("同步缓存锁");
     // 条目封顶（轮 UI-2 P3-1——对齐 hashcache DEGRADED_MAP_CAP：百万文件级
@@ -1380,6 +1415,11 @@ fn sync_hash_of(
         cache.clear();
     }
     cache.insert(key, h);
+    drop(cache);
+    // 现算即「已核对完整」——登记落盘（C# VerifyFullHashFile → StoreIfUnchanged 同义）。
+    if let Some(j) = state.sync_journal.lock().expect("同步 journal 锁").as_mut() {
+        j.insert(&path_str, size, mtime, h);
+    }
     h
 }
 
@@ -1399,18 +1439,35 @@ fn remember_sync_hash(state: &Arc<CsServerState>, p: &Path, hash: &[u8; 32]) {
         cache.clear();
     }
     cache.insert(key, *hash);
+    drop(cache);
+    // 追加一行到落盘 journal（写失败静默退化为内存缓存，与 hashcache 同纪律）。
+    if let Some(j) = state.sync_journal.lock().expect("同步 journal 锁").as_mut() {
+        j.insert(&p.to_string_lossy(), md.len(), key.2, *hash);
+    }
 }
 
 /// 0x04 续点判定：当前 (size, mtime) 已被本进程登记过摘要 = 盘上是某个**完整版本**
 /// （C# `KnownComplete` / `FileHashes.Knows` 同义）。短于发送端的已知完整文件是
 /// 「旧版本」，不能当断点前缀拼接；只有从未登记过的短文件才按半成品续传。
 fn known_complete(state: &Arc<CsServerState>, p: &Path, size: u64) -> bool {
-    let key = (fnv1a(p.to_string_lossy().as_bytes()), size, mtime_nanos(p));
-    state
+    let mtime = mtime_nanos(p);
+    let key = (fnv1a(p.to_string_lossy().as_bytes()), size, mtime);
+    if state
         .sync_hashes
         .lock()
         .expect("同步缓存锁")
         .contains_key(&key)
+    {
+        return true;
+    }
+    // 跨进程事实：进程重启后靠 journal 仍能认出「上一轮写完的完整版本」。
+    state
+        .sync_journal
+        .lock()
+        .expect("同步 journal 锁")
+        .as_ref()
+        .map(|j| j.get(&p.to_string_lossy(), size, mtime).is_some())
+        .unwrap_or(false)
 }
 
 /* ============ 服务端连接处理 ============ */
@@ -1785,7 +1842,8 @@ pub async fn serve_tcp_on(listener: tokio::net::TcpListener, opts: RecvOptions) 
     cleanup_part_orphans(&opts.save_dir);
     crate::transfer::resume::cleanup_resume_orphans(&opts.save_dir);
     let served = Arc::new(AtomicU64::new(0));
-    let state = Arc::new(CsServerState::default());
+    // 落盘 journal：服务端重启后首轮 0x04 仍能区分「旧完整版本」与「断点半成品」。
+    let state = Arc::new(CsServerState::with_journal(&opts.save_dir));
     match opts.max_count {
         // 限量模式（CLI --count）：串行处理，收满即停（与 v2 帧同口径：只有
         // 真实完成的一次传输才计数——0x02 的中间块不计）。
@@ -4242,6 +4300,41 @@ pub async fn send_text_cs_tcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 判别（2026-11-23，服务端重启场景）：`known_complete` 必须跨进程存活——
+    /// 新 `CsServerState`（= 重启后的服务端）凭保存目录里的 journal 仍能认出
+    /// 「上一轮写完的完整版本」，不会把变长旧档当断点半成品去拼接。
+    /// 纯内存实现下第二次断言必红（TECH-STACK §7.64 残留项）。
+    #[test]
+    fn known_complete_survives_restart_via_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.bin");
+        std::fs::write(&done, b"alpha\n").unwrap();
+        let hash = crate::hash::sha256_file(&done).unwrap();
+
+        let st1 = Arc::new(CsServerState::with_journal(dir.path()));
+        let size = std::fs::metadata(&done).unwrap().len();
+        remember_sync_hash(&st1, &done, &hash);
+        assert!(known_complete(&st1, &done, size), "当前进程必须认得刚写完的版本");
+
+        // 重启：新状态、空内存缓存，只有落盘 journal。
+        let st2 = Arc::new(CsServerState::with_journal(dir.path()));
+        assert!(
+            st2.sync_hashes.lock().unwrap().is_empty(),
+            "前提：新状态的内存缓存必须是空的"
+        );
+        assert!(
+            known_complete(&st2, &done, size),
+            "落盘 journal 必须让重启后的服务端仍认出「已知完整」"
+        );
+
+        // 负例：从未登记过的短文件仍是断点半成品（不得一律当完整，否则续传失效）。
+        let partial = dir.path().join("partial.bin");
+        std::fs::write(&partial, b"half").unwrap();
+        assert!(!known_complete(&st2, &partial, 4), "未登记文件不得判为已知完整");
+        // 负例：同一路径换了长度即不认（键含 size——旧版本被改过）。
+        assert!(!known_complete(&st2, &done, size + 9), "长度不符不得命中");
+    }
 
     /// 轮 UI-5 续 5 判别：tracker/会话表必须有条数上限（declared_total 只封字节），
     /// 超出按 touched 最旧逐出；resume 只摘会话不删文件（可能是已验证交付）。

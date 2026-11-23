@@ -228,10 +228,14 @@ fn decode_hash(hex: &str) -> std::result::Result<[u8; 32], ()> {
 pub const CACHE_FILE_NAME: &str = ".trft-hash-cache.txt";
 /// 原子换入产生的 `.bak` 镜像（config::write_atomic 同族产物）——扫描/清单同样必须排除。
 pub const CACHE_BAK_NAME: &str = ".trft-hash-cache.bak";
+/// 0x04 **服务端**摘要 journal（`KnownComplete` 判据的落盘形态，C# 落在
+/// %APPDATA%\TrFileTransfer\hash-cache-server.txt 的等价物）。与客户端缓存分文件：
+/// 服务端进程常驻持有追加句柄，同文件会让 verify 的原子重写撞共享冲突。
+pub const SERVER_CACHE_NAME: &str = ".trft-hash-cache-server.txt";
 
-/// 缓存族文件判定（主文件 + .bak 镜像）。
+/// 缓存族文件判定（主文件 + .bak 镜像 + 服务端 journal）。
 pub fn is_cache_artifact(name: &str) -> bool {
-    name == CACHE_FILE_NAME || name == CACHE_BAK_NAME
+    name == CACHE_FILE_NAME || name == CACHE_BAK_NAME || name == SERVER_CACHE_NAME
 }
 
 /// 瞬态文件判定：内部元数据（缓存族）+ 传输未完成时的中间产物。
@@ -254,6 +258,11 @@ pub fn is_transient_name(name: &str) -> bool {
 /// 便捷入口：确保目录级缓存文件名。
 pub fn cache_file_for(dir: &Path) -> std::path::PathBuf {
     dir.join(CACHE_FILE_NAME)
+}
+
+/// 便捷入口：0x04 服务端 journal 文件名（与保存目录同级）。
+pub fn server_cache_file_for(dir: &Path) -> std::path::PathBuf {
+    dir.join(SERVER_CACHE_NAME)
 }
 
 #[cfg(test)]
