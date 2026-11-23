@@ -133,6 +133,7 @@
 |------|------|
 | 发送队列 | 串行批量执行；逐项快照面板参数；失败自动重试 `QueueRetries`（0–5，默认 1）次；列表持久化（`queue.txt`，上限 500 项，`|` 分隔——该字符在 Windows 文件名非法）；**完成后动作**：无 / 关机（`shutdown /s /t 60`，可 `shutdown /a` 取消）/ 休眠 / 执行命令，执行前弹确认 |
 | 群发 | 复选已知设备 + 在线设备 + 手输 IP:端口（IPv4/v6 校验；重复地址只勾不重加）；并行对每目标起独立客户端（按面板协议/限速/配对码）；逐目标进度卡片；汇总 `{ok}/{total}` 并通知；可整体取消 |
+| 文件夹排除扩展名 | 整夹（0x01）与差量同步（0x04）按扩展名跳过文件：大小写与前导点不敏感、无扩展名文件不受影响、命中即不进清单也不传输（接收端不产生条目）；**四类清单构建路径同口径**（v2 帧 0x01/0x04、C# 方言 0x01/0x04）；入口：CLI `--exclude-exts`、GUI 发送卡「排除扩展名」（记忆 `FolderExcludeExts`）、队列中文件夹项入队即快照 |
 | 监控模式 | `FileSystemWatcher` + 启动全量扫描；**拷贝完成检测**：独占打开（FileShare.None）成功 + 500ms 大小稳定窗口双重判定——半截文件与「0 字节占位后填充」不得发出；**未就绪文件在队列中后移一个位置**（队首让给下一个文件，本文件下一轮重试，不阻塞队首）；已消失文件直接丢弃；未就绪日志按文件节流（首报立即、后续 60 秒一次）；成功后移入「已发送文件/」（重名追加序号）；**排除扩展名**（`MonitorExcludeExts`，逗号分隔、大小写与前导点不敏感；命中即不扫描不入队，无扩展名文件不受影响） |
 | 文本互传 | 0x06，UTF-8 ≤1MB；接收侧弹非模态对话框（复制按钮）+ 气泡通知；历史落盘 200 条重启不丢 |
 | 拖放 | 多文件/文件夹拖入逐项入队并打开队列对话框；单文件填充路径框 |
@@ -441,7 +442,7 @@
 | 服务器 | `ServerPortTCP/QUIC/RUDP/UDP` `ServerBindTCP/UDP` `SaveDirTCP/QUIC/RUDP/UDP`（Rust v2 命名；注：C# 版的 `*UDT` 配置键承载的是 QUIC 槽位语义——拆分前本版同名键亦然，存量数据已迁移，见 §9.2 拆分行；拆分批曾短暂使用 `*UDT` 键承载自研流，更名批改 `*RUDP`，未发布无存量）`AutoArchive` |
 | 接收选项 | `ConfirmReceive` `IpFilterMode` `IpFilterList` `PerDeviceFolder` `DuplicateFiles` `RecvSpeedLimit` `HashCacheDays`（同时决定 0x04 同步续点 journal 的有效期；0=永久） `SyncVerifyContent` `PairingLength` `MonitorExcludeExts` |
 | 配对/加密 | `PairingCode` `Encrypt` `EncryptStrict` `Compress` |
-| 客户端 | `ClientIP` `ClientPort` `ClientProtocol` `LastPath` `FolderMode` `SyncMode` `MonitorMode` `VerifyHash` `Concurrency` `SrcPort` `SpeedLimit` |
+| 客户端 | `ClientIP` `ClientPort` `ClientProtocol` `LastPath` `FolderMode` `SyncMode` `MonitorMode` `VerifyHash` `Concurrency` `SrcPort` `SpeedLimit` `FolderExcludeExts`（文件夹/同步发送的排除扩展名；面板记忆） |
 | 单向 UDP | `UdpPasses` `UdpFecParity` `UdpFec` |
 | 队列 | `QueueRetries` `QueueAfterAction` `QueueAfterCommand` |
 | HTTP 共享 | `HttpSharePort` `QrAddress` |

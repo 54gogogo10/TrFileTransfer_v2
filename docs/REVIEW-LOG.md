@@ -989,4 +989,9 @@ CLI `recv` 与 GUI 接收器同源），此前硬编码 7 天；② 监控模式
 GUI 监控卡输入并在启动时落盘）。判别 `monitor_excludes_configured_extensions`；
 全量 312 → **313 项全绿**。
 
+**补记 3（同日）**：文件夹发送统一支持排除扩展名（TECH-STACK §7.67）——新增 `crate::extext` 统一归一化/命中口径，
+四条清单构建路径（v2 0x01/0x04、C# 方言 0x01/0x04）统一读 `SendOptions.exclude_exts`；入口含 CLI
+`--exclude-exts`、GUI 发送卡输入（记忆 `FolderExcludeExts`）、队列文件夹项快照（行格式第 14 字段，
+旧 13 字段行兼容）。判别 4 条（v2/C# 两套 walker 各一 + 归一化 + 队列格式）；全量 313 → **317 项全绿**。
+
 

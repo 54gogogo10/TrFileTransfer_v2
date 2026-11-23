@@ -506,6 +506,13 @@
     - **判别**：`monitor_excludes_configured_extensions`（归一化口径 + 扫描过滤 + 空列表不排除）。
     - **兼容**：旧 `config.toml` 无该键 → serde 缺省空表（不排除）；`RecvOptions` 新字段在 `Default` 取 `DEFAULT_TTL_DAYS`，既有测试构造一律 `..Default::default()`。
 
+67. **文件夹发送统一支持排除扩展名（2026-11-23）**：基线 313 → **317 项全绿**（+4 判别）。
+    - **口径统一**：新增 `crate::extext`（`normalize_exts` / `ext_excluded` / `path_excluded`），监控与发送共用同一套归一化与命中规则（原先只存在于 `monitor.rs`，抽出后两个调用点不再各写一份）。
+    - **覆盖四条清单构建路径**：v2 帧 0x01（`folder::collect_files`）、v2 帧 0x04（`resume::send_folder_resume`）、C# 方言 0x01（`cs_send_folder` 的 walk）、C# 方言 0x04（`build_sync_manifest` 的 walk）——统一读 `SendOptions.exclude_exts`，命中即不进清单、不传输（接收端按清单落盘，本来也看不到这些名字）。
+    - **入口**：CLI `send --exclude-exts tmp,log` / `sync --exclude-exts …`（逗号或重复给出，归一化后再传入）；GUI 发送卡文件夹类型新增「排除扩展名」输入（逗号/分号/空白分隔），面板值记忆在 `Config.folder_exclude_exts` 跨重启恢复；队列的文件夹项入队即快照（`QueueItem.exclude_exts`，队列行第 14 字段；旧 13 字段行照常解析、执行时回落当前面板），群发与整夹/同步共用同一份请求。
+    - **判别**：`folder_send_excludes_configured_extensions`（v2 0x01，含子目录与无扩展名文件）、`udt_folder_send_excludes_configured_extensions`（C# 0x01；两套 walker 各自钉死，防止只修一边）、`normalize_and_match`（extext 口径）、队列 `round_trip_full_fourteen_fields` 与 `thirteen_field_lines_still_parse`（格式向后兼容）。
+    - **口径**：只过滤发送侧清单——接收端已有文件不删（与同步「保留已删除」语义一致）；扩展名与文件名大小写不敏感，`noext`/`.hidden` 不受影响。
+
 ## 8. 记录在案的否决项
 
 | 选项 | 理由 |
