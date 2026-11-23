@@ -976,4 +976,10 @@ TCP 199 / QUIC 179 / UDT 161；真机矩阵 14/14 + GUI 0x02 复验全 SHA-256 �
 `known_complete` + 收完即登记摘要；判别 `cs_dialect_sync_replaces_file_that_grew`（去修复必红 `Rejected`），
 双机 T8 复跑 rc=0/0 通过。全量用例 310 → **311 项全绿**。
 
+**补记（同日）**：§7.64 的 `known_complete` 原先只在进程内存——服务端重启后首轮仍会误判。补保存目录内
+`.trft-hash-cache-server.txt` 落盘 journal（`CsServerState::with_journal`，复用 `HashCache` 追加日志机制，
+归入 `is_cache_artifact`），判别 `known_complete_survives_restart_via_journal`（TECH-STACK §7.65）。
+双机复测（端口不变、接收端进程重启）：删 journal 模拟旧行为 → 二轮 rc=1 且目标文件消失；保留 journal →
+二轮 rc=0、哈希一致。全量 311 → **312 项全绿**。
+
 
