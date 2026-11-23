@@ -58,6 +58,29 @@ DEF-1 修复后仍留一个缺口：`known_complete` 只查进程内存，**服�
 
 两变体首轮均「同步完成」。T8R0 复现的正是 §7.64 描述的现象，说明该用例对修复有判别力。
 
+## C 段：GUI 本机冒烟（2026-11-23，CDP 驱动）
+
+环境：本机 `target\release\trft-gui.exe`（含本批全部改动），
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` 启动，Node CDP
+`Runtime.evaluate` 驱动 DOM（驱动脚本 `.zcode/gui-verify.mjs`，gitignored）；接收端为同机 CLI `trft recv`。
+验证前备份 `%APPDATA%\TrFileTransfer\config.toml`，结束后原样还原（含 `hash_cache_days`）。
+
+| ID | 用例 | 结果 | 证据 |
+|---|---|---|---|
+| C18a | 类型=文件夹、排除 `.tmp, LOG`、整夹发送 | ✅ | 排除行可见；日志「传输完成: src」；接收端仅 `src\keep.bin`、`src\sub\noext`（`.tmp`/`.LOG` 未传） |
+| C18b | 同参数切「差量同步」再发 | ✅ | 日志「传输完成: 同步: src」；接收端仅 `src.c025e4ca\keep.bin` 与 `sub\noext` |
+| C18c | 队列：入队文件夹项后执行 | ✅ | 日志「队列 1/src」「#4 1 完成」；接收端仅未被排除的两个文件（入队快照生效） |
+| C18d | 重启 GUI 后回填 | ✅ | `#send-exclude` = `.tmp, LOG`（config `folder_exclude_exts` 持久化） |
+| C16 | 监控：目录 + 排除 `.tmp, LOG`，预置三个落料 | ✅ | 监控列表「入队/发送中/已发送 keep-m.bin」；`skip-m.tmp`、`skip-m.LOG` 留在监控目录未入队；停止后状态复位 |
+| C16b | 重启 GUI 后回填 | ✅ | `#monitor-exclude` = `.tmp, LOG` |
+| C17 | 设置页「摘要缓存/同步续点有效期」 | ✅ | 改 0 保存 → `config.toml hash_cache_days = 0`；改回 7 → `= 7` |
+
+JS 异常/控制台错误：0（CDP eval 无 exception，无遮挡弹层）；截图：`target/gui-folder.png`（文件夹类型的排除行）、
+`target/gui-monitor.png`（监控卡排除行）。
+
+备注：驱动脚本首跑把源路径写成 `C:\Users\...\Temp`（本机实际 TEMP 为 `D:\cache\temp`），
+产生一次「目录为空」的预期内失败；修正路径后全部通过——该失败属驱动路径错误，非产品缺陷。
+
 ## 已知限制 / 未覆盖
 
 - 服务端 journal（`.trft-hash-cache-server.txt`）与保存目录同生命周期：删掉目录即失效，
