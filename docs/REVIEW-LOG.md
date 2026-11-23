@@ -969,3 +969,11 @@ TCP 199 / QUIC 179 / UDT 161；真机矩阵 14/14 + GUI 0x02 复验全 SHA-256 �
 **遗留 / 已知耦合**：① 定时校验的「忙」判定匹配后端错误串「进行中」，改文案需同步前端（登记未改）；
 ② `batch_add`/`queue_add`/`queue_run` 三个文案键随入口移除删除。
 
+**双机验证（VM 10.184.213.49，2026-11-23）**：宿主 10.184.213.78 → VM（SMB `C$` + `schtasks` 以 SYSTEM 运行接收端），
+10 项矩阵覆盖 TCP/QUIC/RUDP/UDT/UDP、并行分块、文件夹 0x01、同步 0x04、断点续传、校验瞬态排除，修复后 10/10 通过
+（详见 [QA-RESULTS-2026-11-23.md](QA-RESULTS-2026-11-23.md)）。首轮暴露缺陷 **DEF-1**：0x04 二轮同步遇到**变长**
+文件时报「对端拒绝」且目标目录丢文件——C# `KnownComplete` 守卫移植时丢失（TECH-STACK §7.64）。已补
+`known_complete` + 收完即登记摘要；判别 `cs_dialect_sync_replaces_file_that_grew`（去修复必红 `Rejected`），
+双机 T8 复跑 rc=0/0 通过。全量用例 310 → **311 项全绿**。
+
+
