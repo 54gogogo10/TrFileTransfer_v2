@@ -257,6 +257,13 @@ pub(crate) fn ensure_contained(save_dir: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 收到的一条文本消息（0x06）：内容 + 来源（GUI 弹窗标题用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextMsg {
+    pub text: String,
+    pub peer: std::net::SocketAddr,
+}
+
 #[derive(Clone)]
 pub struct RecvOptions {
     pub save_dir: PathBuf,
@@ -266,7 +273,8 @@ pub struct RecvOptions {
     /// 成功帧数上限（任一帧成功处理即计 1），达到即停（对应 CLI --count）。
     pub max_count: Option<u64>,
     /// 收到文本的回调通道（GUI/Web 面接入点；None 时仅打印）。
-    pub text_tx: Option<mpsc::UnboundedSender<String>>,
+    /// 载荷带来源地址——GUI 弹窗要显示「来自谁」（轮 10：仅 String 时只能弹裸内容）。
+    pub text_tx: Option<mpsc::UnboundedSender<TextMsg>>,
     /// 接受 0x09 加密升级（TCP 槽位；QUIC 由 TLS 承担）。
     pub encrypt: bool,
     /// 接受 0x08 压缩协商（仅认证后；关闭时回 0x00 宽容降级）。
@@ -971,7 +979,10 @@ where
                     }
                 };
                 if let Some(tx) = &opts.text_tx {
-                    let _ = tx.send(text.clone());
+                    let _ = tx.send(TextMsg {
+                        text: text.clone(),
+                        peer,
+                    });
                 }
                 eprintln!("[文本] 来自 {peer}: {text}");
                 write_u8(&mut s, STATUS_OK).await?;

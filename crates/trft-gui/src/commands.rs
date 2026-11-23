@@ -1155,12 +1155,22 @@ pub async fn recv_start(
                 &cache_file_for(&dir),
                 cfg.hash_cache_days,
             )));
-            let (ttx, mut trx) = mpsc::unbounded_channel::<String>();
+            let (ttx, mut trx) =
+                mpsc::unbounded_channel::<trft_core::transfer::receiver::TextMsg>();
             let app3 = app.clone();
             tauri::async_runtime::spawn(async move {
-                while let Some(t) = trx.recv().await {
-                    text_history_append(&t); // 规格 §3.2：历史落盘 200 条
-                    let _ = app3.emit("trft://text", &t);
+                while let Some(m) = trx.recv().await {
+                    text_history_append(&m.text); // 规格 §3.2：历史落盘 200 条
+                    // 弹窗要能被看到：最小化/后台时把主窗口拉到前台（失败忽略）。
+                    if let Some(w) = app3.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                    // 轮 10：载荷带来源——接收卡弹窗显示「来自 x.x.x.x」。
+                    let _ = app3.emit(
+                        "trft://text",
+                        serde_json::json!({ "text": m.text, "from": m.peer.ip().to_string() }),
+                    );
                 }
             });
             let mut tracker = ChunkTracker::default();

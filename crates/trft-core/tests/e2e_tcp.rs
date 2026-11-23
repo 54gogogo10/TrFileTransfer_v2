@@ -96,7 +96,9 @@ async fn text_roundtrip_then_second_file() {
     send_text(addr, "你好，局域网", &SendOptions::default())
         .await
         .unwrap();
-    assert_eq!(rx.recv().await.unwrap(), "你好，局域网");
+    let msg = rx.recv().await.unwrap();
+    assert_eq!(msg.text, "你好，局域网");
+    assert_eq!(msg.peer.ip(), addr.ip(), "文本消息必须带上来源地址");
 
     let src = dir.path().join("b.bin");
     std::fs::write(&src, vec![1u8; 4096]).unwrap();

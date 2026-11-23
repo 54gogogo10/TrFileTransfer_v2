@@ -721,7 +721,7 @@ body.dragging::after {
 
 /* ============ M5'：接收前确认弹窗 ============ */
 /* #yn-overlay：通用确认模态（队列完成后动作 / 统计清除），与接收确认同浮层样式 */
-#confirm-overlay, #yn-overlay, #help-overlay {
+#confirm-overlay, #yn-overlay, #help-overlay, #text-overlay {
   position: fixed; inset: 0;
   background: color-mix(in srgb, #0a1420 48%, transparent);
   backdrop-filter: blur(3px);
@@ -757,6 +757,23 @@ body.dragging::after {
   line-height: 1.75;
   color: var(--text-dim);
   font-size: 13px;
+  user-select: text;
+}
+
+/* 收到文本弹窗（轮 10）：全文可滚动、可选中复制；多段到达时按「时间 + 来源」分段。 */
+.modal-meta { font-size: 12px; color: var(--text-dim); }
+.modal .text-body {
+  max-height: 46vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--panel-2);
+  border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+  border-radius: var(--radius-s);
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
   user-select: text;
 }
 

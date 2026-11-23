@@ -3092,7 +3092,10 @@ async fn handle_text<S: AsyncRead + AsyncWrite + Unpin>(
     wire.read_exact(&mut buf).await?;
     let text = String::from_utf8_lossy(&buf).to_string();
     if let Some(tx) = &opts.text_tx {
-        let _ = tx.send(text);
+        let _ = tx.send(crate::transfer::receiver::TextMsg {
+            text: text.clone(),
+            peer,
+        });
     } else {
         eprintln!("[文本] {text}");
     }

@@ -543,6 +543,19 @@
     </div>
   </div>
 
+  <!-- 收到文本弹窗（轮 10）：对端 0x06 文本到达即弹出，显示来源与全文 -->
+  <div id="text-overlay" class="hidden">
+    <div class="modal modal-wide">
+      <div class="modal-title" id="text-title" data-i18n="text_title">收到文本</div>
+      <div class="modal-meta mono" id="text-meta"></div>
+      <pre id="text-body" class="text-body mono"></pre>
+      <div class="modal-btns">
+        <button id="btn-text-copy" class="btn" data-i18n="copy">复制</button>
+        <button id="btn-text-close" class="btn primary" data-i18n="help_close">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>
