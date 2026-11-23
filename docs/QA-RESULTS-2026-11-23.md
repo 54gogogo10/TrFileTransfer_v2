@@ -81,6 +81,22 @@ JS 异常/控制台错误：0（CDP eval 无 exception，无遮挡弹层）；�
 备注：驱动脚本首跑把源路径写成 `C:\Users\...\Temp`（本机实际 TEMP 为 `D:\cache\temp`），
 产生一次「目录为空」的预期内失败；修正路径后全部通过——该失败属驱动路径错误，非产品缺陷。
 
+### C 段续：跨机 GUI（VM 10.184.213.49 当服务器，本机 GUI 当客户端）
+
+接收端跑在 VM 上（CLI `trft recv`，schtasks / SYSTEM 起），本机 GUI 经 CDP 驱动发送，落盘用 SMB 目录核对；
+验证后 VM 侧 5 个接收任务已停止并删除，本机 `config.toml` 已还原。
+
+| ID | 用例 | 结果 | 证据（VM `C:\trft-test\recv\...`） |
+|---|---|---|---|
+| X1 | 单文件 → VM:19083 | ✅ | `gui-file\single-remote.bin`（4098 B）；GUI 日志「传输完成: single-remote.bin」 |
+| X2 | 整夹（排除 `.tmp, LOG`）→ VM:19080 | ✅ | `gui-plain\src\keep.bin`、`src\sub\noext`；无 `drop.tmp` / `sub\drop.LOG` |
+| X3 | 差量同步（同排除项）→ VM:19081 | ✅ | `gui-sync\src.7bcade57\keep.bin`、`sub\noext` |
+| X4 | 队列文件夹项 → VM:19084 | ✅ | `gui-queue\src\keep.bin`、`sub\noext`；GUI 日志「队列 1/src」「#4 1 完成」 |
+| X5 | 监控（排除 `.tmp, LOG`）→ VM:19082 | ✅ | `gui-monitor\keep-m.bin`；本机 watch 目录留 `skip-m.tmp`/`skip-m.LOG`，`keep-m.bin` 进「已发送文件」 |
+
+五条路径均为本机出站直连 VM（未改任何防火墙），GUI 无 JS 异常；差异项与本地冒烟一致——
+排除扩展名在跨机场景同样生效（对端只按收到的清单落盘，不会看到被排除的名字）。
+
 ## 已知限制 / 未覆盖
 
 - 服务端 journal（`.trft-hash-cache-server.txt`）与保存目录同生命周期：删掉目录即失效，
