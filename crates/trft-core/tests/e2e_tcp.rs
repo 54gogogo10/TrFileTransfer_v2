@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{ephemeral_listener, opts};
+use common::{ephemeral_listener, opts, opts_resident};
 use rand_core::{OsRng, RngCore};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -627,3 +627,49 @@ async fn v6_wildcard_bind_accepts_v4_connection() {
         .unwrap();
     assert!(out.join("dual.bin").exists());
 }
+
+/// 第 9 轮回归（分块残留进度条）：0x02 并行分块接收必须按「组」只注册一张
+/// 进度卡，并在完成时以 done 收尾。旧实现每条连接 register 一次——4 连接 =
+/// 4 张卡，只有补齐组装的那张 finish，其余永远停在「传输中」。
+#[tokio::test]
+async fn chunked_recv_reports_single_progress_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("big.bin");
+    let mut data = vec![0u8; 8 * 1024 * 1024];
+    OsRng.fill_bytes(&mut data);
+    std::fs::write(&src, &data).unwrap();
+    let out = dir.path().join("out");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let hub = trft_core::progress::ProgressHub::new(tx);
+    let (listener, addr) = ephemeral_listener().await;
+    let server = tokio::spawn(serve_on(
+        listener,
+        RecvOptions {
+            progress: Some(hub),
+            ..opts_resident(out.clone(), None)
+        },
+    ));
+
+    trft_core::transfer::cswire::send_file_chunked_cs_tcp(addr, &src, &SendOptions::default(), 4)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut ids = std::collections::HashSet::new();
+    let mut done = 0usize;
+    while let Ok(ev) = rx.try_recv() {
+        ids.insert(ev.id);
+        if ev.state == "done" {
+            done += 1;
+        }
+    }
+    server.abort();
+    assert_eq!(ids.len(), 1, "分块接收必须只注册一张进度卡（实际 {}）", ids.len());
+    assert_eq!(done, 1, "进度卡必须以 done 收尾");
+    assert_eq!(
+        sha256_file(&out.join("big.bin")).unwrap(),
+        sha256_file(&src).unwrap()
+    );
+}
+

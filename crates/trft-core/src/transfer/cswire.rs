@@ -1123,6 +1123,10 @@ pub struct CsChunkTracker {
     /// 最后活跃（轮 UI-2 P2-1：连接中断的 tracker 此前永驻 + 持有文件句柄；
     /// TTL 惰性清扫用）。
     touched: Instant,
+    /// 本分块组的进度上报（组内多连接共享；完成/逐出时结算）。
+    /// 旧实现每条连接 register 一次——只有补齐组装的那条 finish，其余卡片
+    /// 永远停在「传输中」（4 连接 = 4 张卡，完成 1 张、残留 3 张）。
+    reporter: Option<crate::progress::Reporter>,
 }
 
 impl CsChunkTracker {
@@ -1150,6 +1154,7 @@ impl CsChunkTracker {
             ranges: Vec::new(),
             received: 0,
             touched: Instant::now(),
+            reporter: None,
         })
     }
 
@@ -1299,6 +1304,10 @@ fn cs_sweep_stale(state: &CsServerState) {
             .collect();
         for k in stale {
             if let Some(tr) = t.remove(&k) {
+                // 空闲逐出 = 放弃该组：进度卡必须收尾（否则永远停在「传输中」）。
+                if let Some(r) = &tr.reporter {
+                    r.fail_if_running();
+                }
                 cs_release_declared(state, tr.total);
                 let _ = std::fs::remove_file(&tr.save_path);
             }
@@ -1311,6 +1320,9 @@ fn cs_sweep_stale(state: &CsServerState) {
                 break;
             };
             if let Some(tr) = t.remove(&k) {
+                if let Some(r) = &tr.reporter {
+                    r.fail_if_running();
+                }
                 cs_release_declared(state, tr.total);
                 let _ = std::fs::remove_file(&tr.save_path);
             }
@@ -2222,7 +2234,6 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
         None
     };
     confirm_once(peer, opts, confirmed).await?;
-    let reporter = register_recv(hub, peer, name.clone(), total as u64);
     let tracker_key = match &group_key {
         Some(g) => {
             // 组归属绑定（防外来 peer 写入他人组装——C# ChunkSessionPeers 同防线）。
@@ -2246,7 +2257,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
 
     // 组装器（大小不符的遗留 tracker 重建——C# 同策略）。
     cs_sweep_stale(state); // 轮 UI-2 P2-1：入口惰性清扫（死 tracker/会话不再永驻）
-    {
+    let reporter: CsReporter = {
         let mut t = state.trackers.lock().expect("tracker 锁");
         let stale = match t.get(&tracker_key) {
             Some(tr) if tr.total == total as u64 => None,
@@ -2254,6 +2265,10 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             None => None,
         };
         if let Some(st) = stale {
+            // 大小不符的旧组被重建：旧进度卡必须收尾，否则永远停在「传输中」。
+            if let Some(r) = &st.reporter {
+                r.fail_if_running();
+            }
             cs_release_declared(state, st.total); // 旧声明量随重建释放
             let _ = std::fs::remove_file(&st.save_path);
         }
@@ -2273,7 +2288,16 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
             };
             t.insert(tracker_key.clone(), tr);
         }
-    }
+        // 组内共享一张进度卡：首条连接注册，其余连接复用同一 Reporter。
+        let rep = t.get_mut(&tracker_key).and_then(|tr| {
+            if tr.reporter.is_none() {
+                tr.reporter = register_recv(hub, peer, name.clone(), total as u64);
+            }
+            tr.reporter.clone()
+        });
+        drop(t);
+        rep
+    };
 
     // 写段 + 逐段哈希（C# HandleChunkedFile 同构）。
     use sha2::Digest;
@@ -2373,7 +2397,7 @@ async fn handle_chunk<S: AsyncRead + AsyncWrite + Unpin>(
                 "分块传输",
                 &final_path,
             );
-            if let Some(r) = &reporter {
+            if let Some(r) = &tr.reporter {
                 r.finish();
             }
         }
