@@ -461,6 +461,12 @@ async fn spawn_send(
     req: SendRequest,
     from_queue: bool,
 ) -> Result<(u64, tokio::sync::oneshot::Receiver<Result<(), String>>), String> {
+    // 单向 UDP 只有文件帧（PRODUCT-SPEC §4.2：无回执链路，START/DATA/PARITY/END）；
+    // 文本走 0x06 需要送达判决，文件夹走 0x01/0x04 清单——都不适用。前端已拦，
+    // 此处兜底（CLI/队列/拖放等入口不经过前端校验）。
+    if req.proto == Proto::Udp && req.kind != "udpfile" {
+        return Err("单向 UDP 只支持单个文件（无回执，只有文件帧）。文本请用 TCP/QUIC/RUDP；文件夹请用连接型协议。".into());
+    }
     let name = req.display_name();
     let (ptx, prx) = mpsc::unbounded_channel();
     forward_progress(app.clone(), prx);
