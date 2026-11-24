@@ -388,9 +388,12 @@ function updateKindRows() {
   $("#udp-opts").classList.toggle("hidden", !(isFile && isUdp) || isMonitor || isQueue);
   // 源端口仅连接型协议可绑定（§3.1；UDP 无连接语义，与 CLI --srcport 约束同口径）。
   $("#send-srcport").classList.toggle("hidden", isUdp || isMonitor);
-  // 队列逐项按文件/文件夹发送，不走并行分块；隐藏无意义的分块数。
-  $("#send-chunks").classList.toggle("hidden", isQueue);
-  $("#chunks-lbl").classList.toggle("hidden", isQueue);
+  // 分块只有「单文件 + 连接型协议」用得上（0x02 并行分块）；文件夹走 0x01/0x04、
+  // 文本走 0x06、监控与队列逐项发送，都不发 0x02——旧实现只隐藏了队列，
+  // 其余类型仍显示「分块数」却无处生效（用户反馈：没有分块按钮）。
+  const chunksVisible = isFile && !isUdp && !isMonitor && !isQueue;
+  $("#send-chunks").classList.toggle("hidden", !chunksVisible);
+  $("#chunks-lbl").classList.toggle("hidden", !chunksVisible);
 
   // 监控使用自己卡片里的目标/协议/配对码，隐藏普通发送的对应行与动作行；
   // 队列仍复用主发送卡的目标/配对码（入队时逐项快照）。
